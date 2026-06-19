@@ -976,26 +976,26 @@ RESOURCE_USAGE_ATTACHMENT_DEPTH_STENCIL_READ_WRITE → DEPTH_STENCIL_ATTACHMENT_
 
 ```mermaid
 flowchart TD
-    A[_add_command_to_graph<br>trackers[], usages[], command_index)] --> B[遍历所有资源 tracker]
+    A["_add_command_to_graph<br>trackers[], usages[], command_index"] --> B[遍历所有资源 tracker]
     B --> C{tracker 是否过期?}
-    C -->|command_frame != tracking_frame| D[reset_if_outdated<br>保留 previous_frame_stages]
+    C -->|command_frame != tracking_frame| D["reset_if_outdated<br>保留 previous_frame_stages"]
     C -->|未过期| E[保持当前状态]
     D & E --> F{当前 usage 是写操作?}
 
-    F -->|是写| G[_add_to_write_list<br>记录写命令索引]
+    F -->|是写| G["_add_to_write_list<br>记录写命令索引"]
     G --> H{之前有读命令?}
-    H -->|read_*_command_list_index != -1| I[检测读后写冲突<br>添加相邻命令依赖]
+    H -->|read_*_command_list_index != -1| I["检测读后写冲突<br>添加相邻命令依赖"]
     H -->|无| J{之前有写命令?}
 
-    J -->|write_command_or_list_index != -1| K[检测写后写冲突<br>添加相邻命令依赖]
+    J -->|write_command_or_list_index != -1| K["检测写后写冲突<br>添加相邻命令依赖"]
     J -->|无| L[仅记录写操作]
 
     F -->|是读| M{之前有写命令?}
-    M -->|write_command_or_list_index != -1| N[检测写后读冲突<br>添加相邻命令依赖]
-    M -->|无| O[_add_to_command_list<br>记录读命令索引]
+    M -->|write_command_or_list_index != -1| N["检测写后读冲突<br>添加相邻命令依赖"]
+    M -->|无| O["_add_to_command_list<br>记录读命令索引"]
 
     I & K & L & N & O --> P[更新 tracker 的 usage 和 stages]
-    P --> Q[更新 RecordedCommand 的<br>previous_stages / next_stages]
+    P --> Q["更新 RecordedCommand 的<br>previous_stages / next_stages"]
     Q --> B
 
     B -->|遍历完成| R[命令已加入图]
@@ -1005,15 +1005,15 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A[end() 被调用] --> B[创建 RecordedCommandSort 数组]
+    A["end() 被调用"] --> B[创建 RecordedCommandSort 数组]
     B --> C[为每个命令计算 level 和 priority]
     C --> D{reorder_commands?}
-    D -->|是| E[_boost_priority_for_render_commands<br>提升可并行命令优先级]
+    D -->|是| E["_boost_priority_for_render_commands<br>提升可并行命令优先级"]
     D -->|否| F[保持原始顺序]
     E --> G[按 level + priority + index 排序]
     F --> G
     G --> H[遍历排序后的命令]
-    H --> I[_group_barriers_for_render_commands<br>合并相邻屏障]
+    H --> I["_group_barriers_for_render_commands<br>合并相邻屏障"]
     I --> J[编码到命令缓冲区]
 ```
 

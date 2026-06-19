@@ -310,8 +310,8 @@ classDiagram
         +D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle
     }
 
-    DescriptorHeap +-- DescriptorHeapAllocation
-    CPUDescriptorHeapPool +-- CPUDescriptorHeapPoolAllocation
+    DescriptorHeap *-- DescriptorHeapAllocation : contains
+    CPUDescriptorHeapPool *-- CPUDescriptorHeapPoolAllocation : contains
     CPUDescriptorHeapPool --> DescriptorHeap : 包含多个
 
     class ResourceClass {
