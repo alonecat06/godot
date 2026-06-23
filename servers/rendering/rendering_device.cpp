@@ -40,6 +40,12 @@
 #include "core/profiling/profiling.h"
 #include "core/templates/fixed_vector.h"
 #include "modules/modules_enabled.gen.h"
+
+#ifdef MODULE_INSIGHTS_ENABLED
+#include "modules/insights/insights_core/insights_manager.h"
+#include "modules/insights/channels/gpu_channel.h"
+#endif
+
 #include "servers/rendering/rendering_shader_container.h"
 
 #ifdef MODULE_GLSLANG_ENABLED
@@ -6745,6 +6751,15 @@ void RenderingDevice::_end_frame() {
 	driver->command_buffer_end(command_buffer);
 	GodotProfileZoneGrouped(_profile_zone, "driver->end_segment");
 	driver->end_segment();
+
+#ifdef MODULE_INSIGHTS_ENABLED
+	if (InsightsManager::get_singleton() && InsightsManager::get_singleton()->is_recording()) {
+		GPUChannel *gpu = InsightsManager::get_singleton()->get_gpu_channel();
+		if (gpu) {
+			gpu->collect_frame_timestamps(this);
+		}
+	}
+#endif
 }
 
 void RenderingDevice::execute_chained_cmds(bool p_present_swap_chain, RenderingDeviceDriver::FenceID p_draw_fence,
