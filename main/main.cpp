@@ -138,6 +138,10 @@
 
 #include "modules/modules_enabled.gen.h" // For mono.
 
+#ifdef MODULE_INSIGHTS_ENABLED
+#include "modules/insights/insights_core/insights_manager.h"
+#endif // MODULE_INSIGHTS_ENABLED
+
 #if defined(MODULE_MONO_ENABLED) && defined(TOOLS_ENABLED)
 #include "modules/mono/editor/bindings_generator.h"
 #endif
@@ -5015,6 +5019,12 @@ bool Main::iteration() {
 	if (EngineDebugger::is_active()) {
 		EngineDebugger::get_singleton()->iteration(frame_time, process_ticks, physics_process_ticks, physics_step);
 	}
+
+#ifdef MODULE_INSIGHTS_ENABLED
+	if (InsightsManager::get_singleton() && InsightsManager::get_singleton()->is_recording()) {
+		InsightsManager::get_singleton()->tick((double)frame_time / 1000000.0);
+	}
+#endif // MODULE_INSIGHTS_ENABLED
 
 	frames++;
 	Engine::get_singleton()->_process_frames++;
