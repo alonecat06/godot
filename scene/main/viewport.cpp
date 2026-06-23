@@ -32,6 +32,7 @@
 
 #include "core/config/project_settings.h"
 #include "core/debugger/engine_debugger.h"
+#include "core/profiling/insights.h"
 #include "core/templates/pair.h"
 #include "core/templates/sort_array.h"
 #include "scene/gui/control.h"
@@ -568,6 +569,7 @@ void Viewport::_on_settings_changed() {
 }
 
 void Viewport::_notification(int p_what) {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_CPU, "godot:scene/viewport/notification");
 	ERR_MAIN_THREAD_GUARD;
 
 	switch (p_what) {
@@ -748,6 +750,7 @@ void Viewport::_notification(int p_what) {
 
 #if !defined(PHYSICS_2D_DISABLED) || !defined(PHYSICS_3D_DISABLED)
 void Viewport::_process_picking() {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_CPU, "godot:scene/viewport/process_picking");
 	if (!is_inside_tree()) {
 		return;
 	}
@@ -1052,6 +1055,7 @@ RID Viewport::get_viewport_rid() const {
 }
 
 void Viewport::update_canvas_items() {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_CPU, "godot:scene/viewport/update_canvas_items");
 	ERR_MAIN_THREAD_GUARD;
 	if (!is_inside_tree()) {
 		return;
@@ -3462,6 +3466,7 @@ void Viewport::_drop_mouse_over(Control *p_until_control) {
 }
 
 void Viewport::push_input(RequiredParam<InputEvent> rp_event, bool p_local_coords) {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_CPU, "godot:scene/viewport/push_input");
 	ERR_MAIN_THREAD_GUARD;
 	ERR_FAIL_COND(!is_inside_tree());
 	EXTRACT_PARAM_OR_FAIL(p_event, rp_event);
@@ -3556,6 +3561,7 @@ void Viewport::push_unhandled_input(RequiredParam<InputEvent> rp_event, bool p_l
 #endif // DISABLE_DEPRECATED
 
 void Viewport::_push_unhandled_input_internal(const Ref<InputEvent> &p_event) {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_CPU, "godot:scene/viewport/push_unhandled_input");
 	// Shortcut Input.
 	if (Object::cast_to<InputEventKey>(*p_event) != nullptr || Object::cast_to<InputEventShortcut>(*p_event) != nullptr || Object::cast_to<InputEventJoypadButton>(*p_event) != nullptr) {
 		ERR_FAIL_COND(!is_inside_tree());

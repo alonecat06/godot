@@ -33,6 +33,7 @@
 #include "core/debugger/engine_debugger.h"
 #include "core/io/marshalls.h"
 #include "core/os/os.h"
+#include "core/profiling/insights.h"
 
 #ifdef DEBUG_ENABLED
 _FORCE_INLINE_ void SceneMultiplayer::_profile_bandwidth(const String &p_what, int p_value) {
@@ -211,6 +212,7 @@ Ref<MultiplayerPeer> SceneMultiplayer::get_multiplayer_peer() {
 }
 
 void SceneMultiplayer::_process_packet(int p_from, const uint8_t *p_packet, int p_packet_len) {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_NETWORK, "godot:network/process_packet");
 	ERR_FAIL_COND_MSG(root_path.is_empty(), "Multiplayer root was not initialized. If you are using custom multiplayer, remember to set the root path via SceneMultiplayer.set_root_path before using it.");
 	ERR_FAIL_COND_MSG(p_packet_len < 1, "Invalid packet received. Size too small.");
 
@@ -256,6 +258,7 @@ _FORCE_INLINE_ Error SceneMultiplayer::_send(const uint8_t *p_packet, int p_pack
 #endif
 
 Error SceneMultiplayer::send_command(int p_to, const uint8_t *p_packet, int p_packet_len) {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_NETWORK, "godot:network/send_command");
 	if (server_relay && get_unique_id() != 1 && p_to != 1 && multiplayer_peer->is_server_relay_supported()) {
 		// Send relay packet.
 		relay_buffer->seek(0);
@@ -574,6 +577,7 @@ String SceneMultiplayer::get_rpc_md5(const Object *p_obj) {
 }
 
 Error SceneMultiplayer::rpcp(Object *p_obj, int p_peer_id, const StringName &p_method, const Variant **p_arg, int p_argcount) {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_NETWORK, "godot:network/rpc");
 	return rpc->rpcp(p_obj, p_peer_id, p_method, p_arg, p_argcount);
 }
 

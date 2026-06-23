@@ -35,6 +35,11 @@
 #include "core/os/os.h"
 #include "core/profiling/profiling.h"
 
+#ifdef MODULE_INSIGHTS_ENABLED
+#include "modules/insights/insights_core/insights_manager.h"
+#include "modules/insights/channels/script_channel.h"
+#endif
+
 #ifdef DEBUG_ENABLED
 
 static bool _profile_count_as_native(const Object *p_base_obj, const StringName &p_methodname) {
@@ -497,6 +502,14 @@ void (*type_init_function_table[])(Variant *) = {
 
 Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_args, int p_argcount, Callable::CallError &r_err, CallState *p_state) {
 	GodotProfileZoneScript(this, source, name, name, _initial_line);
+#ifdef MODULE_INSIGHTS_ENABLED
+	if (InsightsManager::get_singleton() && InsightsManager::get_singleton()->is_recording()) {
+		ScriptChannel *script = InsightsManager::get_singleton()->get_script_channel();
+		if (script) {
+			script->enter_function(name, source, _initial_line);
+		}
+	}
+#endif
 
 	OPCODES_TABLE;
 
@@ -1908,6 +1921,14 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 				const StringName *methodname = &_global_names_ptr[methodname_idx];
 
 				GodotProfileZoneScriptSystemCall(methodname, source, name, *methodname, line);
+#ifdef MODULE_INSIGHTS_ENABLED
+				if (InsightsManager::get_singleton() && InsightsManager::get_singleton()->is_recording()) {
+					ScriptChannel *script = InsightsManager::get_singleton()->get_script_channel();
+					if (script) {
+						script->enter_function(name, source, line);
+					}
+				}
+#endif
 
 				GET_INSTRUCTION_ARG(base, argc);
 				Variant **argptrs = instruction_args;
@@ -2030,6 +2051,14 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 				MethodBind *method = _methods_ptr[_code_ptr[ip + 2]];
 
 				GodotProfileZoneScriptSystemCall(method, source, name, method->get_name(), line);
+#ifdef MODULE_INSIGHTS_ENABLED
+				if (InsightsManager::get_singleton() && InsightsManager::get_singleton()->is_recording()) {
+					ScriptChannel *script = InsightsManager::get_singleton()->get_script_channel();
+					if (script) {
+						script->enter_function(name, source, line);
+					}
+				}
+#endif
 
 				GET_INSTRUCTION_ARG(base, argc);
 
@@ -2117,6 +2146,14 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 				const StringName *methodname = &_global_names_ptr[methodname_idx];
 
 				GodotProfileZoneScriptSystemCall(methodname, source, name, *methodname, line);
+#ifdef MODULE_INSIGHTS_ENABLED
+				if (InsightsManager::get_singleton() && InsightsManager::get_singleton()->is_recording()) {
+					ScriptChannel *script = InsightsManager::get_singleton()->get_script_channel();
+					if (script) {
+						script->enter_function(name, source, line);
+					}
+				}
+#endif
 
 				int argc = _code_ptr[ip + 3];
 				GD_ERR_BREAK(argc < 0);
@@ -2149,6 +2186,14 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 				MethodBind *method = _methods_ptr[_code_ptr[ip + 1]];
 
 				GodotProfileZoneScriptSystemCall(method, source, name, method->get_name(), line);
+#ifdef MODULE_INSIGHTS_ENABLED
+				if (InsightsManager::get_singleton() && InsightsManager::get_singleton()->is_recording()) {
+					ScriptChannel *script = InsightsManager::get_singleton()->get_script_channel();
+					if (script) {
+						script->enter_function(name, source, line);
+					}
+				}
+#endif
 
 				int argc = _code_ptr[ip + 2];
 				GD_ERR_BREAK(argc < 0);
@@ -2197,6 +2242,14 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 				MethodBind *method = _methods_ptr[_code_ptr[ip + 2]];
 
 				GodotProfileZoneScriptSystemCall(method, source, name, method->get_name(), line);
+#ifdef MODULE_INSIGHTS_ENABLED
+				if (InsightsManager::get_singleton() && InsightsManager::get_singleton()->is_recording()) {
+					ScriptChannel *script = InsightsManager::get_singleton()->get_script_channel();
+					if (script) {
+						script->enter_function(name, source, line);
+					}
+				}
+#endif
 
 				Variant **argptrs = instruction_args;
 
@@ -2235,6 +2288,14 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 				MethodBind *method = _methods_ptr[_code_ptr[ip + 2]];
 
 				GodotProfileZoneScriptSystemCall(method, source, name, method->get_name(), line);
+#ifdef MODULE_INSIGHTS_ENABLED
+				if (InsightsManager::get_singleton() && InsightsManager::get_singleton()->is_recording()) {
+					ScriptChannel *script = InsightsManager::get_singleton()->get_script_channel();
+					if (script) {
+						script->enter_function(name, source, line);
+					}
+				}
+#endif
 
 				Variant **argptrs = instruction_args;
 #ifdef DEBUG_ENABLED
@@ -2273,6 +2334,14 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 				MethodBind *method = _methods_ptr[_code_ptr[ip + 2]];
 
 				GodotProfileZoneScriptSystemCall(method, source, name, method->get_name(), line);
+#ifdef MODULE_INSIGHTS_ENABLED
+				if (InsightsManager::get_singleton() && InsightsManager::get_singleton()->is_recording()) {
+					ScriptChannel *script = InsightsManager::get_singleton()->get_script_channel();
+					if (script) {
+						script->enter_function(name, source, line);
+					}
+				}
+#endif
 
 				GET_INSTRUCTION_ARG(base, argc);
 
@@ -2327,6 +2396,14 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 				MethodBind *method = _methods_ptr[_code_ptr[ip + 2]];
 
 				GodotProfileZoneScriptSystemCall(method, source, name, method->get_name(), line);
+#ifdef MODULE_INSIGHTS_ENABLED
+				if (InsightsManager::get_singleton() && InsightsManager::get_singleton()->is_recording()) {
+					ScriptChannel *script = InsightsManager::get_singleton()->get_script_channel();
+					if (script) {
+						script->enter_function(name, source, line);
+					}
+				}
+#endif
 
 				GET_INSTRUCTION_ARG(base, argc);
 #ifdef DEBUG_ENABLED
@@ -2500,6 +2577,14 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 				const StringName *methodname = &_global_names_ptr[self_fun];
 
 				GodotProfileZoneScriptSystemCall(methodname, source, name, *methodname, line);
+#ifdef MODULE_INSIGHTS_ENABLED
+				if (InsightsManager::get_singleton() && InsightsManager::get_singleton()->is_recording()) {
+					ScriptChannel *script = InsightsManager::get_singleton()->get_script_channel();
+					if (script) {
+						script->enter_function(name, source, line);
+					}
+				}
+#endif
 
 				Variant **argptrs = instruction_args;
 

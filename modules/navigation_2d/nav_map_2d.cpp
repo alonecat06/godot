@@ -41,6 +41,7 @@
 #include "core/config/project_settings.h"
 #include "core/object/worker_thread_pool.h"
 #include "servers/navigation_2d/navigation_server_2d.h"
+#include "core/profiling/insights.h"
 
 #include <Obstacle2d.h>
 
@@ -281,6 +282,7 @@ Vector2 NavMap2D::get_random_point(uint32_t p_navigation_layers, bool p_uniforml
 }
 
 void NavMap2D::_build_iteration() {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_CPU, "godot:navigation/2d/build_iteration");
 	if (!iteration_dirty || iteration_building || iteration_ready) {
 		return;
 	}
@@ -371,6 +373,7 @@ void NavMap2D::_sync_iteration() {
 }
 
 void NavMap2D::sync() {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_CPU, "godot:navigation/2d/map_sync");
 	// Performance Monitor.
 	performance_data.pm_region_count = regions.size();
 	performance_data.pm_agent_count = agents.size();
@@ -525,6 +528,7 @@ void NavMap2D::compute_single_avoidance_step(uint32_t p_index, NavAgent2D **p_ag
 }
 
 void NavMap2D::step(double p_delta_time) {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_CPU, "godot:navigation/2d/step");
 	rvo_simulation.setTimeStep(float(p_delta_time));
 
 	if (active_avoidance_agents.size() > 0) {

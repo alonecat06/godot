@@ -31,6 +31,7 @@
 #include "physics_server_3d.h"
 
 #include "core/config/project_settings.h"
+#include "core/profiling/insights.h"
 #include "core/variant/typed_array.h"
 
 void PhysicsServer3DRenderingServerHandler::set_vertex(int p_vertex_id, const Vector3 &p_vertex) {
@@ -56,6 +57,7 @@ void PhysicsServer3DRenderingServerHandler::_bind_methods() {
 PhysicsServer3D *PhysicsServer3D::singleton = nullptr;
 
 void PhysicsDirectBodyState3D::integrate_forces() {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_CPU, "godot:physics/3d/integrate_forces");
 	real_t step = get_step();
 	Vector3 lv = get_linear_velocity();
 	lv += get_total_gravity() * step;
@@ -1135,6 +1137,7 @@ void PhysicsServer3D::_bind_methods() {
 }
 
 PhysicsServer3D::PhysicsServer3D() {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_CPU, "godot:physics/3d/init");
 	singleton = this;
 
 	// World3D physics space

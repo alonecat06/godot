@@ -35,6 +35,14 @@
 
 #include <cstdlib>
 
+#include "core/os/os.h"
+#include "core/os/thread.h"
+
+#ifdef MODULE_INSIGHTS_ENABLED
+#include "modules/insights/insights_core/insights_manager.h"
+#include "modules/insights/channels/memory_channel.h"
+#endif
+
 void *operator new(size_t p_size, const char *p_description) {
 	return Memory::alloc_static(p_size, false);
 }
@@ -124,8 +132,24 @@ void *Memory::alloc_static(size_t p_bytes, bool p_pad_align) {
 		uint64_t new_mem_usage = _current_mem_usage.add(p_bytes);
 		_max_mem_usage.exchange_if_greater(new_mem_usage);
 #endif
+#ifdef MODULE_INSIGHTS_ENABLED
+		if (unlikely(InsightsManager::get_singleton() && InsightsManager::get_singleton()->is_recording())) {
+			MemoryChannel *mem_ch = InsightsManager::get_singleton()->get_memory_channel();
+			if (mem_ch) {
+				mem_ch->on_alloc((uint64_t)(s8 + DATA_OFFSET), p_bytes, Thread::get_caller_id(), OS::get_singleton()->get_ticks_usec() * 1000);
+			}
+		}
+#endif
 		return s8 + DATA_OFFSET;
 	} else {
+#ifdef MODULE_INSIGHTS_ENABLED
+		if (unlikely(InsightsManager::get_singleton() && InsightsManager::get_singleton()->is_recording())) {
+			MemoryChannel *mem_ch = InsightsManager::get_singleton()->get_memory_channel();
+			if (mem_ch) {
+				mem_ch->on_alloc((uint64_t)mem, p_bytes, Thread::get_caller_id(), OS::get_singleton()->get_ticks_usec() * 1000);
+			}
+		}
+#endif
 		return mem;
 	}
 }
@@ -190,6 +214,15 @@ void *Memory::realloc_static(void *p_memory, size_t p_bytes, bool p_pad_align) {
 
 void Memory::free_static(void *p_ptr, bool p_pad_align) {
 	ERR_FAIL_NULL(p_ptr);
+
+#ifdef MODULE_INSIGHTS_ENABLED
+	if (unlikely(InsightsManager::get_singleton() && InsightsManager::get_singleton()->is_recording())) {
+		MemoryChannel *mem_ch = InsightsManager::get_singleton()->get_memory_channel();
+		if (mem_ch) {
+			mem_ch->on_free((uint64_t)p_ptr, Thread::get_caller_id(), OS::get_singleton()->get_ticks_usec() * 1000);
+		}
+	}
+#endif
 
 	uint8_t *mem = (uint8_t *)p_ptr;
 

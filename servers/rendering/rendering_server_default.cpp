@@ -31,6 +31,7 @@
 #include "rendering_server_default.h"
 
 #include "core/os/os.h"
+#include "core/profiling/insights.h"
 #include "core/profiling/profiling.h"
 #include "renderer_canvas_cull.h"
 #include "renderer_scene_cull.h"
@@ -231,6 +232,7 @@ bool RenderingServerDefault::has_changed() const {
 }
 
 void RenderingServerDefault::_init() {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_GPU, "godot:rendering/init");
 	RSG::threaded = create_thread;
 
 	RSG::canvas = memnew(RendererCanvasCull);
@@ -253,6 +255,7 @@ void RenderingServerDefault::_init() {
 }
 
 void RenderingServerDefault::_finish() {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_GPU, "godot:rendering/finish");
 	if (test_cube.is_valid()) {
 		free_rid(test_cube);
 	}
@@ -426,6 +429,7 @@ void RenderingServerDefault::set_physics_interpolation_enabled(bool p_enabled) {
 /* EVENT QUEUING */
 
 void RenderingServerDefault::sync() {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_GPU, "godot:rendering/sync");
 	if (create_thread) {
 		command_queue.sync();
 	} else {
@@ -434,6 +438,7 @@ void RenderingServerDefault::sync() {
 }
 
 void RenderingServerDefault::draw(bool p_present, double frame_step) {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_GPU, "godot:rendering/draw");
 	ERR_FAIL_COND_MSG(!Thread::is_main_thread(), "Manually triggering the draw function from the RenderingServer can only be done on the main thread. Call this function from the main thread or use call_deferred().");
 	// Needs to be done before changes is reset to 0, to not force the editor to redraw.
 	RS::get_singleton()->emit_signal(SNAME("frame_pre_draw"));
@@ -446,6 +451,7 @@ void RenderingServerDefault::draw(bool p_present, double frame_step) {
 }
 
 void RenderingServerDefault::tick() {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_GPU, "godot:rendering/tick");
 	RSG::canvas->tick();
 	RSG::scene->tick();
 }

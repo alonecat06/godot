@@ -31,6 +31,7 @@
 #include "audio_stream.h"
 
 #include "core/config/project_settings.h"
+#include "core/profiling/insights.h"
 
 void AudioStreamPlayback::start(double p_from_pos) {
 	GDVIRTUAL_CALL(_start, p_from_pos);
@@ -181,6 +182,7 @@ void AudioStreamPlaybackResampled::_bind_methods() {
 }
 
 int AudioStreamPlaybackResampled::mix(AudioFrame *p_buffer, float p_rate_scale, int p_frames) {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_CPU, "godot:audio/resampled_mix");
 	float target_rate = AudioServer::get_singleton()->get_mix_rate();
 	float playback_speed_scale = AudioServer::get_singleton()->get_playback_speed_scale();
 
@@ -382,6 +384,7 @@ bool AudioStreamMicrophone::is_monophonic() const {
 }
 
 int AudioStreamPlaybackMicrophone::_mix_internal(AudioFrame *p_buffer, int p_frames) {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_CPU, "godot:audio/microphone_mix");
 	AudioDriver::get_singleton()->lock();
 
 	Vector<int32_t> buf = AudioDriver::get_singleton()->get_input_buffer();
@@ -857,6 +860,7 @@ void AudioStreamPlaybackRandomizer::tag_used_streams() {
 }
 
 int AudioStreamPlaybackRandomizer::mix(AudioFrame *p_buffer, float p_rate_scale, int p_frames) {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_CPU, "godot:audio/randomizer_mix");
 	if (playing.is_valid()) {
 		int mixed_samples = playing->mix(p_buffer, p_rate_scale * pitch_scale, p_frames);
 		for (int samp = 0; samp < mixed_samples; samp++) {

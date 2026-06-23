@@ -30,6 +30,8 @@
 
 #include "physics_server_2d_wrap_mt.h"
 
+#include "core/profiling/insights.h"
+
 void PhysicsServer2DWrapMT::_assign_mt_ids(WorkerThreadPool::TaskID p_pump_task_id) {
 	server_thread = Thread::get_caller_id();
 	server_task_id = p_pump_task_id;
@@ -56,6 +58,7 @@ void PhysicsServer2DWrapMT::_thread_sync() {
 /* EVENT QUEUING */
 
 void PhysicsServer2DWrapMT::step(real_t p_step) {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_CPU, "godot:physics/2d/step");
 	if (create_thread) {
 		command_queue.push(physics_server_2d, &PhysicsServer2D::step, p_step);
 	} else {
@@ -64,6 +67,7 @@ void PhysicsServer2DWrapMT::step(real_t p_step) {
 }
 
 void PhysicsServer2DWrapMT::sync() {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_CPU, "godot:physics/2d/sync");
 	if (create_thread) {
 		command_queue.push_and_sync(this, &PhysicsServer2DWrapMT::_thread_sync);
 	} else {
@@ -73,6 +77,7 @@ void PhysicsServer2DWrapMT::sync() {
 }
 
 void PhysicsServer2DWrapMT::flush_queries() {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_CPU, "godot:physics/2d/flush_queries");
 	physics_server_2d->flush_queries();
 }
 
@@ -85,6 +90,7 @@ void PhysicsServer2DWrapMT::end_sync() {
 }
 
 void PhysicsServer2DWrapMT::init() {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_CPU, "godot:physics/2d/init");
 	if (create_thread) {
 		WorkerThreadPool::TaskID tid = WorkerThreadPool::get_singleton()->add_task(callable_mp(this, &PhysicsServer2DWrapMT::_thread_loop), true, "Physics server 2D pump task", true);
 		command_queue.set_pump_task_id(tid);

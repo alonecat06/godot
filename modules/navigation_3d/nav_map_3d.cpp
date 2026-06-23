@@ -41,6 +41,7 @@
 #include "core/config/project_settings.h"
 #include "core/object/worker_thread_pool.h"
 #include "servers/navigation_3d/navigation_server_3d.h"
+#include "core/profiling/insights.h"
 
 #include <Obstacle2d.h>
 
@@ -335,6 +336,7 @@ Vector3 NavMap3D::get_random_point(uint32_t p_navigation_layers, bool p_uniforml
 }
 
 void NavMap3D::_build_iteration() {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_CPU, "godot:navigation/3d/build_iteration");
 	if (!iteration_dirty || iteration_building || iteration_ready) {
 		return;
 	}
@@ -427,6 +429,7 @@ void NavMap3D::_sync_iteration() {
 }
 
 void NavMap3D::sync() {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_CPU, "godot:navigation/3d/map_sync");
 	// Performance Monitor.
 	performance_data.pm_region_count = regions.size();
 	performance_data.pm_agent_count = agents.size();
@@ -607,6 +610,7 @@ void NavMap3D::compute_single_avoidance_step_3d(uint32_t index, NavAgent3D **age
 }
 
 void NavMap3D::step(double p_delta_time) {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_CPU, "godot:navigation/3d/step");
 	rvo_simulation_2d.setTimeStep(float(p_delta_time));
 	rvo_simulation_3d.setTimeStep(float(p_delta_time));
 

@@ -48,6 +48,11 @@
 #define THREADING_NAMESPACE std
 #endif
 
+#ifdef MODULE_INSIGHTS_ENABLED
+#include "modules/insights/insights_core/insights_manager.h"
+#include "modules/insights/channels/log_channel.h"
+#endif
+
 OS *OS::singleton = nullptr;
 uint64_t OS::target_ticks = 0;
 
@@ -102,6 +107,33 @@ void OS::print_error(const char *p_function, const char *p_file, int p_line, con
 	if (_logger) {
 		_logger->log_error(p_function, p_file, p_line, p_code, p_rationale, p_editor_notify, p_type, p_script_backtraces);
 	}
+
+#ifdef MODULE_INSIGHTS_ENABLED
+	if (unlikely(InsightsManager::get_singleton() && InsightsManager::get_singleton()->is_recording())) {
+		LogChannel *log = InsightsManager::get_singleton()->get_log_channel();
+		if (log) {
+			LogChannel::Severity severity = LogChannel::SEVERITY_INFO;
+			switch (p_type) {
+				case Logger::ERR_ERROR:
+					severity = LogChannel::SEVERITY_ERROR;
+					break;
+				case Logger::ERR_WARNING:
+					severity = LogChannel::SEVERITY_WARNING;
+					break;
+				case Logger::ERR_SCRIPT:
+					severity = LogChannel::SEVERITY_ERROR;
+					break;
+				case Logger::ERR_SHADER:
+					severity = LogChannel::SEVERITY_WARNING;
+					break;
+				default:
+					severity = LogChannel::SEVERITY_INFO;
+					break;
+			}
+			log->log_message(severity, String(p_rationale), String(p_file), p_line, OS::get_singleton()->get_ticks_usec() * 1000);
+		}
+	}
+#endif
 }
 
 void OS::print(const char *p_format, ...) {

@@ -37,6 +37,7 @@
 #include "core/object/message_queue.h"
 #include "core/object/worker_thread_pool.h"
 #include "core/os/os.h"
+#include "core/profiling/insights.h"
 #include "core/profiling/profiling.h"
 #include "node.h"
 #include "scene/animation/tween.h"
@@ -626,6 +627,7 @@ void SceneTree::iteration_prepare() {
 }
 
 bool SceneTree::physics_process(double p_time) {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_CPU, "godot:scene/tree/physics_process");
 	current_frame++;
 
 	flush_transform_notifications();
@@ -675,6 +677,7 @@ void SceneTree::iteration_end() {
 }
 
 bool SceneTree::process(double p_time) {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_CPU, "godot:scene/tree/process");
 	// First pass of scene tree fixed timestep interpolation.
 	if (get_scene_tree_fti().is_enabled()) {
 		// Special, we need to ensure RenderingServer is up to date
@@ -842,6 +845,7 @@ void SceneTree::process_tweens(double p_delta, bool p_physics) {
 }
 
 void SceneTree::finalize() {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_CPU, "godot:scene/tree/finalize");
 	_flush_delete_queue();
 
 	_flush_ugc();
@@ -1216,6 +1220,7 @@ void SceneTree::_process_groups_thread(uint32_t p_index, bool p_physics) {
 }
 
 void SceneTree::_process(bool p_physics) {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_CPU, "godot:scene/tree/_process");
 	if (process_groups_dirty) {
 		{
 			// First, remove dirty groups.

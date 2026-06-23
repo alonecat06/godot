@@ -31,11 +31,13 @@
 #include "physics_server_2d.h"
 
 #include "core/config/project_settings.h"
+#include "core/profiling/insights.h"
 #include "core/variant/typed_array.h"
 
 PhysicsServer2D *PhysicsServer2D::singleton = nullptr;
 
 void PhysicsDirectBodyState2D::integrate_forces() {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_CPU, "godot:physics/2d/integrate_forces");
 	real_t step = get_step();
 	Vector2 lv = get_linear_velocity();
 	lv += get_total_gravity() * step;
@@ -899,6 +901,7 @@ void PhysicsServer2D::_bind_methods() {
 }
 
 PhysicsServer2D::PhysicsServer2D() {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_CPU, "godot:physics/2d/init");
 	singleton = this;
 
 	// World2D physics space

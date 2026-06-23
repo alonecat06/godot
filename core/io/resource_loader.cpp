@@ -39,11 +39,19 @@
 #include "core/os/condition_variable.h"
 #include "core/os/os.h"
 #include "core/os/safe_binary_mutex.h"
+#include "core/profiling/insights.h"
 #include "core/string/print_string.h"
 #include "core/string/translation_server.h"
 #include "core/templates/rb_set.h"
 #include "core/variant/variant_parser.h"
 #include "servers/rendering/rendering_server.h"
+
+#ifdef MODULE_INSIGHTS_ENABLED
+#include "core/profiling/insights.h"
+#include "modules/insights/insights_core/insights_manager.h"
+#include "modules/insights/insights_core/resource_load_tracker.h"
+#include "modules/insights/channels/loading_channel.h"
+#endif
 
 #ifdef DEBUG_LOAD_THREADED
 #define print_lt(m_text) print_line(m_text)
@@ -287,6 +295,7 @@ ResourceLoader::LoadToken::~LoadToken() {
 }
 
 Ref<Resource> ResourceLoader::_load(const String &p_path, const String &p_original_path, const String &p_type_hint, ResourceFormatLoader::CacheMode p_cache_mode, Error *r_error, bool p_use_sub_threads, float *r_progress) {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_LOADING, "godot:loading/resource/_load");
 	const String &original_path = p_original_path.is_empty() ? p_path : p_original_path;
 	load_nesting++;
 	if (load_paths_stack.size()) {
@@ -300,6 +309,12 @@ Ref<Resource> ResourceLoader::_load(const String &p_path, const String &p_origin
 		}
 	}
 	load_paths_stack.push_back(original_path);
+
+#ifdef MODULE_INSIGHTS_ENABLED
+	if (InsightsManager::get_singleton() && InsightsManager::get_singleton()->is_recording()) {
+		ResourceLoadTracker::get_singleton()->on_load_begin(original_path, p_type_hint);
+	}
+#endif
 
 	print_verbose(vformat("Loading resource: %s", p_path));
 
@@ -322,6 +337,11 @@ Ref<Resource> ResourceLoader::_load(const String &p_path, const String &p_origin
 	load_nesting--;
 
 	if (res.is_valid()) {
+#ifdef MODULE_INSIGHTS_ENABLED
+		if (InsightsManager::get_singleton() && InsightsManager::get_singleton()->is_recording()) {
+			ResourceLoadTracker::get_singleton()->on_load_end(original_path, 0);
+		}
+#endif
 		return res;
 	} else {
 		print_verbose(vformat("Failed loading resource: %s", p_path));
@@ -340,6 +360,11 @@ Ref<Resource> ResourceLoader::_load(const String &p_path, const String &p_origin
 	}
 #endif
 
+#ifdef MODULE_INSIGHTS_ENABLED
+	if (InsightsManager::get_singleton() && InsightsManager::get_singleton()->is_recording()) {
+		ResourceLoadTracker::get_singleton()->on_load_fail(original_path, vformat("Failed loading resource: %s.", p_path));
+	}
+#endif
 	ERR_FAIL_COND_V_MSG(found, Ref<Resource>(), vformat("Failed loading resource: %s.", p_path));
 
 #ifdef TOOLS_ENABLED
@@ -348,6 +373,11 @@ Ref<Resource> ResourceLoader::_load(const String &p_path, const String &p_origin
 		if (r_error) {
 			*r_error = ERR_FILE_NOT_FOUND;
 		}
+#ifdef MODULE_INSIGHTS_ENABLED
+		if (InsightsManager::get_singleton() && InsightsManager::get_singleton()->is_recording()) {
+			ResourceLoadTracker::get_singleton()->on_load_fail(original_path, vformat("Resource file not found: %s (expected type: %s)", p_path, !p_type_hint.is_empty() ? p_type_hint : "unknown"));
+		}
+#endif
 		ERR_FAIL_V_MSG(Ref<Resource>(), vformat("Resource file not found: %s (expected type: %s)", p_path, !p_type_hint.is_empty() ? p_type_hint : "unknown"));
 	}
 #endif
@@ -355,12 +385,18 @@ Ref<Resource> ResourceLoader::_load(const String &p_path, const String &p_origin
 	if (r_error) {
 		*r_error = ERR_FILE_UNRECOGNIZED;
 	}
+#ifdef MODULE_INSIGHTS_ENABLED
+	if (InsightsManager::get_singleton() && InsightsManager::get_singleton()->is_recording()) {
+		ResourceLoadTracker::get_singleton()->on_load_fail(original_path, vformat("No loader found for resource: %s (expected type: %s)", p_path, !p_type_hint.is_empty() ? p_type_hint : "unknown"));
+	}
+#endif
 	ERR_FAIL_V_MSG(Ref<Resource>(), vformat("No loader found for resource: %s (expected type: %s)", p_path, !p_type_hint.is_empty() ? p_type_hint : "unknown"));
 }
 
 // This implementation must allow re-entrancy for a task that started awaiting in a deeper stack frame.
 // The load task token must be manually re-referenced before this is called, which includes threaded runs.
 void ResourceLoader::_run_load_task(void *p_userdata) {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_LOADING, "godot:loading/resource/run_load_task");
 	ThreadLoadTask &load_task = *(ThreadLoadTask *)p_userdata;
 
 	{
@@ -539,6 +575,7 @@ void ResourceLoader::_load_threaded_request_setup_user_token(LoadToken *p_token,
 }
 
 Ref<Resource> ResourceLoader::load(const String &p_path, const String &p_type_hint, ResourceFormatLoader::CacheMode p_cache_mode, Error *r_error) {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_LOADING, "godot:loading/resource/load");
 	if (r_error) {
 		*r_error = OK;
 	}
@@ -816,6 +853,7 @@ void ResourceLoader::set_is_import_thread(bool p_import_thread) {
 }
 
 Ref<Resource> ResourceLoader::_load_complete_inner(LoadToken &p_load_token, Error *r_error, MutexLock<SafeBinaryMutex<BINARY_MUTEX_TAG>> &p_thread_load_lock) {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_LOADING, "godot:loading/resource/load_complete");
 	if (r_error) {
 		*r_error = OK;
 	}

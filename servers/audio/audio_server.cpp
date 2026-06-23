@@ -42,6 +42,7 @@
 #include "servers/audio/audio_driver_dummy.h"
 #include "servers/audio/audio_stream.h"
 #include "servers/audio/effects/audio_effect_compressor.h"
+#include "core/profiling/insights.h"
 
 #ifdef TOOLS_ENABLED
 #define MARK_EDITED set_edited(true);
@@ -259,6 +260,7 @@ AudioDriver *AudioDriverManager::get_driver(int p_driver) {
 //////////////////////////////////////////////
 
 void AudioServer::_driver_process(int p_frames, int32_t *p_buffer) {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_CPU, "godot:audio/driver_process");
 	mix_count++;
 	int todo = p_frames;
 
@@ -339,6 +341,7 @@ void AudioServer::_driver_process(int p_frames, int32_t *p_buffer) {
 }
 
 void AudioServer::_mix_step() {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_CPU, "godot:audio/mix_step");
 	bool solo_mode = false;
 
 	for (int i = 0; i < buses.size(); i++) {
@@ -1513,6 +1516,7 @@ void AudioServer::init_channels_and_buffers() {
 }
 
 void AudioServer::init() {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_CPU, "godot:audio/init");
 	channel_disable_threshold_db = GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "audio/buses/channel_disable_threshold_db", PROPERTY_HINT_RANGE, "-80,0,0.1,suffix:dB"), -60.0);
 	channel_disable_frames = float(GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "audio/buses/channel_disable_time", PROPERTY_HINT_RANGE, "0,5,0.01,or_greater"), 2.0)) * get_mix_rate();
 	// TODO: Buffer size is hardcoded for now. This would be really nice to have as a project setting because currently it limits audio latency to an absolute minimum of 11ms with default mix rate, but there's some additional work required to make that happen. See TODOs in `_mix_step_for_channel`.
@@ -1538,6 +1542,7 @@ void AudioServer::init() {
 }
 
 void AudioServer::update() {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_CPU, "godot:audio/update");
 #ifdef DEBUG_ENABLED
 	if (EngineDebugger::is_profiling(SNAME("servers"))) {
 		// Driver time includes server time + effects times

@@ -39,6 +39,7 @@
 #include "core/string/print_string.h"
 #include "core/string/translation_server.h"
 #include "core/variant/typed_array.h"
+#include "core/profiling/insights.h"
 
 #ifdef DEBUG_ENABLED
 
@@ -293,6 +294,7 @@ Object::Connection::Connection(const Variant &p_variant) {
 }
 
 bool Object::_predelete() {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_CPU, "godot:object/predelete");
 	_predelete_ok = true;
 	notification(NOTIFICATION_PREDELETE, true);
 	if (!_predelete_ok) {
@@ -1030,6 +1032,7 @@ void Object::_gdvirtual_init_method_ptr(uint32_t p_compat_hash, void *&r_fn_ptr,
 }
 
 void Object::_notification_forward(int p_notification) {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_CPU, "godot:object/notification_forward");
 	// Notify classes starting with Object and ending with most derived subclass.
 	// e.g. Object -> Node -> Node3D
 	_notification_forwardv(p_notification);
@@ -1090,6 +1093,7 @@ String Object::to_string() {
 }
 
 void Object::set_script(const Variant &p_script) {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_CPU, "godot:object/set_script");
 	if (get_script() == p_script) {
 		return;
 	}
@@ -1301,6 +1305,7 @@ Error Object::_emit_signal(const Variant **p_args, int p_argcount, Callable::Cal
 }
 
 Error Object::emit_signalp(const StringName &p_name, const Variant **p_args, int p_argcount) {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_CPU, "godot:object/emit_signal");
 	if (_block_signals) {
 		return ERR_CANT_ACQUIRE_RESOURCE; //no emit, signals blocked
 	}

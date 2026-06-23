@@ -42,6 +42,7 @@ STATIC_ASSERT_INCOMPLETE_TYPE(class, Engine);
 #include "core/io/resource_loader.h"
 #include "core/object/message_queue.h"
 #include "core/object/script_language.h"
+#include "core/profiling/insights.h"
 #include "core/string/print_string.h"
 #include "instance_placeholder.h"
 #include "scene/animation/tween.h"
@@ -58,6 +59,7 @@ SafeNumeric<uint64_t> Node::total_node_count{ 0 };
 thread_local Node *Node::current_process_thread_group = nullptr;
 
 void Node::_notification(int p_notification) {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_CPU, "godot:scene/node/notification");
 	switch (p_notification) {
 		case NOTIFICATION_ACCESSIBILITY_INVALIDATE: {
 			if (data.accessibility_element.is_valid()) {
@@ -315,6 +317,7 @@ void Node::_notification(int p_notification) {
 }
 
 void Node::_propagate_ready() {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_CPU, "godot:scene/node/propagate_ready");
 	data.ready_notified = true;
 	data.blocked++;
 	for (KeyValue<StringName, Node *> &K : data.children) {
@@ -333,6 +336,7 @@ void Node::_propagate_ready() {
 }
 
 void Node::_propagate_enter_tree() {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_CPU, "godot:scene/node/propagate_enter_tree");
 	// this needs to happen to all children before any enter_tree
 
 	if (data.parent) {
@@ -402,6 +406,7 @@ void Node::_propagate_after_exit_tree() {
 }
 
 void Node::_propagate_exit_tree() {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_CPU, "godot:scene/node/propagate_exit_tree");
 	//block while removing children
 
 #ifdef DEBUG_ENABLED
@@ -3373,6 +3378,7 @@ Node *Node::get_node_and_resource(const NodePath &p_path, Ref<Resource> &r_res, 
 }
 
 void Node::_set_tree(SceneTree *p_tree) {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_CPU, "godot:scene/node/set_tree");
 	SceneTree *tree_changed_a = nullptr;
 	SceneTree *tree_changed_b = nullptr;
 

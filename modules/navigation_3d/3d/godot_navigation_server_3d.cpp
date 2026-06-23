@@ -34,6 +34,7 @@
 #include "scene/main/node.h"
 
 #include "nav_mesh_generator_3d.h"
+#include "core/profiling/insights.h"
 
 using namespace NavigationDefaults3D;
 
@@ -1339,6 +1340,7 @@ void GodotNavigationServer3D::set_active(bool p_active) {
 }
 
 void GodotNavigationServer3D::flush_queries() {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_CPU, "godot:navigation/3d/flush_queries");
 	MutexLock lock(commands_mutex);
 	MutexLock lock2(operations_mutex);
 
@@ -1366,6 +1368,7 @@ uint32_t GodotNavigationServer3D::map_get_iteration_id(RID p_map) const {
 }
 
 void GodotNavigationServer3D::sync() {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_CPU, "godot:navigation/3d/sync");
 	if (navmesh_generator_3d) {
 		navmesh_generator_3d->sync();
 	}
@@ -1381,6 +1384,7 @@ void GodotNavigationServer3D::process(double p_delta_time) {
 }
 
 void GodotNavigationServer3D::physics_process(double p_delta_time) {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_CPU, "godot:navigation/3d/physics_process");
 	// Called for each physics process step AFTER node and user script physics_process() and BEFORE PhysicsServer sync.
 	// Will NOT run reliably every rendered frame. If there is no physics step this function will not run.
 	// Use for physics or step depending calculations and updates where the result affects the next step calculation.

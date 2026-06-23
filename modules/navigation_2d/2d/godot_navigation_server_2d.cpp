@@ -37,6 +37,7 @@
 #ifdef CLIPPER2_ENABLED
 #include "nav_mesh_generator_2d.h"
 #endif // CLIPPER2_ENABLED
+#include "core/profiling/insights.h"
 
 #define COMMAND_1(F_NAME, T_0, D_0)                                     \
 	struct MERGE(F_NAME, _command_2d) : public SetCommand2D {           \
@@ -88,6 +89,7 @@ void GodotNavigationServer2D::init() {
 }
 
 void GodotNavigationServer2D::sync() {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_CPU, "godot:navigation/2d/sync");
 #ifdef CLIPPER2_ENABLED
 	if (navmesh_generator_2d) {
 		navmesh_generator_2d->sync();
@@ -1179,6 +1181,7 @@ Vector<Vector2> GodotNavigationServer2D::obstacle_get_vertices(RID p_obstacle) c
 }
 
 void GodotNavigationServer2D::flush_queries() {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_CPU, "godot:navigation/2d/flush_queries");
 	MutexLock lock(commands_mutex);
 	MutexLock lock2(operations_mutex);
 
@@ -1307,6 +1310,7 @@ void GodotNavigationServer2D::process(double p_delta_time) {
 }
 
 void GodotNavigationServer2D::physics_process(double p_delta_time) {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_CPU, "godot:navigation/2d/physics_process");
 	// Called for each physics process step AFTER node and user script physics_process() and BEFORE PhysicsServer sync.
 	// Will NOT run reliably every rendered frame. If there is no physics step this function will not run.
 	// Use for physics or step depending calculations and updates where the result affects the next step calculation.

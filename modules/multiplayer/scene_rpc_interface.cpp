@@ -37,6 +37,7 @@
 #include "scene/main/multiplayer_api.h"
 #include "scene/main/node.h"
 #include "scene/main/window.h"
+#include "core/profiling/insights.h"
 
 // The RPC meta is composed by a single byte that contains (starting from the least significant bit):
 // - `NetworkCommands` in the first four bits.
@@ -153,6 +154,7 @@ Node *SceneRPCInterface::_process_get_node(int p_from, const uint8_t *p_packet, 
 }
 
 void SceneRPCInterface::process_rpc(int p_from, const uint8_t *p_packet, int p_packet_len) {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_NETWORK, "godot:network/rpc/recv");
 	// Extract packet meta
 	int packet_min_size = 1;
 	int name_id_offset = 1;
@@ -301,6 +303,7 @@ void SceneRPCInterface::_process_rpc(Node *p_node, const uint16_t p_rpc_method_i
 }
 
 void SceneRPCInterface::_send_rpc(Node *p_node, int p_to, uint16_t p_rpc_id, const RPCConfig &p_config, const StringName &p_name, const Variant **p_arg, int p_argcount) {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_NETWORK, "godot:network/rpc/send");
 	Ref<MultiplayerPeer> peer = multiplayer->get_multiplayer_peer();
 	ERR_FAIL_COND_MSG(peer.is_null(), "Attempt to call RPC without active multiplayer peer.");
 
@@ -469,6 +472,7 @@ void SceneRPCInterface::_send_rpc(Node *p_node, int p_to, uint16_t p_rpc_id, con
 }
 
 Error SceneRPCInterface::rpcp(Object *p_obj, int p_peer_id, const StringName &p_method, const Variant **p_arg, int p_argcount) {
+	GodotProfileZoneC(GODOT_INSIGHTS_COLOR_NETWORK, "godot:network/rpc/dispatch");
 	Ref<MultiplayerPeer> peer = multiplayer->get_multiplayer_peer();
 	ERR_FAIL_COND_V_MSG(peer.is_null(), ERR_UNCONFIGURED, "Trying to call an RPC while no multiplayer peer is active.");
 	Node *node = Object::cast_to<Node>(p_obj);
