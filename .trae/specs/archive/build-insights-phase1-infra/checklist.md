@@ -1,0 +1,28 @@
+- [x] modules/insights/ 目录结构创建完成，包含 insights_core/、channels/、gpu/、editor/、tools/ 子目录
+- [x] modules/insights/SCsub 和 config.py 存在且配置正确
+- [x] `scons module_insights_enabled=yes` 编译通过 ✅
+- [ ] `scons module_insights_enabled=no` 编译通过且无 insights 相关符号（需验证）
+- [x] core/profiling/insights.h 存在，包含 7 个宏定义（ZoneC/ZoneH/Fiber/Plot/Message/ResourceLoad/GpuStage）+ 8 个颜色常量
+- [x] 无 GODOT_USE_TRACY 时，所有 insights 宏为 no-op stub，颜色常量为 0，编译零开销
+- [x] GODOT_USE_TRACY 启用时，GodotProfileZoneC 使用 ZoneNamedN + ZoneColor(category) 应用 category 颜色
+- [x] GodotProfileZoneH 自动拼接 "godot:subsystem/op1/op2" 名称
+- [x] InsightsChannel 基类定义完成，包含 name/color/category/is_enabled 属性和虚方法
+- [x] ChannelCategory 枚举包含 CPU/GPU/MEMORY/SCRIPT/LOADING/NETWORK/LOG/CUSTOM（类内枚举）
+- [x] validate_zone_name("godot:physics/3d/step") 返回 true
+- [x] validate_zone_name("invalid_name") 返回 false
+- [x] get_category_from_zone("godot:physics/3d/step") 返回 CHANNEL_CATEGORY_CPU
+- [x] get_category_from_zone("godot:gpu/command/draw") 返回 CHANNEL_CATEGORY_GPU
+- [x] ChannelCategory::CPU 默认颜色为 #7AC0E5
+- [x] InsightsManager 单例可通过 get_singleton() 获取
+- [x] start_capture("res://test.gitracy") 后 is_recording() 返回 true
+- [x] stop_capture() 后 is_recording() 返回 false，返回保存路径
+- [x] 未 start 时 stop_capture() 返回空字符串且不崩溃
+- [x] 引擎关闭时若正在录制则自动停止并保存（析构函数调用 _cleanup）
+- [x] register_channel() / get_channel() / get_channel_count() 工作正常
+- [x] InsightsDatabase 使用内存+二进制序列化存储，open()/create_tables()/insert/query API 完整
+- [x] insert_zone() + query_zone() 可正确插入和查询 zone 数据（含 HashMap 索引）
+- [x] InsightsDatabase::close() 正常关闭，save_to_file()/load_from_file() 支持二进制持久化
+- [x] NativeCapture::start() 启动消费者线程和事件队列
+- [x] NativeCapture 事件入队后消费者线程异步写入 InsightsDatabase（双缓冲+Mutex）
+- [x] NativeCapture::stop() 完成剩余事件处理后退出
+- [x] main/main.cpp 中已添加 InsightsManager::tick() 调用（MODULE_INSIGHTS_ENABLED 条件编译）
