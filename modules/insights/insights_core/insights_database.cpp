@@ -474,6 +474,163 @@ void InsightsDatabase::clear() {
 	zone_name_index.clear();
 }
 
+Array InsightsDatabase::query_zones_by_depth(int p_depth) const {
+	Array result;
+	for (uint32_t i = 0; i < zones.size(); i++) {
+		const ZoneRecord &rec = zones[i];
+		if (rec.depth == p_depth) {
+			Dictionary dict;
+			dict["name"] = rec.name;
+			dict["file"] = rec.file;
+			dict["function"] = rec.function;
+			dict["line"] = rec.line;
+			dict["channel"] = rec.channel;
+			dict["thread_id"] = (int64_t)rec.thread_id;
+			dict["start_ns"] = (int64_t)rec.start_ns;
+			dict["end_ns"] = (int64_t)rec.end_ns;
+			dict["depth"] = rec.depth;
+			dict["parent_zone_id"] = rec.parent_zone_id;
+			result.push_back(dict);
+		}
+	}
+	return result;
+}
+
+Array InsightsDatabase::query_allocations_by_size(uint64_t p_min_size) const {
+	Array result;
+	for (uint32_t i = 0; i < allocations.size(); i++) {
+		const AllocationRecord &rec = allocations[i];
+		if (rec.size >= p_min_size) {
+			Dictionary dict;
+			dict["ptr"] = (int64_t)rec.ptr;
+			dict["size"] = (int64_t)rec.size;
+			dict["site_zone_id"] = rec.site_zone_id;
+			dict["alloc_ns"] = (int64_t)rec.alloc_ns;
+			dict["free_ns"] = (int64_t)rec.free_ns;
+			dict["thread_id"] = (int64_t)rec.thread_id;
+			result.push_back(dict);
+		}
+	}
+	return result;
+}
+
+Array InsightsDatabase::query_resource_loads() const {
+	Array result;
+	for (uint32_t i = 0; i < resource_loads.size(); i++) {
+		const ResourceLoadRecord &rec = resource_loads[i];
+		Dictionary dict;
+		dict["path"] = rec.path;
+		dict["loader"] = rec.loader;
+		dict["start_ns"] = (int64_t)rec.start_ns;
+		dict["end_ns"] = (int64_t)rec.end_ns;
+		dict["size_bytes"] = (int64_t)rec.size_bytes;
+		dict["parent_path"] = rec.parent_path;
+		dict["thread_id"] = (int64_t)rec.thread_id;
+		result.push_back(dict);
+	}
+	return result;
+}
+
+Array InsightsDatabase::query_resource_dependencies(const String &p_path) const {
+	Array result;
+	for (uint32_t i = 0; i < resource_loads.size(); i++) {
+		const ResourceLoadRecord &rec = resource_loads[i];
+		if (rec.parent_path == p_path) {
+			Dictionary dict;
+			dict["path"] = rec.path;
+			dict["loader"] = rec.loader;
+			dict["start_ns"] = (int64_t)rec.start_ns;
+			dict["end_ns"] = (int64_t)rec.end_ns;
+			dict["size_bytes"] = (int64_t)rec.size_bytes;
+			dict["parent_path"] = rec.parent_path;
+			dict["thread_id"] = (int64_t)rec.thread_id;
+			result.push_back(dict);
+		}
+	}
+	return result;
+}
+
+uint64_t InsightsDatabase::get_peak_memory() const {
+	if (allocations.size() == 0) {
+		return 0;
+	}
+
+	// Collect all allocation/free events sorted by time.
+	struct Event {
+		uint64_t time_ns;
+		uint64_t size;
+		bool is_alloc;
+	};
+
+	LocalVector<Event> events;
+	events.reserve(allocations.size() * 2);
+	for (uint32_t i = 0; i < allocations.size(); i++) {
+		const AllocationRecord &rec = allocations[i];
+		events.push_back({ rec.alloc_ns, rec.size, true });
+		if (rec.free_ns != 0) {
+			events.push_back({ rec.free_ns, rec.size, false });
+		}
+	}
+
+	// Sort by time.
+	for (uint32_t i = 0; i < events.size(); i++) {
+		for (uint32_t j = i + 1; j < events.size(); j++) {
+			if (events[j].time_ns < events[i].time_ns) {
+				Event tmp = events[i];
+				events[i] = events[j];
+				events[j] = tmp;
+			}
+		}
+	}
+
+	uint64_t current = 0;
+	uint64_t peak = 0;
+	for (uint32_t i = 0; i < events.size(); i++) {
+		if (events[i].is_alloc) {
+			current += events[i].size;
+		} else {
+			current -= events[i].size;
+		}
+		if (current > peak) {
+			peak = current;
+		}
+	}
+	return peak;
+}
+
+Array InsightsDatabase::get_leaked_allocations() const {
+	Array result;
+	for (uint32_t i = 0; i < allocations.size(); i++) {
+		const AllocationRecord &rec = allocations[i];
+		if (rec.free_ns == 0) {
+			Dictionary dict;
+			dict["ptr"] = (int64_t)rec.ptr;
+			dict["size"] = (int64_t)rec.size;
+			dict["alloc_ns"] = (int64_t)rec.alloc_ns;
+			dict["thread_id"] = (int64_t)rec.thread_id;
+			result.push_back(dict);
+		}
+	}
+	return result;
+}
+
+uint64_t InsightsDatabase::get_total_duration_ns() const {
+	if (zones.size() == 0) {
+		return 0;
+	}
+	uint64_t min_start = zones[0].start_ns;
+	uint64_t max_end = zones[0].end_ns;
+	for (uint32_t i = 1; i < zones.size(); i++) {
+		if (zones[i].start_ns < min_start) {
+			min_start = zones[i].start_ns;
+		}
+		if (zones[i].end_ns > max_end) {
+			max_end = zones[i].end_ns;
+		}
+	}
+	return max_end - min_start;
+}
+
 void InsightsDatabase::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("open", "path"), &InsightsDatabase::open);
 	ClassDB::bind_method(D_METHOD("close"), &InsightsDatabase::close);
@@ -494,6 +651,14 @@ void InsightsDatabase::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("query_resource_loads_in_range", "start_ns", "end_ns"), &InsightsDatabase::query_resource_loads_in_range);
 	ClassDB::bind_method(D_METHOD("query_gpu_zones_for_cpu_zone", "cpu_zone_id"), &InsightsDatabase::query_gpu_zones_for_cpu_zone);
 	ClassDB::bind_method(D_METHOD("query_gpu_zones_in_range", "start_ns", "end_ns"), &InsightsDatabase::query_gpu_zones_in_range);
+
+	ClassDB::bind_method(D_METHOD("query_zones_by_depth", "depth"), &InsightsDatabase::query_zones_by_depth);
+	ClassDB::bind_method(D_METHOD("query_allocations_by_size", "min_size"), &InsightsDatabase::query_allocations_by_size);
+	ClassDB::bind_method(D_METHOD("query_resource_loads"), &InsightsDatabase::query_resource_loads);
+	ClassDB::bind_method(D_METHOD("query_resource_dependencies", "path"), &InsightsDatabase::query_resource_dependencies);
+	ClassDB::bind_method(D_METHOD("get_peak_memory"), &InsightsDatabase::get_peak_memory);
+	ClassDB::bind_method(D_METHOD("get_leaked_allocations"), &InsightsDatabase::get_leaked_allocations);
+	ClassDB::bind_method(D_METHOD("get_total_duration_ns"), &InsightsDatabase::get_total_duration_ns);
 
 	ClassDB::bind_method(D_METHOD("get_zone_count"), &InsightsDatabase::get_zone_count);
 	ClassDB::bind_method(D_METHOD("get_frame_marker_count"), &InsightsDatabase::get_frame_marker_count);

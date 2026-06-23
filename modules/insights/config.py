@@ -23,6 +23,16 @@ def get_doc_classes():
         "GPUProfilerD3D12",
         "GPUProfilerMetal",
         "GPUChannel",
+        "InsightsComparator",
+        "InsightsReplay",
+        "InsightsTimeline",
+        "InsightsFlamegraph",
+        "InsightsMemoryPanel",
+        "InsightsLoadingPanel",
+        "InsightsNetworkPanel",
+        "InsightsComparePanel",
+        "InsightsDock",
+        "InsightsEditorPlugin",
     ]
 
 

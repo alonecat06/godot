@@ -132,6 +132,14 @@ public:
 	Array query_gpu_zones_for_cpu_zone(uint32_t p_cpu_zone_id) const;
 	Array query_gpu_zones_in_range(uint64_t p_start_ns, uint64_t p_end_ns) const;
 
+	Array query_zones_by_depth(int p_depth) const;
+	Array query_allocations_by_size(uint64_t p_min_size) const;
+	Array query_resource_loads() const;
+	Array query_resource_dependencies(const String &p_path) const;
+	uint64_t get_peak_memory() const;
+	Array get_leaked_allocations() const;
+	uint64_t get_total_duration_ns() const;
+
 	uint32_t get_zone_count() const;
 	uint32_t get_frame_marker_count() const;
 	uint32_t get_allocation_count() const;

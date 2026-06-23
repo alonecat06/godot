@@ -48,6 +48,18 @@
 #include "modules/insights/gpu/gpu_profiler_d3d12.h"
 #include "modules/insights/gpu/gpu_profiler_metal.h"
 #include "modules/insights/channels/gpu_channel.h"
+#include "modules/insights/insights_core/insights_comparator.h"
+#include "modules/insights/insights_core/insights_replay.h"
+#ifdef TOOLS_ENABLED
+#include "modules/insights/editor/insights_editor_plugin.h"
+#include "modules/insights/editor/insights_dock.h"
+#include "modules/insights/editor/insights_timeline.h"
+#include "modules/insights/editor/insights_flamegraph.h"
+#include "modules/insights/editor/insights_memory_panel.h"
+#include "modules/insights/editor/insights_loading_panel.h"
+#include "modules/insights/editor/insights_network_panel.h"
+#include "modules/insights/editor/insights_compare_panel.h"
+#endif
 
 void initialize_insights_module(ModuleInitializationLevel p_level) {
 	if (p_level != MODULE_INITIALIZATION_LEVEL_SCENE) {
@@ -68,6 +80,18 @@ void initialize_insights_module(ModuleInitializationLevel p_level) {
 	GDREGISTER_CLASS(GPUProfilerD3D12);
 	GDREGISTER_CLASS(GPUProfilerMetal);
 	GDREGISTER_CLASS(GPUChannel);
+	GDREGISTER_CLASS(InsightsComparator);
+	GDREGISTER_CLASS(InsightsReplay);
+#ifdef TOOLS_ENABLED
+	GDREGISTER_CLASS(InsightsTimeline);
+	GDREGISTER_CLASS(InsightsFlamegraph);
+	GDREGISTER_CLASS(InsightsMemoryPanel);
+	GDREGISTER_CLASS(InsightsLoadingPanel);
+	GDREGISTER_CLASS(InsightsNetworkPanel);
+	GDREGISTER_CLASS(InsightsComparePanel);
+	GDREGISTER_CLASS(InsightsDock);
+	GDREGISTER_CLASS(InsightsEditorPlugin);
+#endif
 	GDREGISTER_CLASS(InsightsManager);
 
 	InsightsManager *insights_manager = memnew(InsightsManager);
