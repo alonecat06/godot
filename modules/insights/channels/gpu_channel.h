@@ -1,5 +1,5 @@
 /**************************************************************************/
-/*  register_types.cpp                                                    */
+/*  gpu_channel.h                                                         */
 /**************************************************************************/
 /*                         This file is part of:                          */
 /*                             GODOT ENGINE                               */
@@ -28,59 +28,46 @@
 /* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
 /**************************************************************************/
 
-#include "register_types.h"
+#pragma once
 
-#include "core/object/class_db.h"
-#include "core/config/engine.h"
-
-#include "modules/insights/insights_core/insights_manager.h"
-#include "modules/insights/insights_core/insights_database.h"
-#include "modules/insights/insights_core/insights_capture.h"
-#include "modules/insights/insights_core/native_capture.h"
-#include "modules/insights/insights_core/resource_load_tracker.h"
 #include "modules/insights/channels/insights_channel.h"
-#include "modules/insights/channels/memory_channel.h"
-#include "modules/insights/channels/log_channel.h"
-#include "modules/insights/channels/script_channel.h"
-#include "modules/insights/channels/loading_channel.h"
-#include "modules/insights/gpu/gpu_timestamp_query.h"
-#include "modules/insights/gpu/gpu_profiler_vulkan.h"
-#include "modules/insights/gpu/gpu_profiler_d3d12.h"
-#include "modules/insights/gpu/gpu_profiler_metal.h"
-#include "modules/insights/channels/gpu_channel.h"
+#include "core/templates/local_vector.h"
+#include "core/templates/hash_map.h"
 
-void initialize_insights_module(ModuleInitializationLevel p_level) {
-	if (p_level != MODULE_INITIALIZATION_LEVEL_SCENE) {
-		return;
-	}
+class GPUChannel : public InsightsChannel {
+	GDCLASS(GPUChannel, InsightsChannel);
 
-	GDREGISTER_CLASS(InsightsChannel);
-	GDREGISTER_CLASS(InsightsDatabase);
-	GDREGISTER_ABSTRACT_CLASS(InsightsCapture);
-	GDREGISTER_CLASS(NativeCapture);
-	GDREGISTER_CLASS(ResourceLoadTracker);
-	GDREGISTER_CLASS(MemoryChannel);
-	GDREGISTER_CLASS(LogChannel);
-	GDREGISTER_CLASS(ScriptChannel);
-	GDREGISTER_CLASS(LoadingChannel);
-	GDREGISTER_ABSTRACT_CLASS(GPUTimestampQuery);
-	GDREGISTER_CLASS(GPUProfilerVulkan);
-	GDREGISTER_CLASS(GPUProfilerD3D12);
-	GDREGISTER_CLASS(GPUProfilerMetal);
-	GDREGISTER_CLASS(GPUChannel);
-	GDREGISTER_CLASS(InsightsManager);
+public:
+	struct GPUZoneRecord {
+		String name;
+		uint32_t queue_id = 0;
+		uint64_t submit_ns = 0;
+		uint64_t start_ns = 0;
+		uint64_t end_ns = 0;
+		uint32_t context_id = 0;
+	};
 
-	InsightsManager *insights_manager = memnew(InsightsManager);
-	Engine::get_singleton()->add_singleton(Engine::Singleton("InsightsManager", insights_manager));
-}
+private:
+	LocalVector<GPUZoneRecord> gpu_zones;
+	uint32_t max_zones = 10000;
 
-void uninitialize_insights_module(ModuleInitializationLevel p_level) {
-	if (p_level != MODULE_INITIALIZATION_LEVEL_SCENE) {
-		return;
-	}
+protected:
+	static void _bind_methods();
 
-	InsightsManager *insights_manager = InsightsManager::get_singleton();
-	if (insights_manager) {
-		memdelete(insights_manager);
-	}
-}
+public:
+	void on_gpu_timestamp(const String &p_name, uint64_t p_gpu_time_ns, uint64_t p_cpu_time_ns, uint32_t p_frame_index);
+	void on_gpu_zone(const String &p_name, uint32_t p_queue_id, uint64_t p_submit_ns, uint64_t p_start_ns, uint64_t p_end_ns, uint32_t p_context_id);
+
+	void collect_frame_timestamps(class RenderingDevice *p_rd);
+
+	TypedArray<Dictionary> get_gpu_zones_in_range(uint64_t p_start_ns, uint64_t p_end_ns) const;
+	TypedArray<Dictionary> get_gpu_zones_for_cpu_zone(uint32_t p_cpu_zone_id) const;
+
+	uint32_t get_zone_count() const;
+
+	virtual void on_event(const Dictionary &p_event_data) override;
+	virtual Dictionary serialize() override;
+
+	GPUChannel();
+	virtual ~GPUChannel();
+};

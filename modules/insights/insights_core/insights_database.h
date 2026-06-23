@@ -129,6 +129,8 @@ public:
 	Array query_frame_markers(uint64_t p_start_ns, uint64_t p_end_ns) const;
 	Array query_allocations_in_range(uint64_t p_start_ns, uint64_t p_end_ns) const;
 	Array query_resource_loads_in_range(uint64_t p_start_ns, uint64_t p_end_ns) const;
+	Array query_gpu_zones_for_cpu_zone(uint32_t p_cpu_zone_id) const;
+	Array query_gpu_zones_in_range(uint64_t p_start_ns, uint64_t p_end_ns) const;
 
 	uint32_t get_zone_count() const;
 	uint32_t get_frame_marker_count() const;

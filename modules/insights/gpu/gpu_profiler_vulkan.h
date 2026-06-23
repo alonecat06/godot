@@ -1,5 +1,5 @@
 /**************************************************************************/
-/*  register_types.cpp                                                    */
+/*  gpu_profiler_vulkan.h                                                 */
 /**************************************************************************/
 /*                         This file is part of:                          */
 /*                             GODOT ENGINE                               */
@@ -28,59 +28,27 @@
 /* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
 /**************************************************************************/
 
-#include "register_types.h"
+#pragma once
 
-#include "core/object/class_db.h"
-#include "core/config/engine.h"
-
-#include "modules/insights/insights_core/insights_manager.h"
-#include "modules/insights/insights_core/insights_database.h"
-#include "modules/insights/insights_core/insights_capture.h"
-#include "modules/insights/insights_core/native_capture.h"
-#include "modules/insights/insights_core/resource_load_tracker.h"
-#include "modules/insights/channels/insights_channel.h"
-#include "modules/insights/channels/memory_channel.h"
-#include "modules/insights/channels/log_channel.h"
-#include "modules/insights/channels/script_channel.h"
-#include "modules/insights/channels/loading_channel.h"
 #include "modules/insights/gpu/gpu_timestamp_query.h"
-#include "modules/insights/gpu/gpu_profiler_vulkan.h"
-#include "modules/insights/gpu/gpu_profiler_d3d12.h"
-#include "modules/insights/gpu/gpu_profiler_metal.h"
-#include "modules/insights/channels/gpu_channel.h"
 
-void initialize_insights_module(ModuleInitializationLevel p_level) {
-	if (p_level != MODULE_INITIALIZATION_LEVEL_SCENE) {
-		return;
-	}
+class GPUProfilerVulkan : public GPUTimestampQuery {
+	GDCLASS(GPUProfilerVulkan, GPUTimestampQuery);
 
-	GDREGISTER_CLASS(InsightsChannel);
-	GDREGISTER_CLASS(InsightsDatabase);
-	GDREGISTER_ABSTRACT_CLASS(InsightsCapture);
-	GDREGISTER_CLASS(NativeCapture);
-	GDREGISTER_CLASS(ResourceLoadTracker);
-	GDREGISTER_CLASS(MemoryChannel);
-	GDREGISTER_CLASS(LogChannel);
-	GDREGISTER_CLASS(ScriptChannel);
-	GDREGISTER_CLASS(LoadingChannel);
-	GDREGISTER_ABSTRACT_CLASS(GPUTimestampQuery);
-	GDREGISTER_CLASS(GPUProfilerVulkan);
-	GDREGISTER_CLASS(GPUProfilerD3D12);
-	GDREGISTER_CLASS(GPUProfilerMetal);
-	GDREGISTER_CLASS(GPUChannel);
-	GDREGISTER_CLASS(InsightsManager);
+private:
+	void *query_pool = nullptr; // VkQueryPool - stored as void* to avoid Vulkan header dependency
+	bool initialized = false;
 
-	InsightsManager *insights_manager = memnew(InsightsManager);
-	Engine::get_singleton()->add_singleton(Engine::Singleton("InsightsManager", insights_manager));
-}
+protected:
+	static void _bind_methods();
 
-void uninitialize_insights_module(ModuleInitializationLevel p_level) {
-	if (p_level != MODULE_INITIALIZATION_LEVEL_SCENE) {
-		return;
-	}
+public:
+	virtual uint32_t write_timestamp(void *p_cmd_buffer, Stage p_stage) override;
+	virtual bool fetch_results(TimestampResult *p_results, uint32_t p_count) override;
+	virtual void begin_frame(void *p_cmd_buffer) override;
+	virtual bool is_supported() const override;
+	virtual float get_timestamp_period() const override;
 
-	InsightsManager *insights_manager = InsightsManager::get_singleton();
-	if (insights_manager) {
-		memdelete(insights_manager);
-	}
-}
+	GPUProfilerVulkan();
+	virtual ~GPUProfilerVulkan();
+};

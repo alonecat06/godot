@@ -102,6 +102,17 @@ void NativeCapture::_process_events() {
 								-1);
 					}
 				} break;
+				case EventType::GPU_ZONE: {
+					if (database.is_valid()) {
+						database->insert_gpu_zone(
+								String(ev.data.gpu_zone.name),
+								ev.data.gpu_zone.queue_id,
+								ev.data.gpu_zone.submit_ns,
+								ev.data.gpu_zone.start_ns,
+								ev.data.gpu_zone.end_ns,
+								ev.data.gpu_zone.context_id);
+					}
+				} break;
 			}
 		}
 		write_buffer.clear();
@@ -311,6 +322,28 @@ void NativeCapture::on_gc_event(int p_generation, int p_objects_collected, uint6
 	ev.data.gc_event.generation = p_generation;
 	ev.data.gc_event.objects_collected = p_objects_collected;
 	ev.data.gc_event.timestamp_ns = p_timestamp_ns;
+
+	MutexLock lock(event_mutex);
+	event_queue.push_back(ev);
+}
+
+void NativeCapture::on_gpu_zone(const String &p_name, uint32_t p_queue_id, uint64_t p_submit_ns, uint64_t p_start_ns, uint64_t p_end_ns, uint32_t p_context_id) {
+	if (!capturing) {
+		return;
+	}
+
+	TraceEvent ev;
+	ev.type = EventType::GPU_ZONE;
+	{
+		CharString cs = p_name.utf8();
+		memcpy(ev.data.gpu_zone.name, cs.ptr(), MIN((size_t)cs.length(), sizeof(ev.data.gpu_zone.name) - 1));
+		ev.data.gpu_zone.name[MIN((size_t)cs.length(), sizeof(ev.data.gpu_zone.name) - 1)] = '\0';
+	}
+	ev.data.gpu_zone.queue_id = p_queue_id;
+	ev.data.gpu_zone.submit_ns = p_submit_ns;
+	ev.data.gpu_zone.start_ns = p_start_ns;
+	ev.data.gpu_zone.end_ns = p_end_ns;
+	ev.data.gpu_zone.context_id = p_context_id;
 
 	MutexLock lock(event_mutex);
 	event_queue.push_back(ev);

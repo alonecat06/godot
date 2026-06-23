@@ -43,6 +43,7 @@
 #include "modules/insights/channels/log_channel.h"
 #include "modules/insights/channels/script_channel.h"
 #include "modules/insights/channels/loading_channel.h"
+#include "modules/insights/channels/gpu_channel.h"
 
 class InsightsManager : public Object {
 	GDCLASS(InsightsManager, Object);
@@ -62,6 +63,7 @@ private:
 	LogChannel *log_channel = nullptr;
 	ScriptChannel *script_channel = nullptr;
 	LoadingChannel *loading_channel = nullptr;
+	GPUChannel *gpu_channel = nullptr;
 
 	void _cleanup();
 	void _register_builtin_channels();
@@ -86,6 +88,7 @@ public:
 	LogChannel *get_log_channel() const;
 	ScriptChannel *get_script_channel() const;
 	LoadingChannel *get_loading_channel() const;
+	GPUChannel *get_gpu_channel() const;
 
 	void tick(double p_delta);
 

@@ -18,6 +18,11 @@ def get_doc_classes():
         "LogChannel",
         "ScriptChannel",
         "LoadingChannel",
+        "GPUTimestampQuery",
+        "GPUProfilerVulkan",
+        "GPUProfilerD3D12",
+        "GPUProfilerMetal",
+        "GPUChannel",
     ]
 
 

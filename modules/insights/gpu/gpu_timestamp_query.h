@@ -1,5 +1,5 @@
 /**************************************************************************/
-/*  register_types.cpp                                                    */
+/*  gpu_timestamp_query.h                                                 */
 /**************************************************************************/
 /*                         This file is part of:                          */
 /*                             GODOT ENGINE                               */
@@ -28,59 +28,53 @@
 /* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
 /**************************************************************************/
 
-#include "register_types.h"
+#pragma once
 
-#include "core/object/class_db.h"
-#include "core/config/engine.h"
+#include "core/object/object.h"
+#include "core/variant/variant.h"
 
-#include "modules/insights/insights_core/insights_manager.h"
-#include "modules/insights/insights_core/insights_database.h"
-#include "modules/insights/insights_core/insights_capture.h"
-#include "modules/insights/insights_core/native_capture.h"
-#include "modules/insights/insights_core/resource_load_tracker.h"
-#include "modules/insights/channels/insights_channel.h"
-#include "modules/insights/channels/memory_channel.h"
-#include "modules/insights/channels/log_channel.h"
-#include "modules/insights/channels/script_channel.h"
-#include "modules/insights/channels/loading_channel.h"
-#include "modules/insights/gpu/gpu_timestamp_query.h"
-#include "modules/insights/gpu/gpu_profiler_vulkan.h"
-#include "modules/insights/gpu/gpu_profiler_d3d12.h"
-#include "modules/insights/gpu/gpu_profiler_metal.h"
-#include "modules/insights/channels/gpu_channel.h"
+class GPUTimestampQuery : public Object {
+	GDCLASS(GPUTimestampQuery, Object);
 
-void initialize_insights_module(ModuleInitializationLevel p_level) {
-	if (p_level != MODULE_INITIALIZATION_LEVEL_SCENE) {
-		return;
-	}
+public:
+	enum Stage {
+		STAGE_BEGIN_RENDER_PASS = 0,
+		STAGE_END_RENDER_PASS = 1,
+		STAGE_DRAW = 2,
+		STAGE_DISPATCH = 3,
+		STAGE_PIPELINE_BARRIER = 4,
+		STAGE_COPY = 5,
+		STAGE_PRESENT = 6,
+	};
 
-	GDREGISTER_CLASS(InsightsChannel);
-	GDREGISTER_CLASS(InsightsDatabase);
-	GDREGISTER_ABSTRACT_CLASS(InsightsCapture);
-	GDREGISTER_CLASS(NativeCapture);
-	GDREGISTER_CLASS(ResourceLoadTracker);
-	GDREGISTER_CLASS(MemoryChannel);
-	GDREGISTER_CLASS(LogChannel);
-	GDREGISTER_CLASS(ScriptChannel);
-	GDREGISTER_CLASS(LoadingChannel);
-	GDREGISTER_ABSTRACT_CLASS(GPUTimestampQuery);
-	GDREGISTER_CLASS(GPUProfilerVulkan);
-	GDREGISTER_CLASS(GPUProfilerD3D12);
-	GDREGISTER_CLASS(GPUProfilerMetal);
-	GDREGISTER_CLASS(GPUChannel);
-	GDREGISTER_CLASS(InsightsManager);
+	struct TimestampResult {
+		uint64_t gpu_timestamp_ns = 0;
+		uint64_t cpu_timestamp_ns = 0;
+		String name;
+		uint32_t query_index = 0;
+	};
 
-	InsightsManager *insights_manager = memnew(InsightsManager);
-	Engine::get_singleton()->add_singleton(Engine::Singleton("InsightsManager", insights_manager));
-}
+protected:
+	static void _bind_methods();
 
-void uninitialize_insights_module(ModuleInitializationLevel p_level) {
-	if (p_level != MODULE_INITIALIZATION_LEVEL_SCENE) {
-		return;
-	}
+	bool supported = false;
+	float timestamp_period = 1.0f;
+	uint32_t max_queries = 256;
+	uint32_t current_query = 0;
 
-	InsightsManager *insights_manager = InsightsManager::get_singleton();
-	if (insights_manager) {
-		memdelete(insights_manager);
-	}
-}
+public:
+	virtual uint32_t write_timestamp(void *p_cmd_buffer, Stage p_stage) = 0;
+	virtual bool fetch_results(TimestampResult *p_results, uint32_t p_count) = 0;
+
+	virtual void begin_frame(void *p_cmd_buffer);
+	virtual void end_frame();
+
+	virtual bool is_supported() const;
+	virtual float get_timestamp_period() const;
+
+	uint32_t get_current_query_index() const;
+	uint32_t get_max_queries() const;
+
+	GPUTimestampQuery();
+	virtual ~GPUTimestampQuery();
+};

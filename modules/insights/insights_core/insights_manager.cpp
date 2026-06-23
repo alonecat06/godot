@@ -150,6 +150,9 @@ void InsightsManager::_register_builtin_channels() {
 
 	loading_channel = memnew(LoadingChannel);
 	register_channel(loading_channel);
+
+	gpu_channel = memnew(GPUChannel);
+	register_channel(gpu_channel);
 }
 
 void InsightsManager::_unregister_builtin_channels() {
@@ -173,6 +176,11 @@ void InsightsManager::_unregister_builtin_channels() {
 		memdelete(loading_channel);
 		loading_channel = nullptr;
 	}
+	if (gpu_channel) {
+		unregister_channel(gpu_channel->get_name());
+		memdelete(gpu_channel);
+		gpu_channel = nullptr;
+	}
 }
 
 MemoryChannel *InsightsManager::get_memory_channel() const {
@@ -189,6 +197,10 @@ ScriptChannel *InsightsManager::get_script_channel() const {
 
 LoadingChannel *InsightsManager::get_loading_channel() const {
 	return loading_channel;
+}
+
+GPUChannel *InsightsManager::get_gpu_channel() const {
+	return gpu_channel;
 }
 
 void InsightsManager::_cleanup() {
@@ -211,6 +223,7 @@ void InsightsManager::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_log_channel"), &InsightsManager::get_log_channel);
 	ClassDB::bind_method(D_METHOD("get_script_channel"), &InsightsManager::get_script_channel);
 	ClassDB::bind_method(D_METHOD("get_loading_channel"), &InsightsManager::get_loading_channel);
+	ClassDB::bind_method(D_METHOD("get_gpu_channel"), &InsightsManager::get_gpu_channel);
 
 	ClassDB::bind_method(D_METHOD("tick", "delta"), &InsightsManager::tick);
 	ClassDB::bind_method(D_METHOD("get_database"), &InsightsManager::get_database);

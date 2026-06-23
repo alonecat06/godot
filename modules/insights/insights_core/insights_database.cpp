@@ -222,6 +222,42 @@ Array InsightsDatabase::query_resource_loads_in_range(uint64_t p_start_ns, uint6
 	return result;
 }
 
+Array InsightsDatabase::query_gpu_zones_for_cpu_zone(uint32_t p_cpu_zone_id) const {
+	Array result;
+	for (uint32_t i = 0; i < gpu_zones.size(); i++) {
+		const GPUZoneRecord &rec = gpu_zones[i];
+		if ((uint32_t)rec.context_id == p_cpu_zone_id) {
+			Dictionary dict;
+			dict["name"] = rec.name;
+			dict["queue_id"] = (int64_t)rec.queue_id;
+			dict["submit_ns"] = (int64_t)rec.submit_ns;
+			dict["start_ns"] = (int64_t)rec.start_ns;
+			dict["end_ns"] = (int64_t)rec.end_ns;
+			dict["context_id"] = rec.context_id;
+			result.push_back(dict);
+		}
+	}
+	return result;
+}
+
+Array InsightsDatabase::query_gpu_zones_in_range(uint64_t p_start_ns, uint64_t p_end_ns) const {
+	Array result;
+	for (uint32_t i = 0; i < gpu_zones.size(); i++) {
+		const GPUZoneRecord &rec = gpu_zones[i];
+		if (rec.start_ns >= p_start_ns && rec.end_ns <= p_end_ns) {
+			Dictionary dict;
+			dict["name"] = rec.name;
+			dict["queue_id"] = (int64_t)rec.queue_id;
+			dict["submit_ns"] = (int64_t)rec.submit_ns;
+			dict["start_ns"] = (int64_t)rec.start_ns;
+			dict["end_ns"] = (int64_t)rec.end_ns;
+			dict["context_id"] = rec.context_id;
+			result.push_back(dict);
+		}
+	}
+	return result;
+}
+
 uint32_t InsightsDatabase::get_zone_count() const {
 	return zones.size();
 }
@@ -456,6 +492,8 @@ void InsightsDatabase::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("query_frame_markers", "start_ns", "end_ns"), &InsightsDatabase::query_frame_markers);
 	ClassDB::bind_method(D_METHOD("query_allocations_in_range", "start_ns", "end_ns"), &InsightsDatabase::query_allocations_in_range);
 	ClassDB::bind_method(D_METHOD("query_resource_loads_in_range", "start_ns", "end_ns"), &InsightsDatabase::query_resource_loads_in_range);
+	ClassDB::bind_method(D_METHOD("query_gpu_zones_for_cpu_zone", "cpu_zone_id"), &InsightsDatabase::query_gpu_zones_for_cpu_zone);
+	ClassDB::bind_method(D_METHOD("query_gpu_zones_in_range", "start_ns", "end_ns"), &InsightsDatabase::query_gpu_zones_in_range);
 
 	ClassDB::bind_method(D_METHOD("get_zone_count"), &InsightsDatabase::get_zone_count);
 	ClassDB::bind_method(D_METHOD("get_frame_marker_count"), &InsightsDatabase::get_frame_marker_count);

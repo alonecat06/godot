@@ -1,5 +1,5 @@
 /**************************************************************************/
-/*  register_types.cpp                                                    */
+/*  gpu_profiler_metal.cpp                                                */
 /**************************************************************************/
 /*                         This file is part of:                          */
 /*                             GODOT ENGINE                               */
@@ -28,59 +28,41 @@
 /* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
 /**************************************************************************/
 
-#include "register_types.h"
-
-#include "core/object/class_db.h"
-#include "core/config/engine.h"
-
-#include "modules/insights/insights_core/insights_manager.h"
-#include "modules/insights/insights_core/insights_database.h"
-#include "modules/insights/insights_core/insights_capture.h"
-#include "modules/insights/insights_core/native_capture.h"
-#include "modules/insights/insights_core/resource_load_tracker.h"
-#include "modules/insights/channels/insights_channel.h"
-#include "modules/insights/channels/memory_channel.h"
-#include "modules/insights/channels/log_channel.h"
-#include "modules/insights/channels/script_channel.h"
-#include "modules/insights/channels/loading_channel.h"
-#include "modules/insights/gpu/gpu_timestamp_query.h"
-#include "modules/insights/gpu/gpu_profiler_vulkan.h"
-#include "modules/insights/gpu/gpu_profiler_d3d12.h"
 #include "modules/insights/gpu/gpu_profiler_metal.h"
-#include "modules/insights/channels/gpu_channel.h"
+#include "core/object/class_db.h"
 
-void initialize_insights_module(ModuleInitializationLevel p_level) {
-	if (p_level != MODULE_INITIALIZATION_LEVEL_SCENE) {
-		return;
+uint32_t GPUProfilerMetal::write_timestamp(void *p_cmd_buffer, Stage p_stage) {
+	if (!initialized) {
+		WARN_PRINT("GPUProfilerMetal: write_timestamp called before initialization.");
+		return 0;
 	}
 
-	GDREGISTER_CLASS(InsightsChannel);
-	GDREGISTER_CLASS(InsightsDatabase);
-	GDREGISTER_ABSTRACT_CLASS(InsightsCapture);
-	GDREGISTER_CLASS(NativeCapture);
-	GDREGISTER_CLASS(ResourceLoadTracker);
-	GDREGISTER_CLASS(MemoryChannel);
-	GDREGISTER_CLASS(LogChannel);
-	GDREGISTER_CLASS(ScriptChannel);
-	GDREGISTER_CLASS(LoadingChannel);
-	GDREGISTER_ABSTRACT_CLASS(GPUTimestampQuery);
-	GDREGISTER_CLASS(GPUProfilerVulkan);
-	GDREGISTER_CLASS(GPUProfilerD3D12);
-	GDREGISTER_CLASS(GPUProfilerMetal);
-	GDREGISTER_CLASS(GPUChannel);
-	GDREGISTER_CLASS(InsightsManager);
-
-	InsightsManager *insights_manager = memnew(InsightsManager);
-	Engine::get_singleton()->add_singleton(Engine::Singleton("InsightsManager", insights_manager));
+	// Metal uses command buffer start/end time rather than query pools,
+	// so we just track the query index.
+	uint32_t index = current_query;
+	current_query++;
+	return index;
 }
 
-void uninitialize_insights_module(ModuleInitializationLevel p_level) {
-	if (p_level != MODULE_INITIALIZATION_LEVEL_SCENE) {
-		return;
-	}
+bool GPUProfilerMetal::fetch_results(TimestampResult *p_results, uint32_t p_count) {
+	// Stub - actual Metal timestamp operations require RD internals.
+	return false;
+}
 
-	InsightsManager *insights_manager = InsightsManager::get_singleton();
-	if (insights_manager) {
-		memdelete(insights_manager);
-	}
+void GPUProfilerMetal::begin_frame(void *p_cmd_buffer) {
+	current_query = 0;
+}
+
+bool GPUProfilerMetal::is_supported() const {
+	return initialized;
+}
+
+void GPUProfilerMetal::_bind_methods() {
+	ClassDB::bind_method(D_METHOD("is_supported"), &GPUProfilerMetal::is_supported);
+}
+
+GPUProfilerMetal::GPUProfilerMetal() {
+}
+
+GPUProfilerMetal::~GPUProfilerMetal() {
 }

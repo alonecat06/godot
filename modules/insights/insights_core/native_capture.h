@@ -50,6 +50,7 @@ public:
 		RESOURCE_LOAD,
 		LOG_MESSAGE,
 		GC_EVENT,
+		GPU_ZONE,
 	};
 
 	struct TraceEvent {
@@ -106,6 +107,14 @@ public:
 				int objects_collected;
 				uint64_t timestamp_ns;
 			} gc_event;
+			struct {
+				char name[128];
+				uint32_t queue_id;
+				uint64_t submit_ns;
+				uint64_t start_ns;
+				uint64_t end_ns;
+				uint32_t context_id;
+			} gpu_zone;
 		} data;
 	};
 
@@ -143,6 +152,7 @@ public:
 	virtual void on_resource_load(const String &p_path, const String &p_loader, uint64_t p_start_ns, uint64_t p_end_ns, uint64_t p_size_bytes, const String &p_parent_path, uint64_t p_thread_id) override;
 	virtual void on_log_message(int p_level, const String &p_text, const String &p_file, int p_line, uint64_t p_timestamp_ns, int p_zone_id) override;
 	virtual void on_gc_event(int p_generation, int p_objects_collected, uint64_t p_timestamp_ns) override;
+	virtual void on_gpu_zone(const String &p_name, uint32_t p_queue_id, uint64_t p_submit_ns, uint64_t p_start_ns, uint64_t p_end_ns, uint32_t p_context_id) override;
 	virtual void flush() override;
 
 	void set_database(const Ref<InsightsDatabase> &p_database);
