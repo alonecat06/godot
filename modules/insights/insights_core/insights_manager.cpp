@@ -109,6 +109,51 @@ void InsightsManager::disconnect_from_remote() {
 	connected_to_remote = false;
 }
 
+Error InsightsManager::start_live_capture(const String &p_host, int p_port) {
+	if (live_mode) {
+		return ERR_ALREADY_IN_USE;
+	}
+	// Stub: actual TCP streaming requires network implementation.
+	live_database.instantiate();
+	live_database->open("res://live_capture.gitracy");
+	live_mode = true;
+	return OK;
+}
+
+void InsightsManager::stop_live_capture() {
+	if (!live_mode) {
+		return;
+	}
+	live_mode = false;
+	if (live_database.is_valid()) {
+		live_database->close();
+	}
+	live_database.unref();
+}
+
+bool InsightsManager::is_live_mode() const {
+	return live_mode;
+}
+
+Ref<InsightsDatabase> InsightsManager::get_live_database() const {
+	return live_database;
+}
+
+void InsightsManager::on_live_frame_received(uint64_t p_start_ns, uint64_t p_end_ns) {
+	if (!live_mode || live_database.is_null()) {
+		return;
+	}
+	int frame_index = live_database->get_frame_marker_count();
+	live_database->insert_frame_marker(frame_index, p_start_ns, p_end_ns);
+}
+
+void InsightsManager::on_live_zone_received(const String &p_name, uint64_t p_thread_id, uint64_t p_start_ns, uint64_t p_end_ns, int p_depth) {
+	if (!live_mode || live_database.is_null()) {
+		return;
+	}
+	live_database->insert_zone(p_name, "", 0, "", "", p_thread_id, p_start_ns, p_end_ns, p_depth, -1);
+}
+
 void InsightsManager::register_channel(InsightsChannel *p_channel) {
 	if (!p_channel) {
 		return;
@@ -218,6 +263,9 @@ GPUChannel *InsightsManager::get_gpu_channel() const {
 }
 
 void InsightsManager::_cleanup() {
+	if (live_mode) {
+		stop_live_capture();
+	}
 	if (recording) {
 		(void)stop_capture();
 	}
@@ -230,6 +278,12 @@ void InsightsManager::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("is_connected_to_remote"), &InsightsManager::is_connected_to_remote);
 	ClassDB::bind_method(D_METHOD("connect_to_remote", "host", "port"), &InsightsManager::connect_to_remote);
 	ClassDB::bind_method(D_METHOD("disconnect_from_remote"), &InsightsManager::disconnect_from_remote);
+	ClassDB::bind_method(D_METHOD("start_live_capture", "host", "port"), &InsightsManager::start_live_capture);
+	ClassDB::bind_method(D_METHOD("stop_live_capture"), &InsightsManager::stop_live_capture);
+	ClassDB::bind_method(D_METHOD("is_live_mode"), &InsightsManager::is_live_mode);
+	ClassDB::bind_method(D_METHOD("get_live_database"), &InsightsManager::get_live_database);
+	ClassDB::bind_method(D_METHOD("on_live_frame_received", "start_ns", "end_ns"), &InsightsManager::on_live_frame_received);
+	ClassDB::bind_method(D_METHOD("on_live_zone_received", "name", "thread_id", "start_ns", "end_ns", "depth"), &InsightsManager::on_live_zone_received);
 
 	ClassDB::bind_method(D_METHOD("register_channel", "channel"), &InsightsManager::register_channel);
 	ClassDB::bind_method(D_METHOD("unregister_channel", "name"), &InsightsManager::unregister_channel);

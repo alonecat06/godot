@@ -53,6 +53,8 @@ private:
 
 	bool recording = false;
 	bool connected_to_remote = false;
+	bool live_mode = false;
+	Ref<InsightsDatabase> live_database;
 	String capture_path;
 
 	Ref<InsightsDatabase> database;
@@ -82,6 +84,12 @@ public:
 	bool is_connected_to_remote() const;
 	Error connect_to_remote(const String &p_host, int p_port);
 	void disconnect_from_remote();
+	Error start_live_capture(const String &p_host, int p_port);
+	void stop_live_capture();
+	bool is_live_mode() const;
+	Ref<InsightsDatabase> get_live_database() const;
+	void on_live_frame_received(uint64_t p_start_ns, uint64_t p_end_ns);
+	void on_live_zone_received(const String &p_name, uint64_t p_thread_id, uint64_t p_start_ns, uint64_t p_end_ns, int p_depth);
 
 	void register_channel(InsightsChannel *p_channel);
 	void unregister_channel(const StringName &p_name);

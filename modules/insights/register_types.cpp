@@ -55,7 +55,12 @@
 #include "modules/insights/tools/insights_launcher.h"
 #include "modules/insights/tools/tracy_converter.h"
 #include "modules/insights/tools/insights_cli.h"
+#include "modules/insights/channels/cpu_channel.h"
+#include "modules/insights/channels/custom_channel.h"
+#include "modules/insights/tools/web_exporter.h"
+#include "modules/insights/insights_core/ai_analyzer.h"
 #ifdef TOOLS_ENABLED
+#include "modules/insights/editor/insights_contention_panel.h"
 #include "modules/insights/editor/insights_editor_plugin.h"
 #include "modules/insights/editor/insights_dock.h"
 #include "modules/insights/editor/insights_timeline.h"
