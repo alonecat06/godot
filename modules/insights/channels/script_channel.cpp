@@ -62,6 +62,32 @@ void ScriptChannel::leave_function() {
 	}
 }
 
+void ScriptChannel::suspend_function(const String &p_name) {
+	if (call_records.is_empty()) {
+		return;
+	}
+	// Mark the most recent call record for this function as suspended.
+	for (int i = call_records.size() - 1; i >= 0; i--) {
+		if (call_records[i].function_name == p_name && call_records[i].end_ns == 0) {
+			call_records[i].was_suspended = true;
+			call_records[i].suspend_ns = OS::get_singleton()->get_ticks_usec() * 1000;
+			break;
+		}
+	}
+}
+
+void ScriptChannel::resume_function(const String &p_name) {
+	if (call_records.is_empty()) {
+		return;
+	}
+	for (int i = call_records.size() - 1; i >= 0; i--) {
+		if (call_records[i].function_name == p_name && call_records[i].was_suspended && call_records[i].resume_ns == 0) {
+			call_records[i].resume_ns = OS::get_singleton()->get_ticks_usec() * 1000;
+			break;
+		}
+	}
+}
+
 void ScriptChannel::on_gc_event(int p_generation, int p_objects_collected, uint64_t p_timestamp_ns) {
 	GCEvent ev;
 	ev.generation = p_generation;
@@ -82,6 +108,9 @@ TypedArray<Dictionary> ScriptChannel::get_call_records() const {
 		d["start_ns"] = call_records[i].start_ns;
 		d["end_ns"] = call_records[i].end_ns;
 		d["depth"] = call_records[i].depth;
+		d["was_suspended"] = call_records[i].was_suspended;
+		d["suspend_ns"] = (int64_t)call_records[i].suspend_ns;
+		d["resume_ns"] = (int64_t)call_records[i].resume_ns;
 		arr[i] = d;
 	}
 	return arr;
@@ -144,6 +173,8 @@ Dictionary ScriptChannel::serialize() {
 void ScriptChannel::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("enter_function", "name", "file", "line", "language"), &ScriptChannel::enter_function, DEFVAL(LANGUAGE_GDSCRIPT));
 	ClassDB::bind_method(D_METHOD("leave_function"), &ScriptChannel::leave_function);
+	ClassDB::bind_method(D_METHOD("suspend_function", "name"), &ScriptChannel::suspend_function);
+	ClassDB::bind_method(D_METHOD("resume_function", "name"), &ScriptChannel::resume_function);
 	ClassDB::bind_method(D_METHOD("on_gc_event", "generation", "objects_collected", "timestamp_ns"), &ScriptChannel::on_gc_event, DEFVAL((uint64_t)0));
 	ClassDB::bind_method(D_METHOD("get_call_records"), &ScriptChannel::get_call_records);
 	ClassDB::bind_method(D_METHOD("get_gc_events"), &ScriptChannel::get_gc_events);

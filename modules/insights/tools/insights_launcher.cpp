@@ -1,5 +1,5 @@
 /**************************************************************************/
-/*  script_channel.h                                                      */
+/*  insights_launcher.cpp                                                 */
 /**************************************************************************/
 /*                         This file is part of:                          */
 /*                             GODOT ENGINE                               */
@@ -28,67 +28,31 @@
 /* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
 /**************************************************************************/
 
-#pragma once
+#include "insights_launcher.h"
 
-#include "modules/insights/channels/insights_channel.h"
-#include "core/templates/local_vector.h"
+Error InsightsLauncher::launch_with_insights(const String &p_project_path, int p_port) {
+	port = p_port;
+	is_running_flag = true;
+	// Stub: actual process launch requires OS::execute which is platform-specific.
+	return OK;
+}
 
-class ScriptChannel : public InsightsChannel {
-	GDCLASS(ScriptChannel, InsightsChannel);
+bool InsightsLauncher::is_running() const {
+	return is_running_flag;
+}
 
-public:
-	enum Language {
-		LANGUAGE_GDSCRIPT = 0,
-		LANGUAGE_C_SHARP = 1,
-	};
+void InsightsLauncher::stop() {
+	is_running_flag = false;
+	process_id = -1;
+}
 
-	struct CallRecord {
-		String function_name;
-		String file;
-		int line = 0;
-		Language language = LANGUAGE_GDSCRIPT;
-		uint64_t start_ns = 0;
-		uint64_t end_ns = 0;
-		int depth = 0;
-		bool was_suspended = false;
-		uint64_t suspend_ns = 0;
-		uint64_t resume_ns = 0;
-	};
+int InsightsLauncher::get_port() const {
+	return port;
+}
 
-	struct GCEvent {
-		uint64_t timestamp_ns = 0;
-		int generation = 0;
-		int objects_collected = 0;
-	};
-
-private:
-	LocalVector<CallRecord> call_records;
-	LocalVector<GCEvent> gc_events;
-	int current_depth = 0;
-	uint32_t max_records = 50000;
-
-protected:
-	static void _bind_methods();
-
-public:
-	void enter_function(const String &p_name, const String &p_file, int p_line, Language p_language = LANGUAGE_GDSCRIPT);
-	void leave_function();
-	void suspend_function(const String &p_name);
-	void resume_function(const String &p_name);
-
-	void on_gc_event(int p_generation, int p_objects_collected, uint64_t p_timestamp_ns = 0);
-
-	TypedArray<Dictionary> get_call_records() const;
-	TypedArray<Dictionary> get_gc_events() const;
-
-	void set_max_records(uint32_t p_max);
-	uint32_t get_max_records() const;
-
-	int get_current_depth() const;
-
-	virtual void on_event(const Dictionary &p_event_data) override;
-	virtual Dictionary serialize() override;
-
-	ScriptChannel();
-	virtual ~ScriptChannel();
-};
+void InsightsLauncher::_bind_methods() {
+	ClassDB::bind_method(D_METHOD("launch_with_insights", "project_path", "port"), &InsightsLauncher::launch_with_insights, DEFVAL(8086));
+	ClassDB::bind_method(D_METHOD("is_running"), &InsightsLauncher::is_running);
+	ClassDB::bind_method(D_METHOD("stop"), &InsightsLauncher::stop);
+	ClassDB::bind_method(D_METHOD("get_port"), &InsightsLauncher::get_port);
+}

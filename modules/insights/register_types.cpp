@@ -50,6 +50,11 @@
 #include "modules/insights/channels/gpu_channel.h"
 #include "modules/insights/insights_core/insights_comparator.h"
 #include "modules/insights/insights_core/insights_replay.h"
+#include "modules/insights/scripting/mono_profiler_bridge.h"
+#include "modules/insights/scripting/gdscript_profiler_decorator.h"
+#include "modules/insights/tools/insights_launcher.h"
+#include "modules/insights/tools/tracy_converter.h"
+#include "modules/insights/tools/insights_cli.h"
 #ifdef TOOLS_ENABLED
 #include "modules/insights/editor/insights_editor_plugin.h"
 #include "modules/insights/editor/insights_dock.h"
@@ -82,6 +87,11 @@ void initialize_insights_module(ModuleInitializationLevel p_level) {
 	GDREGISTER_CLASS(GPUChannel);
 	GDREGISTER_CLASS(InsightsComparator);
 	GDREGISTER_CLASS(InsightsReplay);
+	GDREGISTER_CLASS(MonoProfilerBridge);
+	GDREGISTER_CLASS(GDScriptProfilerDecorator);
+	GDREGISTER_CLASS(InsightsLauncher);
+	GDREGISTER_CLASS(TracyConverter);
+	GDREGISTER_CLASS(InsightsCLI);
 #ifdef TOOLS_ENABLED
 	GDREGISTER_CLASS(InsightsTimeline);
 	GDREGISTER_CLASS(InsightsFlamegraph);

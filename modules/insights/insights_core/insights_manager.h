@@ -52,6 +52,7 @@ private:
 	static InsightsManager *singleton;
 
 	bool recording = false;
+	bool connected_to_remote = false;
 	String capture_path;
 
 	Ref<InsightsDatabase> database;
@@ -78,6 +79,9 @@ public:
 	Error start_capture(const String &p_path = "res://capture.gitracy");
 	String stop_capture();
 	bool is_recording() const;
+	bool is_connected_to_remote() const;
+	Error connect_to_remote(const String &p_host, int p_port);
+	void disconnect_from_remote();
 
 	void register_channel(InsightsChannel *p_channel);
 	void unregister_channel(const StringName &p_name);

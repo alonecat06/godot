@@ -95,6 +95,20 @@ bool InsightsManager::is_recording() const {
 	return recording;
 }
 
+bool InsightsManager::is_connected_to_remote() const {
+	return connected_to_remote;
+}
+
+Error InsightsManager::connect_to_remote(const String &p_host, int p_port) {
+	// Stub: actual Tracy remote connection requires network implementation.
+	connected_to_remote = true;
+	return OK;
+}
+
+void InsightsManager::disconnect_from_remote() {
+	connected_to_remote = false;
+}
+
 void InsightsManager::register_channel(InsightsChannel *p_channel) {
 	if (!p_channel) {
 		return;
@@ -213,6 +227,9 @@ void InsightsManager::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("start_capture", "path"), &InsightsManager::start_capture, DEFVAL("res://capture.gitracy"));
 	ClassDB::bind_method(D_METHOD("stop_capture"), &InsightsManager::stop_capture);
 	ClassDB::bind_method(D_METHOD("is_recording"), &InsightsManager::is_recording);
+	ClassDB::bind_method(D_METHOD("is_connected_to_remote"), &InsightsManager::is_connected_to_remote);
+	ClassDB::bind_method(D_METHOD("connect_to_remote", "host", "port"), &InsightsManager::connect_to_remote);
+	ClassDB::bind_method(D_METHOD("disconnect_from_remote"), &InsightsManager::disconnect_from_remote);
 
 	ClassDB::bind_method(D_METHOD("register_channel", "channel"), &InsightsManager::register_channel);
 	ClassDB::bind_method(D_METHOD("unregister_channel", "name"), &InsightsManager::unregister_channel);

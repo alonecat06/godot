@@ -1,5 +1,5 @@
 /**************************************************************************/
-/*  script_channel.h                                                      */
+/*  gdscript_profiler_decorator.cpp                                       */
 /**************************************************************************/
 /*                         This file is part of:                          */
 /*                             GODOT ENGINE                               */
@@ -28,67 +28,38 @@
 /* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
 /**************************************************************************/
 
-#pragma once
+#include "gdscript_profiler_decorator.h"
 
-#include "modules/insights/channels/insights_channel.h"
-#include "core/templates/local_vector.h"
+bool GDScriptProfilerDecorator::is_profiler_zone_decorator(const String &p_annotation) const {
+	return p_annotation.find("@profiler_zone") >= 0;
+}
 
-class ScriptChannel : public InsightsChannel {
-	GDCLASS(ScriptChannel, InsightsChannel);
+String GDScriptProfilerDecorator::parse_decorator(const String &p_annotation) const {
+	if (p_annotation == "@profiler_zone") {
+		return String(); // Use function name as zone name.
+	}
 
-public:
-	enum Language {
-		LANGUAGE_GDSCRIPT = 0,
-		LANGUAGE_C_SHARP = 1,
-	};
+	// Match @profiler_zone("name") pattern.
+	String pattern = "@profiler_zone(\"";
+	int start = p_annotation.find(pattern);
+	if (start < 0) {
+		return String();
+	}
+	start += pattern.length();
+	int end = p_annotation.find("\")", start);
+	if (end < 0) {
+		return String();
+	}
+	return p_annotation.substr(start, end - start);
+}
 
-	struct CallRecord {
-		String function_name;
-		String file;
-		int line = 0;
-		Language language = LANGUAGE_GDSCRIPT;
-		uint64_t start_ns = 0;
-		uint64_t end_ns = 0;
-		int depth = 0;
-		bool was_suspended = false;
-		uint64_t suspend_ns = 0;
-		uint64_t resume_ns = 0;
-	};
+String GDScriptProfilerDecorator::generate_zone_code(const String &p_function_name, const String &p_zone_name) const {
+	String zone = p_zone_name.is_empty() ? p_function_name : p_zone_name;
+	return vformat("GodotProfileZoneC(\"script\", \"%s\")", zone);
+}
 
-	struct GCEvent {
-		uint64_t timestamp_ns = 0;
-		int generation = 0;
-		int objects_collected = 0;
-	};
-
-private:
-	LocalVector<CallRecord> call_records;
-	LocalVector<GCEvent> gc_events;
-	int current_depth = 0;
-	uint32_t max_records = 50000;
-
-protected:
-	static void _bind_methods();
-
-public:
-	void enter_function(const String &p_name, const String &p_file, int p_line, Language p_language = LANGUAGE_GDSCRIPT);
-	void leave_function();
-	void suspend_function(const String &p_name);
-	void resume_function(const String &p_name);
-
-	void on_gc_event(int p_generation, int p_objects_collected, uint64_t p_timestamp_ns = 0);
-
-	TypedArray<Dictionary> get_call_records() const;
-	TypedArray<Dictionary> get_gc_events() const;
-
-	void set_max_records(uint32_t p_max);
-	uint32_t get_max_records() const;
-
-	int get_current_depth() const;
-
-	virtual void on_event(const Dictionary &p_event_data) override;
-	virtual Dictionary serialize() override;
-
-	ScriptChannel();
-	virtual ~ScriptChannel();
-};
+void GDScriptProfilerDecorator::_bind_methods() {
+	ClassDB::bind_method(D_METHOD("parse_decorator", "annotation"), &GDScriptProfilerDecorator::parse_decorator);
+	ClassDB::bind_method(D_METHOD("generate_zone_code", "function_name", "zone_name"), &GDScriptProfilerDecorator::generate_zone_code);
+	ClassDB::bind_method(D_METHOD("is_profiler_zone_decorator", "annotation"), &GDScriptProfilerDecorator::is_profiler_zone_decorator);
+}

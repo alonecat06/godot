@@ -1,5 +1,5 @@
 /**************************************************************************/
-/*  script_channel.h                                                      */
+/*  tracy_converter.h                                                     */
 /**************************************************************************/
 /*                         This file is part of:                          */
 /*                             GODOT ENGINE                               */
@@ -30,65 +30,16 @@
 
 #pragma once
 
-#include "modules/insights/channels/insights_channel.h"
-#include "core/templates/local_vector.h"
+#include "core/object/ref_counted.h"
 
-class ScriptChannel : public InsightsChannel {
-	GDCLASS(ScriptChannel, InsightsChannel);
+class TracyConverter : public RefCounted {
+	GDCLASS(TracyConverter, RefCounted);
 
 public:
-	enum Language {
-		LANGUAGE_GDSCRIPT = 0,
-		LANGUAGE_C_SHARP = 1,
-	};
-
-	struct CallRecord {
-		String function_name;
-		String file;
-		int line = 0;
-		Language language = LANGUAGE_GDSCRIPT;
-		uint64_t start_ns = 0;
-		uint64_t end_ns = 0;
-		int depth = 0;
-		bool was_suspended = false;
-		uint64_t suspend_ns = 0;
-		uint64_t resume_ns = 0;
-	};
-
-	struct GCEvent {
-		uint64_t timestamp_ns = 0;
-		int generation = 0;
-		int objects_collected = 0;
-	};
-
-private:
-	LocalVector<CallRecord> call_records;
-	LocalVector<GCEvent> gc_events;
-	int current_depth = 0;
-	uint32_t max_records = 50000;
+	Error gitracy_to_tracy(const String &p_gitracy_path, const String &p_tracy_path) const;
+	Error tracy_to_gitracy(const String &p_tracy_path, const String &p_gitracy_path) const;
+	bool is_tracy_file(const String &p_path) const;
 
 protected:
 	static void _bind_methods();
-
-public:
-	void enter_function(const String &p_name, const String &p_file, int p_line, Language p_language = LANGUAGE_GDSCRIPT);
-	void leave_function();
-	void suspend_function(const String &p_name);
-	void resume_function(const String &p_name);
-
-	void on_gc_event(int p_generation, int p_objects_collected, uint64_t p_timestamp_ns = 0);
-
-	TypedArray<Dictionary> get_call_records() const;
-	TypedArray<Dictionary> get_gc_events() const;
-
-	void set_max_records(uint32_t p_max);
-	uint32_t get_max_records() const;
-
-	int get_current_depth() const;
-
-	virtual void on_event(const Dictionary &p_event_data) override;
-	virtual Dictionary serialize() override;
-
-	ScriptChannel();
-	virtual ~ScriptChannel();
 };
