@@ -188,6 +188,8 @@ GDScriptParser::GDScriptParser() {
 		// Networking.
 		// Keep in sync with `rpc_annotation()` and `SceneRPCInterface::_parse_rpc_config()`.
 		register_annotation(MethodInfo("@rpc", PropertyInfo(Variant::STRING, "mode"), PropertyInfo(Variant::STRING, "sync"), PropertyInfo(Variant::STRING, "transfer_mode"), PropertyInfo(Variant::INT, "transfer_channel")), AnnotationInfo::FUNCTION, &GDScriptParser::rpc_annotation, varray("authority", "call_remote", "reliable", 0));
+		// Profiler.
+		register_annotation(MethodInfo("@profiler_zone", PropertyInfo(Variant::STRING, "custom_name")), AnnotationInfo::FUNCTION, &GDScriptParser::profiler_zone_annotation, varray(""));
 	}
 
 #ifdef DEBUG_ENABLED
@@ -5250,6 +5252,21 @@ bool GDScriptParser::rpc_annotation(AnnotationNode *p_annotation, Node *p_target
 		}
 	}
 	function->rpc_config = rpc_config;
+	return true;
+}
+
+bool GDScriptParser::profiler_zone_annotation(AnnotationNode *p_annotation, Node *p_target, ClassNode *p_class) {
+	ERR_FAIL_COND_V_MSG(p_target->type != Node::FUNCTION, false, vformat(R"("%s" annotation can only be applied to functions.)", p_annotation->name));
+
+	FunctionNode *function = static_cast<FunctionNode *>(p_target);
+	if (function->profiler_zone) {
+		push_error(R"("@profiler_zone" annotation can only be used once per function.)", p_annotation);
+		return false;
+	}
+	function->profiler_zone = true;
+	if (!p_annotation->resolved_arguments.is_empty() && p_annotation->resolved_arguments[0].get_type() == Variant::STRING) {
+		function->profiler_zone_name = p_annotation->resolved_arguments[0].operator String();
+	}
 	return true;
 }
 
