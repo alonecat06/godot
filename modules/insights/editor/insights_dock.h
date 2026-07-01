@@ -36,6 +36,7 @@
 #include "scene/gui/tab_container.h"
 #include "scene/gui/button.h"
 #include "modules/insights/insights_core/insights_database.h"
+#include "editor/docks/editor_dock.h"
 
 class InsightsTimeline;
 class InsightsFlamegraph;
@@ -56,12 +57,14 @@ private:
 	Button *btn_open = nullptr;
 	Button *btn_compare = nullptr;
 	Button *btn_clear = nullptr;
+	Button *btn_float = nullptr;
 	Ref<InsightsDatabase> current_database;
 
 protected:
 	static void _bind_methods();
 
 public:
+	void _on_float_pressed();
 	void set_database(const Ref<InsightsDatabase> &p_db);
 	Ref<InsightsDatabase> get_database() const;
 	InsightsTimeline *get_timeline() const;

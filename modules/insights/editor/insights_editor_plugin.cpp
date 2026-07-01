@@ -34,28 +34,24 @@
 
 #include "modules/insights/editor/insights_dock.h"
 #include "modules/insights/insights_core/insights_manager.h"
+#include "editor/docks/editor_dock.h"
 
 InsightsEditorPlugin::InsightsEditorPlugin() {
 	bottom_dock = memnew(InsightsDock);
 	add_control_to_bottom_panel(bottom_dock, TTR("Insights"));
-}
 
-bool InsightsEditorPlugin::has_main_screen() const {
-	return true;
+	// Make the dock appear in the "Editor > Editor Panels" menu, persist after closing, and support floating.
+	EditorDock *dock = Object::cast_to<EditorDock>(bottom_dock->get_parent());
+	if (dock) {
+		dock->set_global(true);
+		dock->set_transient(false);
+		dock->set_closable(true);
+		dock->set_available_layouts(EditorDock::DOCK_LAYOUT_HORIZONTAL | EditorDock::DOCK_LAYOUT_FLOATING);
+	}
 }
 
 String InsightsEditorPlugin::get_plugin_name() const {
 	return TTR("Insights");
-}
-
-void InsightsEditorPlugin::make_visible(bool p_visible) {
-	if (bottom_dock) {
-		if (p_visible) {
-			bottom_dock->show();
-		} else {
-			bottom_dock->hide();
-		}
-	}
 }
 
 InsightsDock *InsightsEditorPlugin::get_bottom_dock() const {

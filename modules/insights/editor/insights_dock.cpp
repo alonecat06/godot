@@ -38,6 +38,8 @@
 #include "modules/insights/editor/insights_loading_panel.h"
 #include "modules/insights/editor/insights_network_panel.h"
 #include "modules/insights/editor/insights_compare_panel.h"
+#include "editor/docks/editor_dock_manager.h"
+#include "editor/editor_node.h"
 
 InsightsDock::InsightsDock() {
 	// Toolbar.
@@ -63,6 +65,13 @@ InsightsDock::InsightsDock() {
 	btn_clear = memnew(Button);
 	btn_clear->set_text(TTR("Clear"));
 	toolbar->add_child(btn_clear);
+
+	// Float button — moves Insights to its own window.
+	btn_float = memnew(Button);
+	btn_float->set_text(TTR("Float"));
+	btn_float->set_tooltip_text(TTR("Make the Insights panel floating."));
+	toolbar->add_child(btn_float);
+	btn_float->connect(SceneStringName(pressed), callable_mp(this, &InsightsDock::_on_float_pressed));
 
 	// Channel tabs.
 	channel_tabs = memnew(TabContainer);
@@ -119,6 +128,13 @@ InsightsDock::InsightsDock() {
 	Button *btn_step = memnew(Button);
 	btn_step->set_text(TTR("Step"));
 	playback_bar->add_child(btn_step);
+}
+
+void InsightsDock::_on_float_pressed() {
+	EditorDock *dock = Object::cast_to<EditorDock>(get_parent());
+	if (dock) {
+		EditorDockManager::get_singleton()->make_dock_floating(dock);
+	}
 }
 
 void InsightsDock::set_database(const Ref<InsightsDatabase> &p_db) {

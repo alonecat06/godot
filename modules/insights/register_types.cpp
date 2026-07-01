@@ -32,6 +32,9 @@
 
 #include "core/object/class_db.h"
 #include "core/config/engine.h"
+#ifdef TOOLS_ENABLED
+#include "editor/plugins/editor_plugin.h"
+#endif
 
 #include "modules/insights/insights_core/insights_manager.h"
 #include "modules/insights/insights_core/insights_database.h"
@@ -106,6 +109,7 @@ void initialize_insights_module(ModuleInitializationLevel p_level) {
 	GDREGISTER_CLASS(InsightsComparePanel);
 	GDREGISTER_CLASS(InsightsDock);
 	GDREGISTER_CLASS(InsightsEditorPlugin);
+	EditorPlugins::add_by_type<InsightsEditorPlugin>();
 #endif
 	GDREGISTER_CLASS(InsightsManager);
 

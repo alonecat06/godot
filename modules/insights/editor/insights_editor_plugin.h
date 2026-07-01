@@ -46,9 +46,7 @@ protected:
 	static void _bind_methods();
 
 public:
-	virtual bool has_main_screen() const override;
 	virtual String get_plugin_name() const override;
-	virtual void make_visible(bool p_visible) override;
 
 	InsightsDock *get_bottom_dock() const;
 
