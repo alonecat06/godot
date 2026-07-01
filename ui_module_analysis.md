@@ -1073,3 +1073,487 @@ Godot MVVM 成熟度：★☆☆☆☆ (1/5)
 | **P2** | 导航/路由 | 多页面应用 |
 | **P3** | 验证框架 | 表单验证 |
 | **P3** | 依赖注入 | ViewModel 生命周期管理 |
+
+## 12. MVVM 实现方案评估
+
+### 12.1 技术路线对比：C++ Module vs GDExtension
+
+```mermaid
+flowchart LR
+    subgraph Module["C++ Module 方案"]
+        M1["编译进引擎二进制"]
+        M2["可扩展 Object 属性系统"]
+        M3["可修改 Control 类"]
+        M4["可扩展序列化系统"]
+        M5["需重新编译引擎"]
+    end
+
+    subgraph GDEXT["GDExtension 方案"]
+        G1["独立动态库 .so/.dll"]
+        G2["仅访问 ClassDB 公共 API"]
+        G3["无法修改 Control 类"]
+        G4["可注册新节点/资源类型"]
+        G5["随项目分发，无需重编译"]
+    end
+
+    Module -->|适合引擎级改造| A["方案A: 原生属性绑定"]
+    GDEXT -->|适合独立框架| B["方案B: 外置 MVVM 框架"]
+```
+
+#### 12.1.1 C++ Module 方案详细评估
+
+**优势**：
+
+| 维度 | 说明 |
+|------|------|
+| **属性系统扩展** | 可为 `Object` 添加 `property_changed` 统一信号，替代手动 `emit_signal` 模式 |
+| **Control 扩展** | 可为 `Control` 增加 `bind_property()` 方法，实现原生属性绑定 |
+| **序列化集成** | 可扩展 `.tscn` 格式支持绑定表达式，编辑器中可视化配置绑定 |
+| **主题系统集成** | 可让绑定系统与 Theme 查找级联联动，实现 Theme→ViewModel 绑定 |
+| **性能** | 属性变化通知可直接通过 Object 内部信号分发，无间接调用 |
+| **编辑器集成** | 可扩展 Inspector 面板添加绑定编辑器、DataContext 配置 |
+| **容器扩展** | 可为 Container 添加虚拟化 + DataTemplate 支持 |
+
+**劣势**：
+
+| 维度 | 说明 |
+|------|------|
+| **分发** | 需自定义 Godot 构建或等待上游合并 |
+| **维护** | 引擎升级时需合并改动，Object/Control 是核心类改动影响面极大 |
+| **兼容性** | 修改 Object 基类影响所有对象，可能破坏现有代码 |
+| **社区门槛** | 贡献者需编译引擎 |
+| **审核难度** | 修改核心类的 PR 极难被上游接受 |
+
+#### 12.1.2 GDExtension 方案详细评估
+
+**优势**：
+
+| 维度 | 说明 |
+|------|------|
+| **独立分发** | 通过 Asset Library 或 GitHub Release 分发，用户无需重编译引擎 |
+| **安全隔离** | 不修改核心类，零风险不影响现有项目 |
+| **快速迭代** | 修改后只需重编译扩展库 |
+| **低门槛** | 开发者只需 C++ 工具链 |
+| **C# 生态** | GDExtension 方案可同时提供 C# 绑定，利用 CommunityToolkit.Mvvm |
+
+**劣势**：
+
+| 维度 | 说明 |
+|------|------|
+| **无法修改 Object** | 不能为 Object 添加 `property_changed` 统一信号 |
+| **无法扩展 Control** | 不能为 Control 添加 `bind_property()` 原生方法 |
+| **属性监听受限** | 只能通过 `set` + `emit_signal` 模式，无法自动检测属性变化 |
+| **编辑器受限** | 无法扩展内置 Inspector，需自建插件 |
+| **性能开销** | 绑定表达式求值经过 ClassDB 间接调用 |
+| **SceneTree 集成** | 无法在节点实例化时自动注入 DataContext |
+
+### 12.2 核心功能与实现路径分析
+
+```mermaid
+flowchart TD
+    subgraph Features["MVVM 核心功能"]
+        F1["可观察属性 (Observable)"]
+        F2["属性绑定 (Binding)"]
+        F3["响应式集合 (ObservableCollection)"]
+        F4["数据模板 (DataTemplate)"]
+        F5["双向绑定 (TwoWay Binding)"]
+        F6["值转换器 (IValueConverter)"]
+        F7["命令模式 (ICommand)"]
+        F8["导航路由 (Navigation)"]
+    end
+
+    subgraph ModulePath["C++ Module 实现路径"]
+        MP1["扩展 Object 属性系统<br>添加 property_changed 信号"]
+        MP2["扩展 Control<br>添加 bind_property 方法"]
+        MP3["扩展 Container<br>添加 DataTemplate 支持"]
+        MP4["扩展 .tscn 序列化<br>支持绑定表达式"]
+    end
+
+    subgraph GDExtPath["GDExtension 实现路径"]
+        GP1["新建 ObservableObject 基类"]
+        GP2["新建 Binding 类 + BindingBuilder"]
+        GP3["新建 ObservableArray 资源"]
+        GP4["新建 DataListView 节点"]
+        GP5["新建 NavigationStack 节点"]
+    end
+
+    F1 --> MP1
+    F1 --> GP1
+    F2 --> MP2
+    F2 --> GP2
+    F3 --> GP3
+    F4 --> MP3
+    F4 --> GP4
+    F5 --> MP2
+    F5 --> GP2
+    F6 --> GP2
+    F7 --> GP1
+    F8 --> GP5
+```
+
+### 12.3 推荐方案：GDExtension 为主 + Module 辅助
+
+#### 12.3.1 为什么 MVVM 更适合 GDExtension（与 Enhanced Input 不同）
+
+```
+Enhanced Input 需要 Module 的原因：
+  1. 必须拦截 Input 事件分发热路径 → 需修改 Input::_parse_input_event
+  2. is_action_pressed() 是全局高频调用 → 必须原生集成
+  3. InputMap 是引擎核心序列化 → 需扩展 project.godot
+
+MVVM 不需要 Module 的原因：
+  1. 属性绑定不在热路径上（每帧仅触发变化的绑定）
+  2. 可观察属性可由新基类 ObservableObject 提供，不必修改 Object
+  3. 数据模板可由新节点 DataListView 提供，不必修改 Container
+  4. 绑定表达式可在 GDExtension 层解析，不必扩展 .tscn
+  5. 性能瓶颈在 UI 布局而非绑定求值，间接调用开销可忽略
+```
+
+#### 12.3.2 分阶段策略
+
+```
+Phase 1: GDExtension 核心 MVVM 框架
+    ├── ObservableObject 基类（可观察属性 + property_changed 信号）
+    ├── Binding / BindingBuilder（单向/双向绑定引擎）
+    ├── ObservableArray（响应式集合 + collection_changed 信号）
+    ├── ViewModel 基类（生命周期 + 依赖注入入口）
+    ├── ICommand / Command 类（命令模式 + can_execute）
+    └── IValueConverter / 类型转换器链
+
+Phase 2: GDExtension UI 集成
+    ├── DataListView（虚拟化列表 + DataTemplate）
+    ├── DataTreeView（虚拟化树 + HierarchicalDataTemplate）
+    ├── NavigationStack（导航栈 + 转场动画）
+    ├── DataContext 节点（注入 ViewModel 到子树）
+    ├── Validator 框架（声明式输入验证）
+    └── Inspector 插件（绑定编辑器 + ViewModel 配置面板）
+
+Phase 3: C++ Module 可选增强（仅关键性能路径）
+    ├── 为 Object 添加原生 property_changed 信号（消除 ObservableObject 包装）
+    ├── 为 Control 添加原生 bind_property()（消除 BindingBuilder 间接调用）
+    └── 扩展 .tscn 序列化支持绑定表达式（编辑器可视化）
+```
+
+#### 12.3.3 Phase 1 架构设计（GDExtension）
+
+```mermaid
+classDiagram
+    class ObservableObject {
+        <<GDExtension RefCounted>>
+        +get_property_name_list() PackedStringArray
+        +get_property_value(name) Variant
+        +set_property_value(name, value) void
+        +signal property_changed(name, old_value, new_value)
+        +notify_property_changed(name) void
+        -_properties : HashMap~StringName, Variant~
+        -_property_changed_signal : StringName
+    }
+
+    class ViewModel {
+        <<GDExtension ObservableObject>>
+        +is_initialized : bool
+        +is_active : bool
+        +on_navigated_to(params) void
+        +on_navigated_from() void
+        +dispose() void
+        -_commands : HashMap~StringName, Command~
+        -_children : HashMap~StringName, ViewModel~
+    }
+
+    class Binding {
+        <<GDExtension RefCounted>>
+        +source : ObservableObject
+        +source_property : StringName
+        +target : Object
+        +target_property : StringName
+        +mode : BindingMode
+        +converter : Ref~IValueConverter~
+        +update() void
+        +disconnect() void
+        -_is_updating : bool
+    }
+
+    class BindingBuilder {
+        <<GDExtension utility>>
+        +from(source, property) BindingBuilder
+        +to(target, property) BindingBuilder
+        +two_way() BindingBuilder
+        +one_way() BindingBuilder
+        +one_time() BindingBuilder
+        +with_converter(converter) BindingBuilder
+        +build() Ref~Binding~
+    }
+
+    class BindingMode {
+        <<enumeration>>
+        ONE_WAY
+        ONE_TIME
+        TWO_WAY
+    }
+
+    class IValueConverter {
+        <<GDExtension abstract class>>
+        +convert(value, target_type) Variant
+        +convert_back(value, source_type) Variant
+    }
+
+    class StringFormatConverter {
+        +convert(value, target_type) Variant
+    }
+
+    class BoolToColorConverter {
+        +true_color : Color
+        +false_color : Color
+        +convert(value, target_type) Variant
+    }
+
+    class EnumToIndexConverter {
+        +convert(value, target_type) Variant
+    }
+
+    class ObservableArray {
+        <<GDExtension Resource>>
+        +items : Array
+        +count : int
+        +signal item_added(index, item)
+        +signal item_removed(index, item)
+        +signal item_changed(index, item)
+        +signal collection_cleared()
+        +add(item) void
+        +remove(index) void
+        +clear() void
+        +get_at(index) Variant
+    }
+
+    class Command {
+        <<GDExtension RefCounted>>
+        +execute() void
+        +can_execute() bool
+        +signal can_execute_changed()
+    }
+
+    class ActionCommand {
+        -_action : Callable
+        -_can_execute_action : Callable
+        +execute() void
+        +can_execute() bool
+    }
+
+    class DataContext {
+        <<GDExtension Node>>
+        +view_model : ViewModel
+        +auto_bind_children : bool
+        +_ready() void
+    }
+
+    ObservableObject <|-- ViewModel
+    ObservableObject --> Binding : observed by
+    BindingBuilder --> Binding : creates
+    IValueConverter <|-- StringFormatConverter
+    IValueConverter <|-- BoolToColorConverter
+    IValueConverter <|-- EnumToIndexConverter
+    Command <|-- ActionCommand
+    DataContext --> ViewModel : holds
+    DataContext --> BindingBuilder : creates bindings
+```
+
+#### 12.3.4 Phase 1 绑定流程
+
+```mermaid
+flowchart TD
+    A["DataContext._ready()"] --> B{auto_bind_children?}
+    B -->|是| C["遍历子节点查找绑定标记"]
+    B -->|否| D["等待手动绑定"]
+
+    C --> E["解析节点 metadata 中的绑定表达式"]
+    E --> F["BindingBuilder.from(vm, prop).to(node, attr)"]
+
+    F --> G["创建 Binding 对象"]
+    G --> H["连接 source.property_changed → Binding.update()"]
+
+    I["ViewModel.set_property_value(name, new_value)"] --> J["notify_property_changed(name)"]
+    J --> K["emit property_changed(name, old, new)"]
+    K --> L["Binding.update() 被调用"]
+    L --> M{mode?}
+    M -->|ONE_WAY| N["source → target: target.set(property, new_value)"]
+    M -->|TWO_WAY| N
+    M -->|ONE_TIME| N
+
+    N --> O{有 converter?}
+    O -->|是| P["IValueConverter.convert(new_value)"]
+    O -->|否| Q["直接赋值"]
+    P --> Q
+
+    R["Control 信号触发 (e.g. text_changed)"] --> S{TWO_WAY?}
+    S -->|是| T["target → source: vm.set_property_value(name, new_value)"]
+    S -->|否| U["忽略"]
+
+    T --> V{_is_updating 防循环}
+    V -->|false| W["设置 _is_updating = true"]
+    W --> X["vm.set_property_value()"]
+    X --> Y["_is_updating = false"]
+    V -->|true| Z["跳过，防止循环"]
+```
+
+#### 12.3.5 Phase 2 DataListView 设计
+
+```mermaid
+classDiagram
+    class DataListView {
+        <<GDExtension Control>>
+        +items_source : ObservableArray
+        +item_template : PackedScene
+        +item_template_selector : Ref~DataTemplateSelector~
+        +virtualization_enabled : bool
+        +estimated_row_height : float
+        +selected_index : int
+        +signal selection_changed(index)
+        +signal item_activated(index)
+        -_visible_items : Array~Control~
+        -_scroll_offset : float
+        -_pool : Array~Control~
+    }
+
+    class DataTemplateSelector {
+        <<GDExtension RefCounted>>
+        +select_template(item) PackedScene
+    }
+
+    class ObservableArray {
+        +items : Array
+        +signal item_added(index, item)
+        +signal item_removed(index, item)
+        +signal collection_cleared()
+    }
+
+    DataListView --> ObservableArray : observes
+    DataListView --> DataTemplateSelector : uses
+    DataTemplateSelector --> PackedScene : selects
+```
+
+```mermaid
+flowchart TD
+    A["ObservableArray.item_added"] --> B["DataListView._on_item_added(index, item)"]
+    B --> C{有可用池对象?}
+    C -->|是| D["从池中取出 Control"]
+    C -->|否| E["item_template.instantiate()"]
+    D --> F["绑定 item 数据到 Control"]
+    E --> F
+    F --> G["插入到 visible_items 对应位置"]
+    G --> H["queue_sort() 重新布局"]
+
+    I["ObservableArray.item_removed"] --> J["DataListView._on_item_removed(index)"]
+    J --> K["将 Control 从 visible_items 移除"]
+    K --> L["Control 放回池中"]
+    L --> H
+
+    M["滚动位置变化"] --> N["计算可见范围"]
+    N --> O["回收范围外 Control → 池"]
+    N --> P["实例化范围内 item"]
+```
+
+#### 12.3.6 使用示例
+
+**Phase 1 后的 MVVM 开发体验**：
+
+```gdscript
+# ViewModel 定义
+class_name PlayerViewModel
+extends ObservableObject
+
+func _init():
+    set_property_value("health", 100.0)
+    set_property_value("player_name", "Hero")
+    set_property_value("is_alive", true)
+
+# Command 绑定
+var attack_command: Command:
+    get:
+        if not attack_command:
+            attack_command = ActionCommand.new(func(): set_property_value("health", get_property_value("health") - 10))
+        return attack_command
+```
+
+```gdscript
+# View 绑定（在 DataContext 节点中）
+extends DataContext
+
+@onready var health_bar: ProgressBar = $HealthBar
+@onready var name_label: Label = $NameLabel
+@onready var attack_btn: Button = $AttackButton
+
+func _ready():
+    var vm = PlayerViewModel.new()
+    view_model = vm
+
+    # 声明式绑定
+    BindingBuilder.from(vm, "health").to(health_bar, "value").build()
+    BindingBuilder.from(vm, "player_name").to(name_label, "text").build()
+    BindingBuilder.from(vm, "health").to(health_bar, "visible") \
+        .with_converter(BoolToColorConverter.new()).build()
+
+    # 命令绑定
+    attack_btn.pressed.connect(vm.attack_command.execute)
+    vm.attack_command.can_execute_changed.connect(
+        func(): attack_btn.disabled = not vm.attack_command.can_execute()
+    )
+```
+
+### 12.4 与 Enhanced Input 方案的对比
+
+```mermaid
+flowchart LR
+    subgraph InputDecision["Enhanced Input: Module 优先"]
+        I1["需要拦截事件分发热路径"]
+        I2["is_action_pressed 高频调用"]
+        I3["需扩展 InputMap 序列化"]
+        I1 --> I4["Phase 1: GDExtension 验证<br>Phase 2: Module 集成"]
+    end
+
+    subgraph UIDecision["MVVM: GDExtension 为主"]
+        U1["绑定不在热路径"]
+        U2["新基类/新节点即可"]
+        U3["序列化可独立解决"]
+        U1 --> U4["Phase 1-2: GDExtension<br>Phase 3: Module 可选"]
+    end
+```
+
+| 评估维度 | Enhanced Input | MVVM UI |
+|---------|---------------|---------|
+| **热路径影响** | 高（每帧每输入事件） | 低（仅变化属性触发） |
+| **是否需修改核心类** | 是（Input/InputMap） | 否（可用新基类替代） |
+| **是否需扩展序列化** | 是（project.godot） | 可选（.tres 即可） |
+| **GDExtension 性能是否够用** | 勉强（间接调用在热路径累积） | 够用（绑定频率远低于输入） |
+| **推荐主方案** | C++ Module（深度集成） | GDExtension（独立框架） |
+| **次要方案** | GDExtension（先行验证） | C++ Module（可选增强） |
+
+### 12.5 推荐结论
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                MVVM 推荐策略：GDExtension 为主                │
+│                                                              │
+│  Phase 1: GDExtension 核心 MVVM 框架（推荐先行）              │
+│  ├── 目标：提供 ObservableObject + Binding + ObservableArray   │
+│  ├── 理由：不修改核心类、独立分发、快速迭代                    │
+│  ├── 适用：可观察属性 / 绑定 / 集合 / 命令 / 转换器           │
+│  └── 限制：需要手动写绑定代码（无 .tscn 可视化绑定）           │
+│                                                              │
+│  Phase 2: GDExtension UI 集成                                │
+│  ├── 目标：DataListView + NavigationStack + Inspector 插件     │
+│  ├── 理由：新节点类型不影响现有控件，扩展独立                   │
+│  └── 限制：虚拟化列表性能需充分测试                            │
+│                                                              │
+│  Phase 3: C++ Module 可选增强（非必须）                       │
+│  ├── 目标：Object 原生 property_changed / Control.bind()      │
+│  ├── 理由：消除 ObservableObject 包装层、提升编辑器体验        │
+│  ├── 风险：修改 Object 核心类影响面大，上游难合并              │
+│  └── 建议：仅当 Phase 1-2 验证成功且社区强烈需求时再考虑       │
+│                                                              │
+│  不推荐：纯 C++ Module 先行                                   │
+│  ├── 原因1：修改 Object/Control 核心类风险高、审核难通过       │
+│  ├── 原因2：MVVM 功能可完全通过新类实现，不必修改现有类         │
+│  ├── 原因3：GDExtension 方案已可满足 90% 需求                  │
+│  └── 原因4：分发门槛低利于社区采纳和反馈                       │
+└──────────────────────────────────────────────────────────────┘
+```

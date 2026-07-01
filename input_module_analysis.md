@@ -795,3 +795,420 @@ Godot Input 成熟度：★★☆☆☆ (2/5)
 | **P1** | 运行时重新绑定 | 设置菜单标准功能 |
 | **P2** | Glyph 系统 | UI 提示体验 |
 | **P2** | 输入录制/回放 | 测试和调试 |
+
+## 10. Enhanced Input 实现方案评估
+
+### 10.1 技术路线对比：C++ Module vs GDExtension
+
+```mermaid
+flowchart LR
+    subgraph Module["C++ Module 方案"]
+        M1["编译进引擎二进制"]
+        M2["直接访问 Input/InputMap 内部"]
+        M3["可修改 Input 单例行为"]
+        M4["可扩展 InputEvent 子类"]
+        M5["需重新编译引擎"]
+    end
+
+    subgraph GDEXT["GDExtension 方案"]
+        G1["独立动态库 .so/.dll"]
+        G2["仅访问 ClassDB 公共 API"]
+        G3["无法修改 Input 单例"]
+        G4["可注册新类和节点"]
+        G5["随项目分发，无需重编译"]
+    end
+
+    Module -->|适合深度集成| A["方案A: 引擎级增强"]
+    GDEXT -->|适合独立插件| B["方案B: 独立输入框架"]
+```
+
+#### 10.1.1 C++ Module 方案详细评估
+
+**优势**：
+
+| 维度 | 说明 |
+|------|------|
+| **内部访问** | 可直接访问 `Input` 单例的 `action_states`、`key_map`、`mouse_button_mask` 等私有成员 |
+| **修改现有类** | 可为 `Input` 添加新的虚方法（如 `push_context`/`pop_context`），为 `InputMap` 添加修饰器链 |
+| **InputEvent 扩展** | 可在 `core/input/` 中新增 `InputEventEnhanced` 子类，直接参与现有事件分发链 |
+| **SceneTree 集成** | 可修改 `SceneTree::_call_input_pause()` 注入上下文过滤逻辑 |
+| **性能** | 直接 C++ 函数调用，零间接开销；修饰器/触发器在事件分发热路径上无虚调用 |
+| **编辑器集成** | 可扩展 InputMap 编辑器面板，添加上下文编辑器、修饰器可视化配置 |
+| **序列化** | 可扩展 `project.godot` 的 `[input]` 段，增加 `[input_context]` 段 |
+
+**劣势**：
+
+| 维度 | 说明 |
+|------|------|
+| **分发** | 需要自定义 Godot 构建或等待上游合并，无法通过 Asset Library 分发 |
+| **维护** | 引擎升级时需合并改动，跟进 Godot 主线分支 |
+| **社区门槛** | 贡献者需编译引擎，开发迭代慢 |
+| **ABI 耦合** | 直接依赖引擎内部数据布局，引擎内部重构会导致 Module 失效 |
+
+#### 10.1.2 GDExtension 方案详细评估
+
+**优势**：
+
+| 维度 | 说明 |
+|------|------|
+| **独立分发** | 通过 Asset Library 或 GitHub Release 分发，用户无需重编译引擎 |
+| **版本独立** | 通过 `gdextension_interface` 的稳定 ABI 隔离，引擎小版本升级无需重编译扩展 |
+| **快速迭代** | 修改后只需重编译扩展库，秒级热加载 |
+| **低门槛** | 开发者只需 C++/Rust 工具链，无需编译整个引擎 |
+| **项目关联** | 直接放在项目的 `addons/` 目录下，版本控制简单 |
+
+**劣势**：
+
+| 维度 | 说明 |
+|------|------|
+| **无法修改 Input 单例** | 不能拦截 `_parse_input_event()` 内部逻辑，只能在外部包装 |
+| **无法扩展 InputMap** | 不能为 `InputMap::Action` 添加修饰器/触发器字段 |
+| **性能开销** | GDExtension → ClassDB 调用有一次虚函数间接跳转，修饰器链每帧每动作多 2-3 次间接调用 |
+| **事件拦截受限** | 无法在 `SceneTree` 分发链中注入过滤；只能在 `_input()`/`_unhandled_input()` 回调中处理 |
+| **编辑器受限** | 无法扩展内置 InputMap 编辑器，需自建 Inspector 插件 |
+| **双向通信** | 扩展内的动作状态需手动同步到 `Input.action_states`，否则 `is_action_pressed()` 仍读旧值 |
+
+### 10.2 核心功能与实现路径分析
+
+```mermaid
+flowchart TD
+    subgraph Features["Enhanced Input 核心功能"]
+        F1["输入映射上下文 (IMC)"]
+        F2["输入修饰器 (Modifier)"]
+        F3["输入触发器 (Trigger)"]
+        F4["手势识别器 (GestureRecognizer)"]
+        F5["强类型动作 (TypedAction)"]
+        F6["运行时重新绑定"]
+        F7["Glyph 系统"]
+    end
+
+    subgraph ModulePath["C++ Module 实现路径"]
+        MP1["扩展 InputMap::Action 结构体"]
+        MP2["修改 Input::_parse_input_event"]
+        MP3["扩展 InputEvent 体系"]
+        MP4["修改 SceneTree 分发逻辑"]
+        MP5["扩展 project.godot 解析"]
+    end
+
+    subgraph GDExtPath["GDExtension 实现路径"]
+        GP1["新建 EnhancedInput 单例"]
+        GP2["_input 回调拦截"]
+        GP3["新建 EnhancedInputEvent"]
+        GP4["Node 子类包装"]
+        GP5["独立 .tres/.cfg 配置"]
+    end
+
+    F1 --> MP1
+    F1 --> GP1
+    F2 --> MP1
+    F2 --> GP1
+    F3 --> MP2
+    F3 --> GP2
+    F4 --> MP3
+    F4 --> GP3
+    F5 --> MP1
+    F5 --> GP1
+    F6 --> MP5
+    F6 --> GP5
+    F7 --> GP1
+```
+
+### 10.3 推荐方案：GDExtension 优先 + Module 上游化
+
+#### 10.3.1 分阶段策略
+
+```
+Phase 1: GDExtension 独立插件（快速验证 + 社区反馈）
+    ├── 实现 EnhancedInputSingleton（替代 Input 的增强查询 API）
+    ├── 实现 InputMappingContext（上下文栈 + 优先级）
+    ├── 实现 InputModifier 链（DeadZone/Scale/Negate/Swizzle）
+    ├── 实现 InputTrigger 链（Pressed/Released/Hold/Tap/Pulse）
+    ├── 实现 GestureRecognizer（Pinch/Swipe/Rotate/LongPress）
+    └── 通过 _input() 回调拦截事件 → 匹补到增强系统
+
+Phase 2: C++ Module 上游化（深度集成 + 性能优化）
+    ├── 将 EnhancedInput 集成为 modules/enhanced_input/
+    ├── 扩展 InputMap::Action 增加 modifiers/triggers 字段
+    ├── 在 Input::_parse_input_event 中注入上下文过滤
+    ├── 扩展 SceneTree 分发链支持上下文感知
+    ├── 为 InputEvent 增加手势事件子类
+    └── 扩展 InputMap 编辑器面板
+
+Phase 3: 核心层合并（最终形态）
+    ├── 将验证过的 API 合并进 core/input/
+    ├── Input 单例原生支持上下文/修饰器/触发器
+    ├── InputMap 编辑器原生支持可视化配置
+    └── 废弃 Phase 1 兼容层
+```
+
+#### 10.3.2 Phase 1 架构设计（GDExtension）
+
+```mermaid
+classDiagram
+    class EnhancedInput {
+        <<GDExtension Singleton>>
+        +push_context(context) void
+        +pop_context(context) void
+        +get_active_contexts() Array
+        +is_action_triggered(action) bool
+        +get_action_value(action) Variant
+        +get_action_value_vector2(action) Vector2
+        +add_gesture_recognizer(recognizer) void
+        +remove_gesture_recognizer(recognizer) void
+        -context_stack : Array~InputMappingContext~
+        -action_cache : HashMap
+        -gesture_recognizers : Array
+        -_input(event) : 拦截回调
+    }
+
+    class InputMappingContext {
+        <<GDExtension Resource>>
+        +context_name : StringName
+        +priority : int
+        +blocking : bool
+        +mappings : Array~InputBinding~
+        +add_binding(action, binding) void
+        +remove_binding(action, binding) void
+        +has_action(action) bool
+    }
+
+    class InputBinding {
+        <<GDExtension Resource>>
+        +action : StringName
+        +events : Array~InputEvent~
+        +modifiers : Array~InputModifier~
+        +triggers : Array~InputTrigger~
+        +process_event(event) InputActionState
+    }
+
+    class InputModifier {
+        <<GDExtension abstract class>>
+        +modify_value(raw_value) float
+        +modify_event(event) InputEvent
+    }
+
+    class DeadZoneModifier {
+        +threshold : float
+        +modify_value(raw_value) float
+    }
+
+    class ScaleModifier {
+        +scale : float
+        +modify_value(raw_value) float
+    }
+
+    class ResponseCurveModifier {
+        +curve : Curve
+        +modify_value(raw_value) float
+    }
+
+    class SwizzleModifier {
+        +swizzle : String
+        +modify_event(event) InputEvent
+    }
+
+    class NegateModifier {
+        +modify_value(raw_value) float
+    }
+
+    class InputTrigger {
+        <<GDExtension abstract class>>
+        +process_event(event, delta) TriggerState
+        +reset() void
+    }
+
+    class PressedTrigger {
+        +process_event(event, delta) TriggerState
+    }
+
+    class ReleasedTrigger {
+        +process_event(event, delta) TriggerState
+    }
+
+    class HoldTrigger {
+        +hold_time : float
+        +process_event(event, delta) TriggerState
+    }
+
+    class TapTrigger {
+        +max_duration : float
+        +process_event(event, delta) TriggerState
+    }
+
+    class PulseTrigger {
+        +interval : float
+        +process_event(event, delta) TriggerState
+    }
+
+    class ComboTrigger {
+        +sequence : Array~StringName~
+        +time_window : float
+        +process_event(event, delta) TriggerState
+    }
+
+    class GestureRecognizer {
+        <<GDExtension abstract class>>
+        +recognize(events) GestureResult
+        +reset() void
+        +signal gesture_recognized(result)
+    }
+
+    class PinchGestureRecognizer {
+        +min_distance : float
+        +recognize(events) GestureResult
+    }
+
+    class SwipeGestureRecognizer {
+        +min_velocity : float
+        +direction_threshold : float
+        +recognize(events) GestureResult
+    }
+
+    class RotateGestureRecognizer {
+        +min_rotation : float
+        +recognize(events) GestureResult
+    }
+
+    EnhancedInput --> InputMappingContext : manages stack
+    InputMappingContext --> InputBinding : contains
+    InputBinding --> InputModifier : applies chain
+    InputBinding --> InputTrigger : evaluates
+    InputModifier <|-- DeadZoneModifier
+    InputModifier <|-- ScaleModifier
+    InputModifier <|-- ResponseCurveModifier
+    InputModifier <|-- SwizzleModifier
+    InputModifier <|-- NegateModifier
+    InputTrigger <|-- PressedTrigger
+    InputTrigger <|-- ReleasedTrigger
+    InputTrigger <|-- HoldTrigger
+    InputTrigger <|-- TapTrigger
+    InputTrigger <|-- PulseTrigger
+    InputTrigger <|-- ComboTrigger
+    EnhancedInput --> GestureRecognizer : manages
+    GestureRecognizer <|-- PinchGestureRecognizer
+    GestureRecognizer <|-- SwipeGestureRecognizer
+    GestureRecognizer <|-- RotateGestureRecognizer
+```
+
+#### 10.3.3 Phase 1 事件处理流程
+
+```mermaid
+flowchart TD
+    A["SceneTree _input 回调"] --> B["EnhancedInput._input(event)"]
+    B --> C["遍历 context_stack 按优先级降序"]
+    C --> D["对每个 InputMappingContext"]
+    D --> E["遍历 InputBinding"]
+    E --> F["InputEvent 匹配检查"]
+    F -->|匹配| G["InputModifier 链处理"]
+    G --> H["InputTrigger 评估"]
+    H --> I{TriggerState?}
+    I -->|Triggered| J["更新 action_cache 为 triggered"]
+    I -->|Ongoing| K["更新 action_cache 为 ongoing"]
+    I -->|None| L["跳过"]
+
+    J --> M{context.blocking?}
+    M -->|是| N["停止遍历低优先级 context"]
+    M -->|否| C
+
+    B --> O["GestureRecognizer 处理"]
+    O --> P["emit gesture_recognized 信号"]
+
+    B --> Q["用户查询"]
+    Q --> R["EnhancedInput.is_action_triggered(action)"]
+    R --> S[返回 action_cache 值]
+```
+
+#### 10.3.4 与现有 Input 系统的桥接
+
+```mermaid
+flowchart LR
+    subgraph Existing["现有 Godot Input"]
+        E1["Input.parse_input_event"]
+        E2["Input.is_action_pressed"]
+        E3["InputMap.action_match"]
+    end
+
+    subgraph Enhanced["EnhancedInput Extension"]
+        EN1["EnhancedInput._input"]
+        EN2["EnhancedInput.is_action_triggered"]
+        EN3["InputMappingContext 栈"]
+        EN4["Modifier + Trigger 链"]
+    end
+
+    E1 -->|"事件先到 SceneTree"| EN1
+    EN1 -->|"不影响"| E2
+    EN2 -->|"独立查询"| EN4
+    EN3 -->|"上下文过滤"| EN4
+
+    style Existing fill:#e3f2fd
+    style Enhanced fill:#fff3e0
+```
+
+**关键桥接机制**：
+
+1. **双轨查询**：`Input.is_action_pressed()` 仍读原有 `action_states`；`EnhancedInput.is_action_triggered()` 读增强缓存。用户按需选择。
+2. **事件先经过增强系统**：在 `_input()` 回调中，EnhancedInput 先于用户代码处理事件，更新自身缓存。
+3. **可选同步**：提供 `EnhancedInput.sync_to_input()` 方法，将增强动作状态写回 `Input.action_states`，使 `Input.is_action_pressed()` 也能感知上下文过滤。
+
+#### 10.3.5 Phase 2 Module 集成要点
+
+```mermaid
+flowchart TD
+    subgraph Phase1["Phase 1: GDExtension"]
+        P1A["EnhancedInput Singleton"]
+        P1B["InputMappingContext Resource"]
+        P1C["InputModifier / InputTrigger"]
+        P1D["GestureRecognizer"]
+    end
+
+    subgraph Phase2["Phase 2: C++ Module"]
+        P2A["扩展 InputMap::Action<br>增加 modifiers/triggers"]
+        P2B["修改 Input::_parse_input_event<br>注入上下文过滤"]
+        P2C["扩展 SceneTree 分发<br>上下文感知分发"]
+        P2D["新增 InputEventGesture 子类"]
+    end
+
+    P1A -->|"验证 API 设计"| P2A
+    P1B -->|"合并进 InputMap"| P2B
+    P1C -->|"内置到 InputMap"| P2A
+    P1D -->|"内置到 core/input"| P2D
+```
+
+**Module 集成需要修改的核心文件**：
+
+| 文件 | 修改内容 |
+|------|---------|
+| `core/input/input_map.h` | `Action` 结构体增加 `Vector<InputModifier*> modifiers`、`Vector<InputTrigger*> triggers` |
+| `core/input/input_map.h` | 新增 `InputMappingContext` 类，`HashMap<StringName, InputMappingContext*> contexts` |
+| `core/input/input.cpp` | `_parse_input_event()` 增加上下文过滤逻辑 |
+| `core/input/input.cpp` | 新增 `push_context()`/`pop_context()` 方法 |
+| `core/input/input_event.h` | 新增 `InputEventGesture` 基类和子类 |
+| `scene/main/scene_tree.cpp` | `_call_input_pause()` 增加上下文感知分发 |
+| `scene/main/viewport.cpp` | 手势识别器集成到 GUI 输入处理 |
+| `editor/input_map_editor.cpp` | 扩展编辑器面板，支持上下文/修饰器/触发器可视化编辑 |
+
+### 10.4 推荐结论
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    推荐策略：双阶段                            │
+│                                                              │
+│  Phase 1: GDExtension（推荐先行）                             │
+│  ├── 目标：快速验证 API 设计 + 获取社区反馈                    │
+│  ├── 理由：独立分发、低门槛、快速迭代                           │
+│  ├── 适用：IMC / Modifier / Trigger / GestureRecognizer      │
+│  └── 风险：无法深度集成 Input 单例，双轨查询                   │
+│                                                              │
+│  Phase 2: C++ Module（深度集成）                              │
+│  ├── 目标：将验证过的 API 原生集成到引擎                       │
+│  ├── 理由：性能最优、无间接调用、编辑器集成                     │
+│  ├── 适用：扩展 InputMap / Input / SceneTree / InputEvent     │
+│  └── 风险：需上游合并、维护成本                                │
+│                                                              │
+│  不推荐：纯 GDExtension 长期方案                              │
+│  ├── 原因1：is_action_pressed() 无法感知上下文过滤             │
+│  ├── 原因2：修饰器链的虚调用开销在热路径上累积                  │
+│  ├── 原因3：无法扩展 InputMap 编辑器                          │
+│  └── 原因4：双轨查询导致用户困惑                               │
+└──────────────────────────────────────────────────────────────┘
+```
