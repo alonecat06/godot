@@ -251,7 +251,7 @@ void InsightsFlamegraph::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_database"), &InsightsFlamegraph::get_database);
 
 	ClassDB::bind_method(D_METHOD("get_root_nodes"), &InsightsFlamegraph::get_root_nodes);
-	ClassDB::bind_method(D_METHOD("get_children", "node_id"), &InsightsFlamegraph::get_children);
+	ClassDB::bind_method(D_METHOD("get_flame_children", "node_id"), &InsightsFlamegraph::get_children);
 
 	ClassDB::bind_method(D_METHOD("set_search_query", "query"), &InsightsFlamegraph::set_search_query);
 	ClassDB::bind_method(D_METHOD("get_search_query"), &InsightsFlamegraph::get_search_query);

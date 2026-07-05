@@ -58,7 +58,7 @@ bool GPUProfilerMetal::is_supported() const {
 }
 
 void GPUProfilerMetal::_bind_methods() {
-	ClassDB::bind_method(D_METHOD("is_supported"), &GPUProfilerMetal::is_supported);
+	// is_supported is already bound in GPUTimestampQuery.
 }
 
 GPUProfilerMetal::GPUProfilerMetal() {

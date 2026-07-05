@@ -60,8 +60,7 @@ float GPUProfilerVulkan::get_timestamp_period() const {
 }
 
 void GPUProfilerVulkan::_bind_methods() {
-	ClassDB::bind_method(D_METHOD("is_supported"), &GPUProfilerVulkan::is_supported);
-	ClassDB::bind_method(D_METHOD("get_timestamp_period"), &GPUProfilerVulkan::get_timestamp_period);
+	// is_supported and get_timestamp_period are already bound in GPUTimestampQuery.
 }
 
 GPUProfilerVulkan::GPUProfilerVulkan() {

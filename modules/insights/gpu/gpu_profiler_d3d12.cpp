@@ -56,7 +56,7 @@ bool GPUProfilerD3D12::is_supported() const {
 }
 
 void GPUProfilerD3D12::_bind_methods() {
-	ClassDB::bind_method(D_METHOD("is_supported"), &GPUProfilerD3D12::is_supported);
+	// is_supported is already bound in GPUTimestampQuery.
 }
 
 GPUProfilerD3D12::GPUProfilerD3D12() {
