@@ -2003,18 +2003,1639 @@ TEST_CASE("[Insights] AI analysis integration") {
 | **跨平台后端** | Vulkan/D3D12/Metal | Vulkan/D3D12/Metal | Phase 3 |
 | **第三方 trace 格式** | UtF/CSV/JSON | `.gitracy` + `.tracy` 兼容 | Phase 5 |
 
-## 11. 总结
+## 11. 直接输出 .tracy 格式可行性调研
+
+### 11.1 调研背景
+
+当前 Godot Insights 的 `.gitracy` 格式通过 `TracyConverter::gitracy_to_chrome_json()` 导出为 Chrome Trace Event JSON，再由 Tracy 通过 File→Open 导入。这种方式需要额外的转换步骤，且 JSON 格式体积较大。用户希望直接生成 `.tracy` 二进制文件，以便 Tracy 原生打开。
+
+本节基于 Tracy v0.13.4 源码（`E:\Code\03_Tool\Tracy`）进行完整逆向分析，评估直接输出 `.tracy` 的可行性。
+
+### 11.2 .tracy 文件格式完整解析
+
+#### 11.2.1 文件头（10 字节）
+
+```
+Offset  Size  Field
+0       4     魔数: {'t', 'r', 253, 'P'}  (TracyHeader)
+4       1     压缩类型: 0=LZ4, 1=Zstd
+5       1     压缩流数量: 1-255
+6-7     2     版本: Major=0, Minor=13
+8-9     2     版本: Patch=4
+```
+
+**注意**：文件头的前 4 字节 `{'t','r',253,'P'}` 是 `TracyHeader`，与文件头 `FileHeader` 不同。完整的 8 字节 `FileHeader` 为 `{'t','r','a','c','y', 0, 13, 4}`。读取时先比较前 5 字节（`FileHeaderMagic=5`），再解析后 3 字节版本号。
+
+**关键版本约束**：
+- 当前版本：`0.13.4`（`FileVersion = (0 << 16) | (13 << 8) | 4 = 3332`）
+- 最低支持版本：`0.9.0`（`FileVersion = 2304`）
+- 版本过高会抛出 `UnsupportedVersion`，过低会抛出 `LegacyVersion`
+
+#### 11.2.2 压缩流架构
+
+`.tracy` 文件使用**多流压缩**架构：
+
+```
+[FileHeader: 10 bytes]
+[Stream 0: uint32_t compressed_size | compressed_data]
+[Stream 1: uint32_t compressed_size | compressed_data]
+[Stream 2: uint32_t compressed_size | compressed_data]
+...
+```
+
+- 每个 stream 有独立的 LZ4/Zstd 压缩上下文
+- 数据以 `FileBufSize = 64KB` 的块为单位写入
+- 写入时轮转分配到不同 stream，实现并行压缩
+- 读取时每个 stream 有独立的解压线程
+
+**简化策略**：可以使用 `streams=1`（单流），避免多线程压缩的复杂性。
+
+#### 11.2.3 数据段顺序（严格序列化）
+
+`.tracy` 文件是**顺序序列化**的，必须按以下精确顺序写入每个数据段。以下是 `Worker::Write()` 的完整数据段列表：
+
+| 序号 | 数据段 | 类型 | 说明 |
+|------|--------|------|------|
+| 1 | `FileHeader` | uint8_t[8] | `{'t','r','a','c','y', Major, Minor, Patch}` |
+| 2 | `resolution` | uint64_t | 定时器分辨率（ns/tick） |
+| 3 | `timerMul` | double | 时间戳乘数（ticks → ns） |
+| 4 | `lastTime` | int64_t | 最后一个事件时间戳 |
+| 5 | `frameOffset` | int64_t | 帧偏移量 |
+| 6 | `pid` | uint64_t | 进程 ID |
+| 7 | `samplingPeriod` | int64_t | 采样周期 |
+| 8 | `cpuArch` | uint8_t | CPU 架构 (0=Unknown, 1=x86, 2=x64, 3=Arm32, 4=Arm64) |
+| 9 | `cpuId` | uint32_t | CPU ID |
+| 10 | `cpuManufacturer` | char[12] | CPU 制造商 |
+| 11 | `onDemand` | uint8_t | 是否按需捕获 |
+| 12 | `captureName` | uint64_t len + char[] | 捕获名称 |
+| 13 | `captureProgram` | uint64_t len + char[] | 程序名称 |
+| 14 | `captureTime` | int64_t | 捕获时间戳 |
+| 15 | `executableTime` | int64_t | 可执行文件时间 |
+| 16 | `hostInfo` | uint64_t len + char[] | 主机信息 |
+| 17 | `cpuTopology` | 嵌套 map | CPU 拓扑（package→die→core→thread） |
+| 18 | `crashEvent` | struct | 崩溃事件 |
+| 19 | `frames` | FrameData 数组 | 帧数据（含 delta 时间戳） |
+| 20 | `sections` | SectionItem 数组 | Section 数据（0.13.4+） |
+| 21 | `stringData` | 指针→内容 map | 字符串内容表（核心：所有字符串先集中存储） |
+| 22 | `strings` | id→指针 map | 静态字符串索引 |
+| 23 | `threadNames` | id→指针 map | 线程名索引 |
+| 24 | `externalNames` | id→(ptr,ptr) map | 外部名称索引 |
+| 25 | `localThreadCompress` | ThreadCompress | 本地线程 ID 压缩表 |
+| 26 | `externalThreadCompress` | ThreadCompress | 外部线程 ID 压缩表 |
+| 27 | `sourceLocation` | ptr→SourceLocationBase map | 静态源码位置（含 name/function/file StringRef + line + color） |
+| 28 | `sourceLocationExpand` | uint64_t 数组 | 源码位置展开表 |
+| 29 | `sourceLocationPayload` | SourceLocationBase 数组 | 动态源码位置 |
+| 30 | `sourceLocationZones` / `sourceLocationZonesCnt` | id→cnt map | 源码位置 zone 统计 |
+| 31 | `gpuSourceLocationZones` / `gpuSourceLocationZonesCnt` | id→cnt map | GPU 源码位置 zone 统计 |
+| 32 | `lockMap` | LockMap 数组 | 锁映射（含 timeline） |
+| 33 | `messages` | MessageData 数组 | 消息数据 |
+| 34 | `zoneExtra` | ZoneExtra 数组 | Zone 附加数据（callstack, text, name, color） |
+| 35 | **`threads`** | ThreadData 数组 | **CPU Zone 时间线（核心数据）** |
+| 36 | **`gpuData`** | GpuCtx 数组 | **GPU Zone 时间线（核心数据）** |
+| 37 | `plots` | PlotData 数组 | 绘图数据（非 Memory 类型） |
+| 38 | `memNameMap` | MemoryData 数组 | 内存分配数据 |
+| 39 | `callstackPayload` | CallstackFrameId 数组 | 调用栈 payload |
+| 40 | `callstackFrameMap` | CallstackFrameData 数组 | 调用栈帧 |
+| 41 | `appInfo` | uint64_t 数组 | 应用信息 |
+| 42 | `frameImage` | 帧图像 + 可选 ZSTD 字典 | 帧截图 |
+| 43 | `ctxSwitch` | ContextSwitch 数据 | 上下文切换 |
+| 44 | `cpuData[256]` | Per-CPU 上下文切换 | 每 CPU 核心的上下文切换 |
+| 45 | `tidToPid` | TID→PID 映射 | 线程到进程映射 |
+| 46 | `cpuThreadData` | CPU 线程数据 | CPU 线程信息 |
+| 47 | `symbolLoc` / `symbolMap` | 符号位置/映射 | 符号信息 |
+| 48 | `symbolCode` | 符号代码 | 符号机器码 |
+| 49 | `codeSymbolMap` | 代码符号映射 | 反向符号映射 |
+| 50 | `hwSamples` | 硬件采样 | 硬件性能计数器 |
+| 51 | `sourceFileCache` | 源码文件缓存 | 源码内容 |
+
+#### 11.2.4 关键数据结构
+
+**ZoneEvent（CPU Zone）** — 位打包结构：
+
+```
+_start_srcloc: uint64_t  →  低 16 位 = srcloc index, 高 47 位 = start timestamp
+_child2:      uint16_t   →  子 zone 列表偏移的低 16 位
+_end_child1:  uint64_t   →  bit63 = end valid, bit55 = has children,
+                            高 47 位 = end timestamp, 低 16 位 = child offset 高位
+extra:        uint32_t   →  ZoneExtra 索引
+```
+
+时间线序列化格式（递归树）：
+```
+uint32_t child_count
+for each child:
+    int16_t srcloc          // 源码位置索引
+    int64_t time_offset     // delta 编码的时间偏移
+    uint32_t extra          // ZoneExtra 索引
+    uint32_t child_count    // 子 zone 数量（0 = 叶子节点）
+    [递归子 zone]
+    int64_t end_offset      // delta 编码的结束时间偏移
+```
+
+**GpuEvent（GPU Zone）** — 类似位打包：
+```
+_cpuStart_srcloc: uint64_t → 低 16 位 = srcloc, 高 47 位 = cpu start time
+_cpuEnd_thread:  uint64_t  → 低 16 位 = thread, 高 47 位 = cpu end time
+_gpuStart_child1: uint64_t → 低 16 位 = child low, 高 47 位 = gpu start time
+_gpuEnd_child2:  uint64_t  → 低 16 位 = child high, 高 47 位 = gpu end time
+callstack: Int24            // 调用栈索引
+query_id:  uint16_t        // GPU 查询 ID
+```
+
+GPU 时间线序列化格式：
+```
+uint64_t child_count
+for each child:
+    int64_t cpu_start_offset    // delta 编码
+    int64_t gpu_start_offset    // delta 编码（独立基准）
+    int16_t srcloc
+    Int24 callstack
+    uint16_t thread
+    uint64_t child_count        // 递归子 zone
+    [递归子 zone]
+    int64_t cpu_end_offset      // delta 编码
+    int64_t gpu_end_offset      // delta 编码
+    uint16_t query_id
+```
+
+**SourceLocationBase** — 源码位置：
+```
+StringRef name      → uint64_t ptr + uint8_t isidx/active
+StringRef function  → 同上
+StringRef file      → 同上
+uint32_t line
+uint32_t color
+```
+
+**StringRef** — 字符串引用（9 字节）：
+```
+uint64_t str       → 字符串指针或索引
+uint8_t isidx:1    → 0=指针, 1=索引
+uint8_t active:1   → 是否有效
+```
+
+#### 11.2.5 字符串系统（核心难点）
+
+`.tracy` 文件使用**指针间接引用**系统来存储字符串：
+
+1. **stringData 段**：存储所有字符串内容，每条记录为 `(uint64_t original_ptr, uint64_t len, char[] content)`
+2. **pointerMap**：读取时构建 `original_ptr → char*` 映射
+3. **StringRef 的 `str` 字段**存储的是原始内存指针，读取时通过 pointerMap 解析为实际字符串
+
+**写入时必须**：
+- 为每个唯一字符串分配一个唯一的 `uint64_t` 值（模拟指针）
+- 在 `stringData` 段记录所有 `(模拟指针, 长度, 内容)`
+- 在所有使用 `StringRef` 的地方（SourceLocation 等）引用这些模拟指针
+
+#### 11.2.6 时间编码
+
+所有时间戳使用 **delta 编码**：
+
+```cpp
+// 写入
+void WriteTimeOffset(FileWrite& f, int64_t& refTime, int64_t time) {
+    int64_t timeOffset = time - refTime;
+    refTime += timeOffset;
+    f.Write(&timeOffset, sizeof(timeOffset));  // 写 8 字节 delta
+}
+
+// 读取
+int64_t ReadTimeOffset(FileRead& f, int64_t& refTime) {
+    int64_t timeOffset;
+    f.Read(timeOffset);
+    refTime += timeOffset;
+    return refTime;
+}
+```
+
+- 每个 Timeline 有独立的 `refTime` 基准
+- GPU Timeline 有两个独立基准：`refTime`（CPU 时间）和 `refGpuTime`（GPU 时间）
+- 帧数据、消息、锁等也有独立的 `refTime`
+
+#### 11.2.7 线程压缩
+
+`ThreadCompress` 将 64 位线程 ID 压缩为 16 位索引：
+
+```
+Save:
+  uint64_t count                    // 压缩后的线程数
+  uint64_t[count] expanded_threads  // 展开表（index → original thread id）
+
+Load:
+  构建两个映射：
+  - m_threadMap: original_id → compressed_index
+  - m_threadExpand: compressed_index → original_id
+```
+
+### 11.3 可行性评估
+
+#### 11.3.1 技术可行性：✅ 可行
+
+直接输出 `.tracy` 格式**技术上完全可行**，理由：
+
+1. **格式确定性**：`.tracy` 是固定顺序的序列化格式，不涉及哈希校验或加密
+2. **压缩可控**：可以选择 LZ4 Fast（最简单）+ 单流模式
+3. **最小数据集**：大部分数据段可以写空（`count=0`），只填充核心数据
+4. **版本可固定**：固定使用 `0.13.4` 版本，避免多版本兼容
+
+#### 11.3.2 核心难点与工作量
+
+| 难点 | 复杂度 | 说明 |
+|------|--------|------|
+| **字符串指针映射** | 高 | 必须维护 `stringData` → `pointerMap` 的一致性，所有 StringRef 引用必须匹配 |
+| **位打包 ZoneEvent** | 中 | 需要精确复制 ZoneEvent/GpuEvent 的位布局，时间戳限制 47 位 |
+| **Delta 时间编码** | 中 | 每个 Timeline 独立基准，递归子树的时间基准传播需正确处理 |
+| **ThreadCompress** | 低 | 简单的 ID → index 映射 |
+| **LZ4 流压缩** | 低 | 可使用 LZ4 快速压缩 + 单流，已有成熟库 |
+| **数据段顺序** | 低 | 严格按 Write() 顺序即可 |
+| **版本兼容性** | 中 | Tracy 版本升级可能导致格式变化，需跟进 |
+
+#### 11.3.3 最小可写 .tracy 数据集
+
+要生成一个 Tracy 能成功打开的 `.tracy` 文件，最少需要填充以下数据段：
+
+| 数据段 | 必需 | 最小值 |
+|--------|------|--------|
+| FileHeader | ✅ | `{'t','r','a','c','y', 0, 13, 4}` |
+| resolution | ✅ | `1` (1ns/tick) |
+| timerMul | ✅ | `1.0` |
+| lastTime | ✅ | 录制结束时间 |
+| frameOffset | ✅ | `0` |
+| pid | ✅ | 进程 ID |
+| samplingPeriod | ✅ | `-1` (不采样) |
+| cpuArch | ✅ | `2` (x64) |
+| cpuId | ✅ | `0` |
+| cpuManufacturer | ✅ | 12 字节 |
+| onDemand | ✅ | `0` |
+| captureName | ✅ | 程序名 |
+| captureProgram | ✅ | 程序名 |
+| captureTime | ✅ | 时间戳 |
+| executableTime | ✅ | `0` |
+| hostInfo | ✅ | 主机信息 |
+| cpuTopology | ✅ | `count=0` |
+| crashEvent | ✅ | 全零 |
+| frames | ✅ | 帧数据 |
+| sections | ✅ (0.13.4+) | `count=0` |
+| **stringData** | ✅ | **所有字符串必须在此注册** |
+| strings | ✅ | `count=0` |
+| threadNames | ✅ | 线程名映射 |
+| externalNames | ✅ | `count=0` |
+| localThreadCompress | ✅ | 线程压缩表 |
+| externalThreadCompress | ✅ | `count=0` |
+| **sourceLocation** | ✅ | **所有 zone 名称必须在此注册** |
+| sourceLocationExpand | ✅ | `count=0` |
+| sourceLocationPayload | ✅ | `count=0` |
+| sourceLocationZonesCnt | ✅ | `count=0` |
+| gpuSourceLocationZonesCnt | ✅ | `count=0` |
+| lockMap | ✅ | `count=0` |
+| messages | ✅ | `count=0` |
+| zoneExtra | ✅ | `count=0` |
+| **threads** | ✅ | **CPU zone 时间线** |
+| **gpuData** | ✅ | **GPU zone 时间线** |
+| plots | ✅ | `count=0` |
+| memNameMap | ✅ | `count=0` |
+| callstackPayload | ✅ | `count=0` |
+| callstackFrameMap | ✅ | `count=0` |
+| appInfo | ✅ | `count=0` |
+| frameImage | ✅ | `dict_size=0, count=0` |
+| ctxSwitch | ✅ | `count=0` |
+| cpuData[256] | ✅ | 全部 `count=0` |
+| tidToPid | ✅ | `count=0` |
+| cpuThreadData | ✅ | `count=0` |
+| symbolLoc + symbolMap | ✅ | `count=0` |
+| symbolCode | ✅ | `count=0` |
+| codeSymbolMap | ✅ | `count=0` |
+| hwSamples | ✅ | `count=0` |
+| sourceFileCache | ✅ | `count=0` |
+
+**结论**：约 51 个数据段，其中 40+ 个可写 `count=0`（空），真正需要填充的仅约 10 个。
+
+#### 11.3.4 方案对比
+
+| 方案 | 优点 | 缺点 | 推荐度 |
+|------|------|------|--------|
+| **A: Chrome Trace JSON** | 简单、Tracy 原生支持导入、格式稳定 | 文件体积大、需要 File→Open 导入而非直接打开 | ⭐⭐⭐ |
+| **B: 直接写 .tracy 二进制** | Tracy 直接打开、体积小、完整保留 Tracy 语义 | 实现复杂度高、需维护版本兼容、需 LZ4 依赖 | ⭐⭐⭐⭐ |
+| **C: 混合方案** | `.gitracy` 存储原始数据，同时支持一键导出 `.tracy` | 需同时维护两种导出路径 | ⭐⭐⭐⭐⭐ |
+
+#### 11.3.5 推荐实现策略：最小化 .tracy 写入器
+
+**阶段 1：核心框架**
+
+实现一个 `TracyFileWriter` 类，仅写入 Tracy 能打开的最小数据集：
+
+```cpp
+class TracyFileWriter {
+    // 文件写入基础设施
+    FILE *m_file;
+    LZ4_stream_t *m_lz4_stream;
+    char *m_buf;            // 64KB 写入缓冲区
+    char *m_compressed;     // 压缩输出缓冲区
+    size_t m_offset;        // 当前缓冲区偏移
+
+    // 字符串管理
+    uint64_t m_next_ptr = 0x1000;  // 模拟指针分配器
+    Vector<String> m_strings;       // 按索引存储字符串
+    HashMap<String, uint64_t> m_string_ptrs; // 字符串→模拟指针
+
+    // 源码位置管理
+    Vector<SourceLocationBase> m_srclocs; // 静态源码位置
+    int16_t m_next_srcloc = 0;
+
+    // 线程压缩
+    Vector<uint64_t> m_threads;     // 线程 ID 列表
+    HashMap<uint64_t, uint16_t> m_thread_map; // thread_id → 压缩索引
+
+public:
+    Error open(const String &p_path);
+    void close();
+
+    // 字符串注册
+    uint64_t register_string(const String &p_str);
+
+    // 源码位置注册
+    int16_t register_source_location(const String &p_name,
+                                      const String &p_function,
+                                      const String &p_file,
+                                      uint32_t p_line);
+
+    // 线程注册
+    uint16_t register_thread(uint64_t p_thread_id);
+
+    // 写入 CPU Zone
+    void write_cpu_zone(uint16_t p_thread, int16_t p_srcloc,
+                        int64_t p_start_ns, int64_t p_end_ns);
+
+    // 写入 GPU Zone
+    void write_gpu_zone(uint8_t p_context, uint16_t p_thread, int16_t p_srcloc,
+                        int64_t p_cpu_start, int64_t p_cpu_end,
+                        int64_t p_gpu_start, int64_t p_gpu_end);
+
+    // 写入帧标记
+    void write_frame_marker(int64_t p_start_ns, int64_t p_end_ns);
+
+    // 写入 Plot 数据
+    void write_plot(const String &p_name, const Vector<Pair<int64_t, double>> &p_data);
+};
+```
+
+**阶段 2：扩展功能**
+
+- 支持 zone 嵌套（子 zone 树）
+- 支持 GPU zone annotation
+- 支持消息（log）
+- 支持 callstack 关联
+
+**阶段 3：高级功能**
+
+- Zstd 压缩选项
+- 多流并行压缩
+- 帧图像嵌入
+- 内存分配追踪导出
+
+#### 11.3.6 关键实现注意事项
+
+1. **模拟指针分配**：`stringData` 段需要为每个字符串分配唯一的 `uint64_t` 值。最简单的方法是从 `0x1000` 开始递增分配。读取端只关心 `(ptr → content)` 映射，不校验指针是否合法。
+
+2. **StringRef 的 isidx 标志**：静态字符串使用 `isidx=0`（指针引用），动态字符串使用 `isidx=1`（索引引用）。Godot Insights 可以全部使用 `isidx=0`（指针引用），因为我们在 `stringData` 段注册了所有字符串。
+
+3. **ZoneEvent 的 47 位时间戳限制**：`start` 和 `end` 字段各占 47 位，最大值为 `2^46 - 1 = 70,368,744,177,663` 纳秒 ≈ 70368 秒 ≈ 19.5 小时。对于绝大多数录制场景足够。
+
+4. **ThreadCompress 序列化**：
+   ```
+   uint64_t count                           // 压缩后的线程数
+   uint64_t[count] expanded_thread_ids      // 展开表
+   ```
+   读取端构建 `thread_id → index` 和 `index → thread_id` 映射。
+
+5. **帧数据格式**：
+   ```
+   uint64_t frame_set_count
+   for each frame_set:
+       uint64_t name           // Frame name 指针
+       uint8_t continuous      // 连续帧 or 离散帧
+       uint64_t frame_count
+       for each frame:
+           int64_t start_offset  // delta 编码
+           [int64_t end_offset]  // 仅离散帧
+           int32_t frame_image   // -1 = 无图像
+   ```
+
+6. **GPU 数据格式**：
+   ```
+   uint64_t total_gpu_zone_count   // 所有 context 的 zone 总数
+   uint64_t gpu_children_count     // 子 zone 总数
+   uint64_t gpu_context_count      // GPU context 数量
+   for each context:
+       uint32_t thread             // 提交线程
+       uint8_t has_calibration     // 是否有校准
+       uint64_t count              // zone 数量
+       float period                // 时间戳周期
+       GpuContextType type         // Vulkan/D3D12/Metal 等
+       StringIdx name              // context 名称
+       uint64_t overflow           // 溢出标志
+       uint64_t note_name_count    // annotation 名称
+       uint64_t thread_data_count  // 线程数据
+       for each thread_data:
+           uint64_t thread_id
+           [GPU zone timeline]     // 递归 GPU zone 树
+       uint64_t notes_count        // annotation
+   ```
+
+7. **SourceLocationBase 大小**：`StringRef(9) + StringRef(9) + StringRef(9) + uint32_t(4) + uint32_t(4) = 35 字节`，非对齐打包（`#pragma pack(push, 1)`）。
+
+#### 11.3.7 与现有 .gitracy 格式的关系
+
+**建议采用混合方案 C**：
+
+1. **录制阶段**：继续使用 `.gitracy` 格式存储原始数据（Godot Insights 自己的 JSON 格式）
+2. **导出阶段**：提供一键 "Export as .tracy" 功能，调用 `TracyFileWriter` 生成标准 `.tracy` 文件
+3. **Tracy 打开**：导出的 `.tracy` 文件可直接在 Tracy 中 File→Open 打开，无需任何转换
+
+这种方案的优势：
+- `.gitracy` 格式保持简单，Godot Insights 内部使用不受限制
+- `.tracy` 导出是可选的，不影响核心功能
+- 用户可以同时享受 Godot Insights 内嵌可视化和 Tracy 的独立分析能力
+
+#### 11.3.8 预估工作量
+
+| 任务 | 预估 |
+|------|------|
+| LZ4 单流压缩写入框架 | 1-2 天 |
+| 字符串管理 + SourceLocation 注册 | 2-3 天 |
+| CPU Zone 时间线写入 | 2-3 天 |
+| GPU Zone 时间线写入 | 2-3 天 |
+| 帧标记写入 | 1 天 |
+| Plot 数据写入 | 1 天 |
+| 空 section 占位 | 1 天 |
+| 端到端测试 + 调试 | 3-5 天 |
+| **总计** | **13-20 天** |
+
+### 11.4 结论
+
+**直接输出 `.tracy` 格式可行且值得做。** 核心工作量集中在字符串管理和位打包数据结构上，但这些都是一次性实现。推荐采用混合方案 C（`.gitracy` + `.tracy` 导出），在保持 Godot Insights 内部格式灵活性的同时，提供与 Tracy 的原生互操作性。
+
+实现时应先写最小可写数据集（约 10 个核心段 + 40 个空段），验证 Tracy 能成功打开后，再逐步扩展 GPU zone、plot、message 等高级功能。
+
+## 12. 整合 Tracy 到 Godot 的方案调研
+
+### 12.1 调研目标
+
+评估是否可以将 Tracy 完整整合进 Godot，由 Tracy 负责所有性能数据捕获，从而避免手动修改引擎添加插桩点。
+
+### 12.2 Tracy 数据捕获机制分析
+
+Tracy 提供两种互补的数据捕获方式：
+
+#### 12.2.1 手动插桩（Instrumental Profiling）
+
+这是 Tracy 的核心捕获方式，需要开发者在代码中添加宏：
+
+| 宏 | 作用 | 是否需要修改源码 |
+|---|---|---|
+| `ZoneNamed` / `ZoneNamedN` | CPU Zone（作用域自动计时） | 是 |
+| `TracyGpuZone` | GPU Zone（Vulkan/D3D12/Metal 时间戳） | 是 |
+| `TracyAlloc` / `TracyFree` | 内存分配/释放追踪 | 是 |
+| `FrameMark` | 帧标记 | 是 |
+| `TracyPlot` | 数值计数器 | 是 |
+| `TracyMessage` | 日志消息 | 是 |
+| `TracyFiberEnter` | Fiber/协程切换 | 是 |
+
+**关键结论：手动插桩必须修改源码，无法绕过。**
+
+#### 12.2.2 自动采样（Sampling Profiling）
+
+Tracy 通过 `TracySysTrace` 模块提供操作系统级 CPU 采样：
+
+**Windows 平台**：
+- 使用 ETW (Event Tracing for Windows) 内核会话
+- 默认采样频率：8000 Hz（可通过 `TRACY_SAMPLING_HZ` 调整，最大 8000）
+- 需要管理员权限（`CheckAdminPrivilege()`）
+- 自动捕获：上下文切换、线程调度、CPU 采样调用栈、VSync 信号
+
+**Linux 平台**：
+- 使用 `perf_event_open` 系统调用
+- 默认采样频率：10000 Hz（可调至 1000000 Hz）
+- 需要 `perf_event_paranoid ≤ 2` 或 root 权限
+- 自动捕获：上下文切换、线程唤醒、VSync（drm_vblank_event）
+
+**macOS**：
+- 使用 `perf` 子系统（通过 `TRACY_SAMPLING_HZ` 默认 1000 Hz）
+- 需要 Instruments 签名的二进制
+
+**自动采样提供的数据**：
+- ✅ CPU 调用栈采样（按固定频率捕获各线程的调用栈）
+- ✅ 上下文切换（线程何时被调度/抢占）
+- ✅ CPU 核心利用率
+- ✅ VSync 信号时间点
+- ❌ 函数精确耗时（只能统计采样命中次数，无法精确计时）
+- ❌ GPU 执行时间
+- ❌ 内存分配/释放
+- ❌ 自定义计数器（帧率、物理统计等）
+- ❌ 引擎语义信息（哪个是物理帧、哪个是渲染帧）
+
+#### 12.2.3 两种方式对比
+
+| 维度 | 手动插桩 | 自动采样 |
+|------|----------|----------|
+| 精确度 | 纳秒级精确计时 | 统计近似（采样频率决定精度） |
+| 函数耗时 | ✅ 精确 | ❌ 近似（采样可能错过短函数） |
+| 调用栈 | ✅ 完整 | ✅ 完整（但有采样偏差） |
+| GPU 数据 | ✅ 精确时间戳 | ❌ 不支持 |
+| 内存追踪 | ✅ 每次 alloc/free | ❌ 不支持 |
+| 自定义事件 | ✅ 任意 | ❌ 不支持 |
+| 源码修改 | 必需 | 不需要 |
+| 权限要求 | 无 | 管理员/root |
+| 运行时开销 | 极低（纳秒级/zone） | 中等（ETW/perf 开销） |
+| 短函数可见性 | ✅ 可见 | ❌ 容易遗漏 |
+
+### 12.3 Godot 现有 Tracy 集成
+
+Godot 已通过 `GODOT_USE_TRACY` 编译选项集成了 Tracy 客户端：
+
+**现有插桩覆盖**（约 30 个源文件，80+ 个插桩点）：
+
+| 模块 | 文件 | 插桩内容 |
+|------|------|----------|
+| 主循环 | `main/main.cpp` | 帧各阶段：idle, physics, navigation 等 |
+| 渲染 | `rendering_server_default.cpp` | begin_frame, scene_update, draw_viewports 等 |
+| 渲染 | `render_forward_clustered.cpp` | render_scene, render_shadow_pass 等 |
+| 渲染 | `render_forward_mobile.cpp` | 同上（移动端） |
+| 渲染 | `rendering_device.cpp` | GPU 提交、同步等 |
+| 物理 | `physics_server_2d/3d.cpp` | integrate_forces, step 等 |
+| 物理 | `physics_server_*_wrap_mt.cpp` | 线程化物理步骤 |
+| 音频 | `audio_server.cpp` | driver_process, mix_step 等 |
+| 脚本 | `gdscript_vm.cpp` | script_function_call 等 |
+| 场景 | `scene_tree.cpp` | physics_process, process 等 |
+| 场景 | `node.cpp` | notification, propagate_ready 等 |
+| 场景 | `viewport.cpp` | notification, process_picking 等 |
+| 导航 | `godot_navigation_server_2d/3d` | navigation_step 等 |
+| 平台 | `os_windows/linuxbsd/android.cpp` | 主循环 FrameMark |
+| XR | `openxr_api.cpp` | XR 帧 |
+| 网络 | `scene_multiplayer.cpp` | multiplayer |
+| 资源 | `resource_loader.cpp` | 资源加载 |
+| 内存 | `object.cpp` | 内存分配/释放 |
+
+**Insights 扩展宏**（`insights.h`，Phase 1 新增）：
+- `GodotProfileZoneC(category, name)` — 带 channel 颜色的 zone
+- `GodotProfileZoneH(subsystem, op1, op2)` — 层级命名 zone
+- `GodotProfilePlot(name, value)` — 数值计数器
+- `GodotProfileMessage(text)` — 日志消息
+- `GodotProfileResourceLoad(path)` — 资源加载
+- `GodotProfileGpuStage(name)` — GPU 阶段
+
+### 12.4 核心问题：能否仅靠 Tracy 自动采样，不修改引擎源码？
+
+**答案：不能。** 理由如下：
+
+1. **GPU 数据不可替代**：Tracy 自动采样无法捕获 GPU 执行时间。Godot 的渲染管线必须通过 `TracyVulkan.hpp` / `TracyD3D12.hpp` / `TracyMetal.hpp` 手动插桩（`TracyVkZone` 等），这是 Tracy GPU 数据的唯一来源。
+
+2. **引擎语义丢失**：自动采样只能看到 C++ 函数调用栈，无法知道：
+   - 当前是物理帧还是渲染帧
+   - 某次 allocation 属于哪个子系统
+   - 场景树的哪个 Node 正在处理 notification
+   - 一个 draw call 对应哪个渲染 pass
+
+3. **短函数遗漏**：引擎中大量关键函数耗时在微秒级（如 `Node::notification` 分发、`ResourceLoader` 查找缓存），采样频率 8000 Hz 意味着每 125μs 才采样一次，大量短函数会被完全遗漏。
+
+4. **权限要求**：自动采样在 Windows 需要管理员权限、Linux 需要 `perf_event_paranoid` 调整，这对普通游戏开发者不友好。
+
+5. **内存追踪**：Tracy 的 `TracyAlloc`/`TracyFree` 必须手动插桩，没有自动采样替代方案。
+
+### 12.5 整合方案分析
+
+#### 方案 A：内嵌 Tracy Client + 外部 Tracy Server（当前方案）
+
+```
+[Godot Engine (TRACY_ENABLE)] --TCP--> [Tracy Server (独立进程)]
+  ├── GodotProfileZone → ZoneNamed
+  ├── GodotProfileFrameMark → FrameMark
+  ├── TracyAlloc/Free
+  └── TracyGpuZone (Vulkan/D3D12/Metal)
+```
+
+**现状**：Godot 已有此集成，`GODOT_USE_TRACY` 编译选项即可启用。
+
+**优点**：
+- Tracy 客户端代码已在引擎中，零额外工作
+- 外部 Tracy Server 提供完整可视化（时间线、火焰图、统计、内存）
+- 不需要自建可视化
+
+**缺点**：
+- 用户必须单独安装 Tracy Server
+- 数据通过 TCP 传输，无法离线分析
+- Tracy Server 是 ImGui + GLFW 独立应用，无法嵌入 Godot Editor
+- 需要手动插桩才能获得有意义的数据
+
+#### 方案 B：内嵌 Tracy Client + 内嵌 Tracy Server（ImGui 嵌入）
+
+```
+[Godot Engine]
+  ├── Tracy Client (TRACY_ENABLE)
+  ├── Tracy Server (编译为静态库)
+  │   └── ImGui 渲染 → 嵌入 Godot 的 Vulkan/Metal 窗口
+  └── Godot Editor Dock → 包裹 ImGui 渲染表面
+```
+
+**可行性分析**：
+
+| 问题 | 评估 |
+|------|------|
+| Tracy Server 能否编译为库？ | ⚠️ 需要修改 CMakeLists，剥离 main()，导出 API |
+| ImGui 能否嵌入 Godot UI？ | ⚠️ Godot 使用自己的 UI 系统，ImGui 是独立渲染层，两者冲突 |
+| 依赖冲突 | ❌ Tracy Server 依赖 GLFW + ImGui + OpenGL/Vulkan，与 Godot 的渲染管线冲突 |
+| 线程模型冲突 | ❌ Tracy Server 有自己的主循环和渲染线程，与 Godot 主循环冲突 |
+| 二进制大小 | ❌ Tracy Server + ImGui + nfd + Zstd 等依赖增加约 10-15MB |
+
+**结论**：技术上极难实现，两个渲染系统（Tracy ImGui vs Godot RenderingDevice）无法共存于同一进程窗口。
+
+#### 方案 C：内嵌 Tracy Client + Godot 自建 UI（当前 Godot Insights 方案）
+
+```
+[Godot Engine]
+  ├── Tracy Client (TRACY_ENABLE) → 数据通过 .gitracy 捕获
+  ├── NativeCapture → 消费 Tracy 队列 → InsightsDatabase
+  └── Godot Insights UI (Control 子类)
+       ├── Timeline (自绘)
+       ├── Flamegraph
+       ├── Memory View
+       └── Statistics
+```
+
+**优点**：
+- UI 与 Editor 完全集成，无需外部工具
+- 数据存储在 .gitracy 格式，可离线分析
+- 可导出 .tracy 供 Tracy Server 分析（见第 11 章方案）
+
+**缺点**：
+- 需要自建所有可视化组件
+- 仍需手动插桩
+
+#### 方案 D：直接使用 Tracy Worker Import API 生成 .tracy
+
+```
+[Godot Engine]
+  ├── NativeCapture → 收集 zones, frames, memory, gpu 数据
+  └── TracyWorker(timeline, messages, plots, threadNames) → worker.Write(file) → .tracy
+```
+
+**发现**：Tracy 的 `import-chrome.cpp` 已经展示了这条路径：
+1. 解析外部数据格式（Chrome Trace JSON）
+2. 构造 `Worker::ImportEventTimeline` / `ImportEventMessages` / `ImportEventPlots` 向量
+3. 调用 `Worker(name, program, timeline, messages, plots, threadNames)` 构造函数
+4. 调用 `worker.Write(fileWrite, false)` 直接写出 .tracy 文件
+
+这意味着我们可以：
+1. 将 Tracy 的 `server/` 目录编译为静态库（`TracyWorker`, `TracyFileWrite`, `TracySlab` 等）
+2. 在 Godot Insights 的 `NativeCapture` 中收集 zone 数据
+3. 将 zone 数据转为 `ImportEventTimeline` 格式
+4. 直接调用 `Worker` 构造函数 + `Write()` 生成 .tracy 文件
+
+**优点**：
+- 不需要自己实现 .tracy 的二进制序列化（Tracy 自己的代码完成）
+- 生成的 .tracy 文件 100% 兼容 Tracy Server
+- 可以包含 GPU zones（通过 `ImportEventTimeline` 的 `isEnd` 机制）
+- 维护成本极低——Tracy 升级只需更新 server 库
+
+**缺点**：
+- 需要将 Tracy server 代码编译进 Godot（增加约 2-3MB 二进制）
+- `Worker` 构造函数的 Import 路径不支持 GPU contexts（只有 CPU timeline + messages + plots）
+- 需要链接 LZ4/Zstd
+
+#### 方案 E：Tracy Client 实时捕获 + 直接写出 .tracy（最优方案）
+
+```
+[Godot Engine (TRACY_ENABLE)]
+  ├── Tracy Client 自动运行
+  │   ├── ZoneBegin/End → Tracy 内部队列
+  │   ├── FrameMark → Tracy 内部队列
+  │   ├── TracyGpuZone → GPU timestamp query
+  │   └── TracyAlloc/Free → 内存事件
+  └── TracyCaptureBridge (新增)
+       ├── 拦截 Tracy 客户端数据（而非 TCP 发送）
+       ├── 将 Tracy 队列事件转为 .gitracy / .tracy
+       └── 同时提供数据给 Godot Insights UI
+```
+
+**实现路径**：
+
+Tracy Client 的数据流为：
+```
+ZoneBegin/End → Profiler::QueueItem → m_queue → TCP 发送线程 → Tracy Server
+```
+
+可以在 TCP 发送线程处拦截：
+1. 保留 `TRACY_ENABLE` 编译选项
+2. 在 `Profiler` 的 `WorkerThread()` 中，除了 TCP 发送外，同时将事件转发给 Godot Insights
+3. 当 Godot Insights 开始录制时，启动拦截；停止录制时，将缓冲的事件序列化为 .tracy
+
+**但这有严重问题**：
+- 需要修改 Tracy 客户端源码（`TracyProfiler.cpp`），每次 Tracy 升级都要同步
+- Tracy 客户端使用 `TRACY_DELAYED_INIT` 和复杂的锁机制，插入拦截逻辑容易引入 bug
+- 数据格式是 Tracy 内部队列格式（紧凑二进制），解析成本接近实现一个 Tracy Server
+
+### 12.6 方案对比总结
+
+| 方案 | 是否需要手动插桩 | UI 集成度 | 实现复杂度 | Tracy 兼容性 | 推荐度 |
+|------|------------------|-----------|------------|--------------|--------|
+| A: Tracy Client + 外部 Server | 是 | 无（外部窗口） | 低 | ✅ 原生 | ⭐⭐⭐ |
+| B: 内嵌 Tracy Server (ImGui) | 是 | 差（ImGui 冲突） | 极高 | ✅ 原生 | ⭐ |
+| C: 自建 UI + .gitracy | 是 | ✅ 完全集成 | 中 | 需转换 | ⭐⭐⭐⭐ |
+| D: Import API 生成 .tracy | 是 | ✅ 完全集成 | 低-中 | ✅ 原生 | ⭐⭐⭐⭐⭐ |
+| E: 拦截 Tracy 队列 | 是 | ✅ 完全集成 | 极高 | ✅ 原生 | ⭐⭐ |
+
+### 12.7 核心结论
+
+**1. 手动插桩不可省略**
+
+无论采用哪种整合方案，手动插桩都是必需的。Tracy 的自动采样只能提供统计级 CPU 调用栈数据，无法替代：
+- GPU 时间戳查询
+- 内存分配追踪
+- 引擎语义标记（帧类型、子系统边界）
+- 短函数的精确计时
+
+**2. 当前插桩密度严重不足**
+
+Godot 现有约 80 个插桩点，仅覆盖主循环、渲染、物理、音频、脚本的粗粒度阶段。对比 Unreal Engine 的 `TRACE_CPUPROFILER_EVENT_SCOPE` 覆盖约 2000+ 个插桩点，差距巨大。需要持续扩展。
+
+**3. 推荐方案：C + D 混合**
+
+- **日常使用**：方案 C（Godot Insights 自建 UI + .gitracy 格式）提供编辑器内实时可视化
+- **深度分析**：方案 D（Tracy Worker Import API）一键导出标准 .tracy 文件，用 Tracy Server 进行高级分析
+- **持续扩展插桩**：在关键路径逐步添加 `GodotProfileZoneC` 宏，而非依赖自动采样
+
+### 12.8 方案 D 实现细节
+
+#### 12.8.1 依赖的 Tracy Server 组件
+
+| 组件 | 文件 | 作用 |
+|------|------|------|
+| `TracyWorker` | `server/TracyWorker.cpp` | 数据模型 + Import 构造函数 + Write 序列化 |
+| `TracyFileWrite` | `server/TracyFileWrite.hpp` | LZ4/Zstd 压缩流写入 |
+| `TracySlab` | `server/TracySlab.hpp` | 内存池分配器 |
+| `TracyEvent` | `server/TracyEvent.hpp` | 数据结构定义 |
+| `TracyArmCpp` | `server/TracyArmCpp.hpp` | ARM 回退 |
+| `lz4` | `zstd/lz4*` | LZ4 压缩库 |
+| `zstd` | `zstd/zstd*` | Zstd 压缩库（可选） |
+
+预计增加二进制大小约 2-3MB。
+
+#### 12.8.2 Import API 使用方式
+
+参考 `import-chrome.cpp` 的实现模式：
+
+```cpp
+// 1. 收集数据
+std::vector<tracy::Worker::ImportEventTimeline> timeline;
+std::vector<tracy::Worker::ImportEventMessages> messages;
+std::vector<tracy::Worker::ImportEventPlots> plots;
+std::unordered_map<uint64_t, std::string> threadNames;
+
+// 2. 填充 timeline 数据
+for (auto &zone : insights_db->get_cpu_zones()) {
+    // Zone 开始
+    timeline.emplace_back(tracy::Worker::ImportEventTimeline {
+        zone.thread_id,          // tid
+        zone.start_ns,           // timestamp (纳秒)
+        zone.name.c_str(),       // zone 名称
+        "",                      // 文本
+        false,                   // isEnd=false 表示 zone 开始
+        zone.file,               // 源文件
+        zone.line                // 行号
+    });
+    // Zone 结束
+    timeline.emplace_back(tracy::Worker::ImportEventTimeline {
+        zone.thread_id,
+        zone.end_ns,
+        "", "", true             // isEnd=true 表示 zone 结束
+    });
+}
+
+// 3. 填充帧数据（通过 message 中包含 "frame" 关键字）
+for (auto &frame : insights_db->get_frame_markers()) {
+    messages.emplace_back(tracy::Worker::ImportEventMessages {
+        frame.thread_id,
+        frame.timestamp_ns,
+        "frame"                  // 包含 "frame" 的消息会被 Tracy 解析为帧标记
+    });
+}
+
+// 4. 填充 Plot 数据
+for (auto &counter : insights_db->get_counters()) {
+    plots.emplace_back(tracy::Worker::ImportEventPlots {
+        counter.name,
+        tracy::PlotValueFormatting::Number,
+        counter.data_points      // vector<pair<int64_t, double>>
+    });
+}
+
+// 5. 填充线程名
+for (auto &thread : insights_db->get_threads()) {
+    threadNames[thread.id] = thread.name;
+}
+
+// 6. 按时间排序
+std::stable_sort(timeline.begin(), timeline.end(),
+    [](const auto &l, const auto &r) { return l.timestamp < r.timestamp; });
+std::stable_sort(messages.begin(), messages.end(),
+    [](const auto &l, const auto &r) { return l.timestamp < r.timestamp; });
+
+// 7. 基线时间归零
+uint64_t mts = 0;
+if (!timeline.empty()) mts = timeline[0].timestamp;
+if (!messages.empty() && messages[0].timestamp < mts) mts = messages[0].timestamp;
+for (auto &v : timeline) v.timestamp -= mts;
+for (auto &v : messages) v.timestamp -= mts;
+
+// 8. 构造 Worker 并写出 .tracy
+tracy::Worker worker("Godot", "Godot Engine", timeline, messages, plots, threadNames);
+auto w = std::unique_ptr<tracy::FileWrite>(tracy::FileWrite::Open(output_path, tracy::FileCompression::Fast));
+worker.Write(*w, false);
+```
+
+#### 12.8.3 Import API 的限制
+
+| 限制 | 影响 | 规避方法 |
+|------|------|----------|
+| 不支持 GPU Context | GPU zone 无法出现在 Tracy 的 GPU 时间线 | 将 GPU zone 作为 CPU zone 写入（线程名标注为 GPU） |
+| 不支持嵌套 zone 文本 | `ImportEventTimeline.text` 只支持单层 | 拼接为 `zone_text` 字段 |
+| 不支持内存分配事件 | 无法展示 Tracy 的内存视图 | 通过 Plot 记录内存使用量曲线 |
+| 不支持调用栈 | `ImportEventTimeline` 无 callstack 字段 | 忽略，或在 zone 名称中附加调用信息 |
+| 不支持锁事件 | 无法展示锁竞争 | 通过 Message 记录锁等待时间 |
+
+#### 12.8.4 GPU Zone 的处理策略
+
+由于 `ImportEventTimeline` 不支持 GPU Context，GPU 数据需要特殊处理：
+
+**策略 1：CPU Zone 模拟 GPU**
+- 将 GPU zone 写入独立的虚拟线程（如 `tid = 0xFFFFFF00 + gpu_context_id`）
+- 线程名标注为 `[GPU] Vulkan Context 0`
+- 优点：Tracy 能看到 GPU 数据，在 CPU 时间线的对应位置
+- 缺点：不在 Tracy 的专用 GPU 时间线区域
+
+**策略 2：Chrome Trace JSON → import-chrome → .tracy**
+- 导出为 Chrome Trace JSON（已有 `gitracy_to_chrome_json()`）
+- 调用 Tracy 自带的 `import-chrome` 工具转换
+- Chrome JSON 的 `X` 事件类型可以直接包含 GPU 数据
+- 优点：利用已有工具链
+- 缺点：需要中间格式，且 Chrome JSON 不支持 GPU context 元数据
+
+**策略 3：扩展 Import API（推荐）**
+- 修改 Tracy 的 `Worker` Import 构造函数，增加 GPU timeline 数据支持
+- 上游贡献：将修改提交给 Tracy 项目
+- 优点：一次修改，所有 import 工具受益
+- 缺点：需要 Tracy 上游接受
+
+### 12.9 扩展插桩点的优先级建议
+
+既然手动插桩不可省略，以下按优先级列出需要新增插桩的位置：
+
+| 优先级 | 子系统 | 当前覆盖 | 建议新增 | 预计新增点数 |
+|--------|--------|----------|----------|-------------|
+| P0 | 渲染管线 | 粗粒度 | 每个渲染 pass (shadow, forward, post-process) | 15-20 |
+| P0 | 物理步骤 | integrate_forces | broadphase, narrowphase, solver, island | 8-10 |
+| P0 | 场景树 | notification | _process, _physics_process, _enter_tree, _ready | 10-15 |
+| P1 | 资源加载 | 仅 resource_loader | 磁盘读取、解析、导入、缓存查找 | 8-10 |
+| P1 | 网络 | multiplayer | RPC, 同步, 场景复制 | 5-8 |
+| P1 | 导航 | navigation_step | 寻路、导航网格生成 | 5-8 |
+| P2 | 音频 | mix_step | 音频总线、效果处理、流式解码 | 5-8 |
+| P2 | GDScript | script_function_call | 变量访问、信号发射、await | 5-8 |
+| P2 | C# | 无 | mono_runtime_invoke 包装 | 3-5 |
+| P3 | 动画 | 无 | AnimationTree、Tween、Blend | 5-8 |
+| P3 | 粒子 | update_particles | emit, process, render | 3-5 |
+
+**总计**：预计需要新增 70-100 个插桩点，使总量达到 150-180 个。
+
+### 12.10 最终推荐路线图
+
+```
+Phase 7 (当前): 完善自建 UI + 方案 D（Tracy Import API 生成 .tracy）
+  ├── 将 Tracy server/ 编译为模块内静态库
+  ├── 实现 InsightsDatabase → ImportEventTimeline 转换
+  ├── 一键 "Export as .tracy" 按钮
+  └── 验证 Tracy Server 能成功打开导出的 .tracy
+
+Phase 8: 扩展插桩密度 (P0 优先级)
+  ├── 渲染管线每 pass 插桩
+  ├── 物理子系统细分
+  └── 场景树关键回调
+
+Phase 9: GPU Zone 原生支持
+  ├── 策略 3: 扩展 Tracy Import API 支持 GPU Context
+  ├── 或: 直接写 .tracy 二进制（方案 11.3）
+  └── GPU zone 出现在 Tracy 的专用 GPU 时间线
+
+Phase 10: 持续扩展插桩 (P1-P3)
+  └── 逐步覆盖资源加载、网络、导航、音频等
+```
+
+## 13. Godot Insights 全 Tracy 整合方案：三大模块设计
+
+### 13.1 设计目标
+
+将 Godot Insights 设计为**完整整合 Tracy 三大模块**的独立 Godot 模块：
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    Godot Insights Module                      │
+│                                                                │
+│  ┌────────────────┐  ┌────────────────┐  ┌────────────────┐  │
+│  │  Tracy Client   │  │  Tracy Server   │  │   Tracy UI     │  │
+│  │  (数据捕获)     │  │  (数据处理)     │  │  (数据可视化)  │  │
+│  │                │  │                │  │                │  │
+│  │ ZoneBegin/End  │→│ Worker         │→│ Timeline       │  │
+│  │ FrameMark      │  │ Write .tracy   │  │ Flamegraph     │  │
+│  │ GpuZone        │  │ Query API      │  │ Memory View    │  │
+│  │ TracyAlloc/Free│  │                │  │ Statistics     │  │
+│  │ TracyPlot      │  │                │  │ Messages       │  │
+│  └────────────────┘  └────────────────┘  └────────────────┘  │
+│                                                                │
+│  关键特征：                                                    │
+│  ✓ 底层基于 Tracy，与 Tracy 互通                              │
+│  ✓ 独立运行，无需额外的源码或 exe                              │
+│  ✓ 数据零损失，支持所有 Tracy 事件类型                        │
+│  ✓ 使用 Godot 编辑器 UI（非 ImGui）                           │
+│  ✓ 保存标准 .tracy 文件，Tracy 可直接读取                     │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 13.2 架构发现：Tracy Client-Server 通信模型
+
+**关键发现**：Tracy 的网络模型是 **Client 监听，Server 连接**（反向模型）。
+
+```
+Tracy Client (Godot Engine)          Tracy Server (外部进程)
+    │ 监听 port 8086                      │
+    │◄──────────── Connect ───────────────┤
+    │                                     │
+    │──── HandshakeShibboleth ───────────→│
+    │◄──── HandshakeWelcome ──────────────┤
+    │                                     │
+    │──── WelcomeMessage ────────────────→│
+    │──── ZoneBegin/End ────────────────→│  (LZ4 压缩流)
+    │──── GpuZoneBegin/End ─────────────→│
+    │──── FrameMark ────────────────────→│
+    │──── MemAlloc/Free ────────────────→│
+    │──── PlotData ─────────────────────→│
+    │──── Message ──────────────────────→│
+    │──── Callstack ────────────────────→│
+```
+
+这意味着：
+- Godot Engine 中的 Tracy Client 已经在 `127.0.0.1:8086` 监听
+- 我们只需创建一个 `Worker` 对象连接到该地址，即可接收全部数据
+- **无需修改任何 Tracy Client 代码**
+
+### 13.3 模块一：Tracy Client（数据捕获）
+
+#### 13.3.1 现状
+
+Godot 已通过 `GODOT_USE_TRACY` 编译选项集成了完整的 Tracy Client：
+
+- `core/profiling/profiling.h` → `TRACY_ENABLE` + `ZoneNamedN` 等宏
+- `core/profiling/insights.h` → `GodotProfileZoneC` / `GodotProfileGpuStage` 等扩展宏
+- 约 80+ 个插桩点覆盖主循环、渲染、物理、音频、脚本等
+
+**无需额外工作**，Tracy Client 已经是完整的。
+
+#### 13.3.2 数据流
+
+```
+Godot Engine 代码
+  │
+  ├── GodotProfileZoneC(COLOR, "godot:physics/3d/step")
+  │     └── ZoneNamedN + ZoneColor → Tracy 内部 Profiler
+  │
+  ├── GodotProfileFrameMark
+  │     └── FrameMark → Tracy 内部队列
+  │
+  ├── GodotProfileGpuStage("render_shadow")
+  │     └── TracyGpuZone → Vulkan timestamp query
+  │
+  └── GodotProfileAlloc/GodotProfileFree
+        └── TracyAlloc/TracyFree → 内存事件队列
+
+Tracy Profiler (内置)
+  │
+  ├── m_queue (无锁队列) → LZ4 压缩
+  │
+  └── ListenSocket(8086) → 等待 Server 连接
+```
+
+#### 13.3.3 Client 发送的所有事件类型
+
+Tracy Client 通过网络发送以下事件类型（完整列表来自 `TracyQueue.hpp`）：
+
+| 类别 | 事件类型 | 说明 |
+|------|----------|------|
+| Zone | `ZoneBegin`/`ZoneBegin16`/`ZoneBegin32` | CPU zone 开始（3 种时间戳宽度） |
+| Zone | `ZoneBeginCallstack`/... | CPU zone 开始 + callstack |
+| Zone | `ZoneBeginAllocSrcLoc`/... | 动态源码位置 zone |
+| Zone | `ZoneEnd`/`ZoneEnd16`/`ZoneEnd32` | CPU zone 结束 |
+| Zone | `ZoneValidation` | Zone ID 验证 |
+| Zone | `ZoneText` / `ZoneName` / `ZoneColor` / `ZoneValue` | Zone 附加信息 |
+| GPU | `GpuNewContext` | GPU 上下文创建 |
+| GPU | `GpuZoneBegin`/`GpuZoneBeginSerial` | GPU zone 开始 |
+| GPU | `GpuZoneBeginCallstack`/... | GPU zone + callstack |
+| GPU | `GpuZoneEnd`/`GpuZoneEndSerial` | GPU zone 结束 |
+| GPU | `GpuTime` / `GpuCalibration` / `GpuTimeSync` | GPU 时间戳 |
+| GPU | `GpuContextName` / `GpuAnnotationName` / `GpuZoneAnnotation` | GPU 元数据 |
+| Memory | `MemAlloc` / `MemFree` / `MemAllocNamed` / `MemFreeNamed` | 内存分配/释放 |
+| Memory | `MemAllocCallstack` / `MemFreeCallstack` / ... | 内存 + callstack |
+| Memory | `MemDiscard` / `MemDiscardCallstack` | 内存事件丢弃 |
+| Frame | `FrameMarkMsg` / `FrameMarkMsgStart` / `FrameMarkMsgEnd` | 帧标记 |
+| Frame | `FrameVsync` / `FrameImage` / `FrameName` | 帧元数据 |
+| Lock | `LockAnnounce` / `LockTerminate` / `LockWait` / `LockObtain` / `LockRelease` | 锁事件 |
+| Lock | `LockSharedWait` / `LockSharedObtain` / `LockSharedRelease` / `LockMark` / `LockName` | 共享锁 |
+| Plot | `PlotDataInt` / `PlotDataFloat` / `PlotDataDouble` / `PlotConfig` | 数值计数器 |
+| Message | `Message` / `MessageLiteral` / `MessageColor` / `MessageCallstack` / ... | 日志消息 |
+| String | `StringData` / `ThreadName` / `FiberName` / `PlotName` / `ExternalName` | 字符串 |
+| String | `SingleStringData` / `SecondStringData` / `SourceLocationPayload` | 动态字符串 |
+| Callstack | `CallstackPayload` / `CallstackAllocPayload` / `CallstackSerial` | 调用栈 |
+| Sampling | `CallstackSample` / `CallstackSample32` | CPU 采样 |
+| Context | `ThreadContext` | 线程上下文 |
+| Source | `SourceLocation` / `SourceCode` / `SymbolCode` | 源码位置 |
+| Symbol | `SymbolLocation` / `ExternalThreadName` | 符号信息 |
+
+### 13.4 模块二：Tracy Server（数据处理）
+
+#### 13.4.1 核心组件
+
+从 Tracy 源码抽取以下组件，编译为 Godot 模块内的静态库：
+
+| 组件 | 源文件 | 作用 | 必需 |
+|------|--------|------|------|
+| **TracyWorker** | `server/TracyWorker.cpp` | 数据模型 + 网络接收 + 事件处理 + 文件读写 | ✅ |
+| **TracyFileWrite** | `server/TracyFileWrite.hpp` | LZ4/Zstd 压缩流写入 | ✅ |
+| **TracyFileRead** | `server/TracyFileRead.hpp` | LZ4/Zstd 压缩流读取 | ✅ |
+| **TracyFileHeader** | `server/TracyFileHeader.hpp` | 文件头定义 | ✅ |
+| **TracyFileMeta** | `server/TracyFileMeta.hpp` | 文件元数据 | ✅ |
+| **TracyEvent** | `server/TracyEvent.hpp` | 数据结构定义 | ✅ |
+| **TracySlab** | `server/TracySlab.hpp` | 内存池分配器 | ✅ |
+| **TracyVector** | `server/TracyVector.hpp` | 自定义 vector | ✅ |
+| **TracySortedVector** | `server/TracySortedVector.hpp` | 排序 vector | ✅ |
+| **TracyVarArray** | `server/TracyVarArray.hpp` | 变长数组 | ✅ |
+| **TracyShortPtr** | `server/TracyShortPtr.hpp` | 压缩指针 | ✅ |
+| **TracyThreadCompress** | `server/TracyThreadCompress.cpp` | 线程 ID 压缩 | ✅ |
+| **TracyStringDiscovery** | `server/TracyStringDiscovery.hpp` | 字符串查找 | ✅ |
+| **TracyTextureCompression** | `server/TracyTextureCompression.cpp` | 帧图像压缩 | 可选 |
+| **TracyTaskDispatch** | `server/TracyTaskDispatch.cpp` | 任务调度 | ✅ |
+| **TracyMemory** | `server/TracyMemory.cpp` | 内存追踪 | ✅ |
+| **TracySort** | `server/TracySort.hpp` | 排序工具 | ✅ |
+| **TracyPrint** | `server/TracyPrint.cpp` | 格式化输出 | ✅ |
+| **TracySysUtil** | `server/TracySysUtil.cpp` | 系统工具 | ✅ |
+| **TracyMmap** | `server/TracyMmap.cpp` | 内存映射 | ✅ |
+| **TracyBroadcast** | `server/TracyBroadcast.cpp` | UDP 广播发现 | 可选 |
+| **TracyCharUtil** | `server/TracyCharUtil.hpp` | 字符工具 | ✅ |
+| **TracyPopcnt** | `server/TracyPopcnt.hpp` | 位计数 | ✅ |
+| **tracy_robin_hood** | `server/tracy_robin_hood.h` | 哈希表 | ✅ |
+| **tracy_xxhash** | `server/tracy_xxhash.h` | 哈希函数 | ✅ |
+| **tracy_pdqsort** | `server/tracy_pdqsort.h` | 排序 | ✅ |
+| **TracySocket** | `public/common/TracySocket.cpp` | TCP 连接 | ✅ |
+| **TracyProtocol** | `public/common/TracyProtocol.hpp` | 协议定义 | ✅ |
+| **TracyQueue** | `public/common/TracyQueue.hpp` | 事件类型定义 | ✅ |
+| **TracyVersion** | `public/common/TracyVersion.hpp` | 版本信息 | ✅ |
+| **TracySystem** | `public/common/TracySystem.cpp` | 系统函数 | ✅ |
+| **TracyStackFrames** | `public/common/TracyStackFrames.hpp` | 调用栈帧 | ✅ |
+| **LZ4** | `public/common/tracy_lz4.hpp` / `tracy_lz4hc.hpp` | LZ4 压缩 | ✅ |
+| **Zstd** | `zstd/` | Zstd 压缩 | ✅ |
+| **Capstone** | — | 反汇编 | 可选（条件编译） |
+
+**可选依赖说明**：
+- `Capstone`：用于 `SymbolCode` 反汇编，可通过 `#ifndef TRACY_NO_SYMBOL_CODE` 条件编译禁用
+- `Zdict`：用于帧图像 ZSTD 字典训练，可通过条件编译禁用
+- `TracyBroadcast`：UDP 广播发现客户端，Godot 内部连接不需要
+
+#### 13.4.2 Worker 的三种构造方式
+
+```cpp
+// 方式 1：连接到远程 Client（实时捕获）
+Worker(const char* addr, uint16_t port, int64_t memoryLimit);
+
+// 方式 2：从 .tracy 文件加载（离线分析）
+Worker(FileRead& f, EventType::Type eventMask, bool bgTasks, bool allowStringModification);
+
+// 方式 3：从导入数据构造（格式转换）
+Worker(const char* name, const char* program,
+       const vector<ImportEventTimeline>& timeline,
+       const vector<ImportEventMessages>& messages,
+       const vector<ImportEventPlots>& plots,
+       const unordered_map<uint64_t, string>& threadNames);
+```
+
+**Godot Insights 使用方式 1 + 方式 2**：
+- 实时录制：`Worker("127.0.0.1", 8086, -1)` — 连接到同一进程内的 Tracy Client
+- 离线分析：`Worker(fileRead)` — 加载保存的 .tracy 文件
+
+#### 13.4.3 Worker 的线程模型
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Worker 线程模型                           │
+│                                                              │
+│  Main Thread (Godot)         │  Worker 内部线程              │
+│                              │                               │
+│  ┌──────────────────┐       │  ┌──────────────────┐        │
+│  │ Query API 调用    │◄──────┤  │ Exec() 线程       │        │
+│  │ GetThreadData()  │       │  │ 处理事件队列       │        │
+│  │ GetGpuData()     │       │  │ DispatchProcess() │        │
+│  │ GetFrames()      │       │  └──────┬───────────┘        │
+│  │ GetPlots()       │       │         │                     │
+│  │ Write(.tracy)    │       │  ┌──────▼───────────┐        │
+│  └──────────────────┘       │  │ Network() 线程    │        │
+│                              │  │ LZ4 解压          │        │
+│                              │  │ 接收 TCP 数据     │        │
+│                              │  └──────────────────┘        │
+│                              │                               │
+│                              │  ┌──────────────────┐        │
+│                              │  │ 符号查询线程      │        │
+│                              │  │ 调用栈解析        │        │
+│                              │  └──────────────────┘        │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**线程安全**：
+- Worker 内部使用 `m_data.lock` 互斥锁保护数据
+- 查询 API 可以在主线程安全调用
+- Exec 线程在处理事件时会获取 `m_data.lock`
+- 当主线程需要锁时，设置 `m_data.mainThreadWantsLock` 标志，Exec 线程会主动让出
+
+#### 13.4.4 Worker 数据查询 API
+
+Worker 提供完整的只读查询 API，供 UI 层读取数据：
+
+**线程和 Zone 查询**：
+```cpp
+const Vector<ThreadData*>& GetThreadData() const;           // 所有线程
+const ThreadData* GetThreadData(uint64_t tid) const;         // 指定线程
+const char* GetThreadName(uint64_t tid) const;               // 线程名
+const Vector<short_ptr<ZoneEvent>>& GetZoneFrame() const;    // Zone 帧
+```
+
+**GPU 查询**：
+```cpp
+const Vector<GpuCtxData*>& GetGpuData() const;              // 所有 GPU 上下文
+const char* GetGpuContextName(uint32_t ctx) const;           // GPU 上下文名
+```
+
+**帧查询**：
+```cpp
+const FrameData* GetFramesBase() const;                      // 基础帧集
+const Vector<FrameData*>& GetFrames() const;                 // 所有帧集
+```
+
+**内存查询**：
+```cpp
+const MemData& GetMemoryNamed(uint64_t name) const;          // 内存数据
+const unordered_flat_map<uint64_t, MemData*>& GetMemNameMap() const;
+```
+
+**消息/Plot/锁**：
+```cpp
+const Vector<short_ptr<MessageData>>& GetMessages() const;   // 消息
+const Vector<PlotData*>& GetPlots() const;                    // 计数器
+const unordered_flat_map<uint32_t, LockMap*>& GetLockMap() const;  // 锁
+```
+
+**源码位置和调用栈**：
+```cpp
+const SourceLocation& GetSourceLocation(int16_t srcloc) const;    // 源码位置
+const char* GetZoneName(const SourceLocation& srcloc) const;      // Zone 名
+const VarArray<CallstackFrameId>& GetCallstack(uint32_t idx) const; // 调用栈
+const CallstackFrameData* GetCallstackFrame(const CallstackFrameId& ptr) const;
+```
+
+**统计查询**：
+```cpp
+const unordered_flat_map<int16_t, SourceLocationZones>& GetSourceLocationZones() const;
+const unordered_flat_map<int16_t, GpuSourceLocationZones>& GetGpuSourceLocationZones() const;
+bool AreSourceLocationZonesReady() const;
+```
+
+**文件写入**：
+```cpp
+void Write(FileWrite& f, bool fiDict);  // 写出 .tracy 文件
+```
+
+**状态查询**：
+```cpp
+bool IsConnected() const;            // 是否连接
+bool HasData() const;                // 是否有数据
+uint8_t GetHandshakeStatus() const;  // 握手状态
+int64_t GetLastTime() const;         // 最后事件时间
+size_t GetFrameCount() const;        // 帧数
+```
+
+### 13.5 模块三：Tracy UI（数据可视化）
+
+#### 13.5.1 设计原则
+
+**不使用 ImGui**，使用 Godot 原生 Control 系统：
+- 与 Godot Editor 完全集成
+- 无渲染冲突
+- 支持主题/HiDPI
+- 支持输入法
+
+#### 13.5.2 数据桥接层
+
+在 Worker 查询 API 和 Godot UI 之间设计一个桥接层，将 Tracy 的 C++ 数据结构转换为 Godot 友好的格式：
+
+```cpp
+// insights_tracy_bridge.h
+class InsightsTracyBridge : public RefCounted {
+    GDCLASS(InsightsTracyBridge, RefCounted);
+
+    // Tracy Worker 实例（在 C++ 层持有）
+    std::unique_ptr<tracy::Worker> m_worker;
+    bool m_is_live = false;  // 是否实时连接
+
+public:
+    // 生命周期
+    Error connect_to_client(const String &p_addr, uint16_t p_port);
+    Error load_tracy_file(const String &p_path);
+    Error save_tracy_file(const String &p_path);
+    void disconnect();
+
+    // 状态查询
+    bool is_connected() const;
+    bool has_data() const;
+    int64_t get_last_time() const;
+
+    // 线程数据（用于 Timeline 渲染）
+    Array get_thread_list() const;              // [{id, name, zone_count}]
+    Array get_thread_zones(uint64_t p_tid,
+                           int64_t p_start_ns,
+                           int64_t p_end_ns) const;  // [{start, end, name, srcloc, depth}]
+
+    // GPU 数据
+    Array get_gpu_context_list() const;         // [{id, name, zone_count}]
+    Array get_gpu_zones(uint32_t p_ctx,
+                        int64_t p_start_ns,
+                        int64_t p_end_ns) const;
+
+    // 帧数据
+    Array get_frame_sets() const;               // [{name, continuous, frames: [{start, end}]}]
+    int get_frame_count() const;
+
+    // 内存数据
+    Array get_memory_events(int64_t p_start_ns,
+                            int64_t p_end_ns) const;  // [{time, ptr, size, is_alloc}]
+    Dictionary get_memory_stats() const;
+
+    // 消息
+    Array get_messages(int64_t p_start_ns,
+                       int64_t p_end_ns) const;       // [{time, text, thread}]
+
+    // Plot/计数器
+    Array get_plots() const;                         // [{name, data: [{time, value}]}]
+
+    // 锁事件
+    Array get_lock_events(uint32_t p_lock_id,
+                          int64_t p_start_ns,
+                          int64_t p_end_ns) const;
+
+    // 统计
+    Array get_zone_stats() const;                    // [{name, count, total_ns, min_ns, max_ns, avg_ns}]
+
+    // 源码位置
+    Dictionary get_source_location(int16_t p_srcloc) const;  // {name, function, file, line, color}
+
+    // 调用栈
+    Array get_callstack(uint32_t p_idx) const;       // [{file, function, line, name}]
+};
+```
+
+#### 13.5.3 UI 组件设计
+
+每个 Tracy 的 ImGui 面板对应一个 Godot Control 子类：
+
+| Tracy ImGui 面板 | Godot Control | 说明 |
+|-------------------|---------------|------|
+| Timeline | `InsightsTimeline` | 已有（Phase 6 实现），需扩展支持 GPU/内存行 |
+| Flame Graph | `InsightsFlamegraph` | 已有，需扩展 |
+| Memory | `InsightsMemoryView` | 新建：内存分配/释放时间线 |
+| Messages | `InsightsMessages` | 新建：消息日志 |
+| Statistics | `InsightsStatistics` | 新建：Zone 统计排名 |
+| Plots | `InsightsPlots` | 新建：计数器曲线图 |
+| Callstack | `InsightsCallstack` | 新建：调用栈查看 |
+| Compare | `InsightsCompare` | 新建：两次录制对比 |
+
+#### 13.5.4 实时更新机制
+
+Tracy 的 Worker 在后台线程持续接收数据，UI 需要定期刷新：
+
+```cpp
+// insights_dock.cpp
+void InsightsDock::_notification(int p_what) {
+    if (p_what == NOTIFICATION_PROCESS) {
+        if (m_bridge.is_connected()) {
+            // 每帧检查 Worker 是否有新数据
+            int64_t last_time = m_bridge.get_last_time();
+            if (last_time != m_cached_last_time) {
+                m_cached_last_time = last_time;
+                _refresh_timeline();    // 刷新时间线
+                _refresh_statistics();  // 刷新统计
+            }
+        }
+    }
+}
+```
+
+### 13.6 完整工作流
+
+#### 13.6.1 实时录制流程
+
+```
+用户点击 "Start Recording"
+    │
+    ▼
+InsightsDock::_on_start_pressed()
+    │
+    ├── 创建 Worker("127.0.0.1", 8086, -1)
+    │   └── Worker 内部：
+    │       ├── Exec 线程：连接到 Tracy Client
+    │       ├── Network 线程：接收 LZ4 压缩数据流
+    │       └── 符号查询线程
+    │
+    ├── 启动 _process() 定时刷新
+    │
+    ▼
+Tracy Client (已运行) ──TCP──→ Worker 接收数据
+    │                              │
+    │ ZoneBegin/End                ▼
+    │ GpuZoneBegin/End        DispatchProcess()
+    │ FrameMark                   │
+    │ MemAlloc/Free              ProcessZoneBegin64()
+    │ PlotData                   ProcessGpuZoneBegin()
+    │ Message                    ProcessFrameMark()
+    │ Callstack                  ProcessMemAlloc()
+    │                             ...
+    │                              │
+    ▼                              ▼
+UI 定时刷新 ◄──── Bridge 查询 API ◄─── Worker 数据模型
+    │
+    ├── Timeline: 新 Zone 实时出现
+    ├── Statistics: 计数更新
+    ├── Memory: 分配/释放实时显示
+    └── GPU: GPU Zone 出现在 GPU 行
+```
+
+#### 13.6.2 停止录制并保存
+
+```
+用户点击 "Stop Recording"
+    │
+    ▼
+InsightsDock::_on_stop_pressed()
+    │
+    ├── Worker 断开连接
+    │   └── m_worker->~Worker() 或 disconnect
+    │
+    ├── 自动保存为 .tracy 文件
+    │   ├── FileWrite::Open("capture_2026-07-07.tracy", Fast)
+    │   └── m_worker->Write(*fileWrite, false)
+    │
+    └── 保持 Worker 数据模型（可继续浏览）
+```
+
+#### 13.6.3 离线分析流程
+
+```
+用户点击 "Open File"
+    │
+    ▼
+InsightsDock::_on_open_pressed()
+    │
+    ├── 选择 .tracy 文件
+    │
+    ├── 创建 Worker(fileRead)
+    │   └── Worker 内部：
+    │       ├── 读取文件头（版本、压缩类型）
+    │       ├── 解压数据段
+    │       └── 重建数据模型
+    │
+    └── UI 加载完整数据
+```
+
+#### 13.6.4 与外部 Tracy 互通
+
+```
+场景 1：Godot Insights 录制 → 外部 Tracy 分析
+    Godot Insights 保存 capture.tracy
+    → 外部 Tracy 执行 File→Open→capture.tracy ✅
+
+场景 2：外部 Tracy 录制 → Godot Insights 分析
+    外部 Tracy 连接 Godot → 录制 → 保存 capture.tracy
+    → Godot Insights Open File→capture.tracy ✅
+
+场景 3：Godot Insights 录制 → 同时在外部 Tracy 实时查看
+    Tracy Client 同时只支持一个 Server 连接 ❌
+    解决方案：先录制保存 .tracy，再用外部 Tracy 打开
+
+场景 4：远程设备录制 → Godot Insights 分析
+    远程设备运行游戏 (Tracy Client 监听)
+    → Godot Insights 连接远程 IP:8086 ✅
+    → 或远程保存 .tracy → 拷贝到本地 → Godot Insights 打开 ✅
+```
+
+### 13.7 编译集成方案
+
+#### 13.7.1 源码组织
+
+```
+modules/insights/
+├── SCsub                          # SCons 构建脚本
+├── config.py                      # 模块配置
+├── register_module_types.h        # 模块注册
+│
+├── tracy_server/                  # Tracy Server 源码（抽取）
+│   ├── TracyWorker.cpp
+│   ├── TracyWorker.hpp
+│   ├── TracyFileWrite.hpp
+│   ├── TracyFileRead.hpp
+│   ├── TracyFileHeader.hpp
+│   ├── TracyFileMeta.hpp
+│   ├── TracyEvent.hpp
+│   ├── TracySlab.hpp
+│   ├── TracyVector.hpp
+│   ├── TracySortedVector.hpp
+│   ├── TracyVarArray.hpp
+│   ├── TracyShortPtr.hpp
+│   ├── TracyThreadCompress.cpp/.hpp
+│   ├── TracyStringDiscovery.hpp
+│   ├── TracyTextureCompression.cpp/.hpp  # 可选
+│   ├── TracyTaskDispatch.cpp/.hpp
+│   ├── TracyMemory.cpp/.hpp
+│   ├── TracySort.hpp
+│   ├── TracyPrint.cpp/.hpp
+│   ├── TracySysUtil.cpp/.hpp
+│   ├── TracyMmap.cpp/.hpp
+│   ├── TracyCharUtil.hpp
+│   ├── TracyPopcnt.hpp
+│   ├── tracy_robin_hood.h
+│   ├── tracy_xxhash.h
+│   └── tracy_pdqsort.h
+│
+├── tracy_common/                  # Tracy 公共源码
+│   ├── TracyProtocol.hpp
+│   ├── TracyQueue.hpp
+│   ├── TracyVersion.hpp
+│   ├── TracySocket.cpp/.hpp
+│   ├── TracySystem.cpp/.hpp
+│   ├── TracyStackFrames.hpp
+│   ├── TracyForceInline.hpp
+│   ├── TracyYield.hpp
+│   ├── tracy_lz4.hpp
+│   └── tracy_lz4hc.hpp
+│
+├── tracy_zstd/                    # Zstd 库
+│   └── ... (从 Tracy zstd/ 目录复制)
+│
+├── editor/                        # Godot Insights 编辑器 UI
+│   ├── insights_dock.h/.cpp       # 主面板
+│   ├── insights_timeline.h/.cpp   # 时间线
+│   ├── insights_flamegraph.h/.cpp # 火焰图
+│   ├── insights_memory_view.h/.cpp
+│   ├── insights_messages.h/.cpp
+│   ├── insights_statistics.h/.cpp
+│   ├── insights_plots.h/.cpp
+│   └── insights_callstack.h/.cpp
+│
+├── insights_tracy_bridge.h/.cpp   # Worker ↔ Godot 桥接层
+│
+├── insights_core/                 # 现有 Insights 核心
+│   ├── insights_database.h/.cpp
+│   └── native_capture.h/.cpp
+│
+└── tools/
+    └── tracy_converter.h/.cpp     # 格式转换（保留兼容）
+```
+
+#### 13.7.2 编译选项
+
+```python
+# SCsub
+if env["tracy_server"]:
+    # 编译 Tracy Server 源码
+    env.Append(CPPDEFINES=[
+        "TRACY_SERVER_ENABLED",
+        "TRACY_NO_STATISTICS",        # 减少内存占用（可选）
+        # "TRACY_NO_SYMBOL_CODE",     # 禁用 Capstone 反汇编
+    ])
+
+    # Tracy Server 源文件
+    tracy_server_src = [
+        "tracy_server/TracyWorker.cpp",
+        "tracy_server/TracyThreadCompress.cpp",
+        "tracy_server/TracyTaskDispatch.cpp",
+        "tracy_server/TracyMemory.cpp",
+        "tracy_server/TracyPrint.cpp",
+        "tracy_server/TracySysUtil.cpp",
+        "tracy_server/TracyMmap.cpp",
+        "tracy_server/TracyTextureCompression.cpp",
+        "tracy_common/TracySocket.cpp",
+        "tracy_common/TracySystem.cpp",
+        # Zstd
+        "tracy_zstd/...",
+    ]
+```
+
+#### 13.7.3 依赖处理
+
+| 依赖 | 处理方式 |
+|------|----------|
+| LZ4 | 已包含在 `tracy_common/tracy_lz4.hpp`（单头文件） |
+| Zstd | 从 Tracy `zstd/` 目录复制 |
+| Capstone | **不包含**，通过 `TRACY_NO_SYMBOL_CODE` 禁用 |
+| Socket | 已包含在 `tracy_common/TracySocket.cpp`（跨平台） |
+| nfd (文件对话框) | 不需要，使用 Godot 原生 FileDialog |
+| ImGui | 不需要，使用 Godot Control |
+
+#### 13.7.4 预计二进制增量
+
+| 组件 | 增量 |
+|------|------|
+| TracyWorker + 依赖 | ~2-3 MB |
+| Zstd 库 | ~0.5 MB |
+| LZ4 库 | ~0.1 MB |
+| 桥接层 + UI | ~0.5 MB |
+| **总计** | **~3-4 MB** |
+
+### 13.8 与第 12 章方案的对比
+
+| 维度 | 12章方案 C+D | 13章全 Tracy 整合 |
+|------|-------------|-------------------|
+| 数据完整性 | Import API 丢失 GPU Context/Memory/Callstack | **100% 完整**（Worker 直接处理所有事件） |
+| .tracy 文件 | 通过 Import API 间接生成 | **Worker.Write() 原生生成** |
+| 实时显示 | 需要 NativeCapture 中间层 | **Worker 直接连接 Client** |
+| 维护成本 | 需要自己维护 .gitracy→ImportEventTimeline 转换 | **Tracy 自己的代码处理**，升级即跟进 |
+| Tracy 兼容性 | 部分数据缺失 | **完全兼容** |
+| 实现复杂度 | 中 | 中-高（需编译 Tracy server 库） |
+| 代码量 | 中 | 较少（复用 Tracy 代码） |
+
+**核心优势**：全 Tracy 整合方案用 Tracy 自己的代码处理所有数据，**零数据损失**，生成的 .tracy 文件与 Tracy 原生录制完全一致。
+
+### 13.9 实现路线图
+
+```
+Phase 7: Tracy Server 编译集成
+  ├── 将 Tracy server/ + common/ 源码复制到 modules/insights/
+  ├── 编写 SCsub 构建脚本
+  ├── 条件编译：禁用 Capstone、Broadcast
+  ├── 验证：编译通过，Worker("127.0.0.1", 8086, -1) 能连接
+
+Phase 8: 桥接层 + 实时录制
+  ├── 实现 InsightsTracyBridge
+  ├── 连接/断开生命周期
+  ├── Zone 查询 → Timeline 渲染
+  ├── Frame 查询 → 帧标记
+  ├── 验证：实时录制能看到 CPU Zone
+
+Phase 9: 保存/加载 .tracy
+  ├── Worker.Write() → 保存 .tracy
+  ├── Worker(FileRead) → 加载 .tracy
+  ├── 验证：保存的 .tracy 文件能被外部 Tracy 打开
+
+Phase 10: 完整数据类型
+  ├── GPU Zone 查询和渲染
+  ├── Memory 事件查询和视图
+  ├── Plot/Counter 查询和曲线
+  ├── Message 日志
+  ├── Lock 事件
+  ├── Callstack 查看
+
+Phase 11: 高级功能
+  ├── Zone 统计排名
+  ├── 两次录制对比
+  ├── 远程设备连接
+  ├── 帧图像（条件编译 TRACY_NO_FRAME_IMAGE）
+```
+
+### 13.10 风险和缓解
+
+| 风险 | 影响 | 缓解措施 |
+|------|------|----------|
+| Tracy 版本升级导致 server API 不兼容 | 编译失败 | 固定 Tracy 版本（如 v0.13.4），定期同步 |
+| Worker 线程与 Godot 主线程竞争 | UI 卡顿 | Worker 有 mainThreadWantsLock 让步机制 |
+| 编译 Capstone 失败 | 编译错误 | 通过 TRACY_NO_SYMBOL_CODE 禁用 |
+| 二进制体积增加 3-4MB | 包体积增大 | 通过编译选项按需启用 |
+| 内存占用过高 | 运行时 OOM | Worker 的 memoryLimit 参数限制 |
+| 同时只能一个 Server 连接 Client | 无法同时用 Tracy 和 Insights | 先录制保存，后用 Tracy 分析 |
+
+## 14. 总结
 
 本方案基于 Godot **已有的 Tracy 基础设施**（80 个插桩点 + 完整平台支持），通过**新增 `modules/insights/` GDExtension 模块 + Editor 嵌入 UI**，实现对标 Unreal Insights 的完整性能录制工具。
 
 **核心创新点**：
-1. **零侵入扩展**：所有现有 Tracy 宏保持兼容，新增宏 `GodotProfileZoneC` / `GodotProfileZoneH` / `GodotProfileFiber` / `GodotProfilePlot`
-2. **统一 Channel 命名**：通过字符串前缀（`godot:<channel>/<subsystem>/<op>`）实现自动分类
-3. **GPU 时间戳桥接**：在 `RenderingDeviceDriver` 抽象层添加 `write_timestamp` 钩子，三大后端统一接入 Tracy GPU context
-4. **资源加载追踪增强**：扩展 `load_paths_stack` 为完整的 LoadEvent 链，自动生成依赖图
-5. **.gitracy 双层格式**：SQLite + TOML 元数据，既能用 SQLite 工具分析，又能转 `.tracy` 用 Tracy Server 可视化
-6. **编辑器内嵌 UI**：仿 UE Insights 的 BottomPanel + MainScreen 双布局
+1. **全 Tracy 整合**：Client + Server + UI 三模块完整整合，数据零损失
+2. **Tracy Server 抽取**：将 Tracy 的 `Worker` + `FileWrite` + `Socket` 编译进 Godot，替代自建 NativeCapture
+3. **Godot 原生 UI**：使用 Godot Control 替代 ImGui，无渲染冲突
+4. **Worker 查询 API**：通过桥接层将 Worker 的 C++ API 暴露给 Godot UI
+5. **标准 .tracy 文件**：Worker.Write() 原生生成，外部 Tracy 直接读取
+6. **实时 + 离线双模式**：连接 Client 实时查看，或加载 .tracy 离线分析
+7. **统一 Channel 命名**：通过字符串前缀（`godot:<channel>/<subsystem>/<op>`）实现自动分类
+8. **GPU 时间戳桥接**：在 `RenderingDeviceDriver` 抽象层添加 `write_timestamp` 钩子
 
 **预计工作量**：1 名高级工程师 6-8 个月，4-6 名工程师 3-4 个月（含编辑器 UI 打磨）。
 
-**最大价值**：从"看不到 → 看到 → 理解 → 优化"完整闭环，对调试 Godot 项目性能瓶颈、内存泄漏、加载卡顿等提供与 UE 相当的工具链。
+**最大价值**：从"看不到 → 看到 → 理解 → 优化"完整闭环，对调试 Godot 项目性能瓶颈、内存泄漏、加载卡顿等提供与 UE 相当的工具链，同时与 Tracy 生态完全互通。
