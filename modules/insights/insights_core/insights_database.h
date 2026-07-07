@@ -118,6 +118,7 @@ public:
 	void create_tables(); // No-op for in-memory, kept for API compatibility.
 
 	void insert_zone(const String &p_name, const String &p_file, int p_line, const String &p_function, const String &p_channel, uint64_t p_thread_id, uint64_t p_start_ns, uint64_t p_end_ns, int p_depth, int p_parent_zone_id);
+	void update_zone_end(uint32_t p_zone_index, uint64_t p_end_ns);
 	void insert_frame_marker(int p_frame_index, uint64_t p_start_ns, uint64_t p_end_ns);
 	void insert_allocation(uint64_t p_ptr, uint64_t p_size, int p_site_zone_id, uint64_t p_alloc_ns, uint64_t p_free_ns, uint64_t p_thread_id);
 	void insert_gpu_zone(const String &p_name, uint64_t p_queue_id, uint64_t p_submit_ns, uint64_t p_start_ns, uint64_t p_end_ns, int p_context_id);

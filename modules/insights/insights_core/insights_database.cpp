@@ -70,6 +70,12 @@ void InsightsDatabase::insert_zone(const String &p_name, const String &p_file, i
 	zone_name_index[p_name].push_back(idx);
 }
 
+void InsightsDatabase::update_zone_end(uint32_t p_zone_index, uint64_t p_end_ns) {
+	if (p_zone_index < zones.size()) {
+		zones[p_zone_index].end_ns = p_end_ns;
+	}
+}
+
 void InsightsDatabase::insert_frame_marker(int p_frame_index, uint64_t p_start_ns, uint64_t p_end_ns) {
 	FrameMarker rec;
 	rec.frame_index = p_frame_index;
@@ -615,18 +621,31 @@ Array InsightsDatabase::get_leaked_allocations() const {
 }
 
 uint64_t InsightsDatabase::get_total_duration_ns() const {
-	if (zones.size() == 0) {
-		return 0;
-	}
-	uint64_t min_start = zones[0].start_ns;
-	uint64_t max_end = zones[0].end_ns;
-	for (uint32_t i = 1; i < zones.size(); i++) {
+	uint64_t min_start = UINT64_MAX;
+	uint64_t max_end = 0;
+
+	// Check zones.
+	for (uint32_t i = 0; i < zones.size(); i++) {
 		if (zones[i].start_ns < min_start) {
 			min_start = zones[i].start_ns;
 		}
 		if (zones[i].end_ns > max_end) {
 			max_end = zones[i].end_ns;
 		}
+	}
+
+	// Check frame markers.
+	for (uint32_t i = 0; i < frame_markers.size(); i++) {
+		if (frame_markers[i].start_ns < min_start) {
+			min_start = frame_markers[i].start_ns;
+		}
+		if (frame_markers[i].end_ns > max_end) {
+			max_end = frame_markers[i].end_ns;
+		}
+	}
+
+	if (min_start == UINT64_MAX) {
+		return 0;
 	}
 	return max_end - min_start;
 }
@@ -638,6 +657,7 @@ void InsightsDatabase::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("create_tables"), &InsightsDatabase::create_tables);
 
 	ClassDB::bind_method(D_METHOD("insert_zone", "name", "file", "line", "function", "channel", "thread_id", "start_ns", "end_ns", "depth", "parent_zone_id"), &InsightsDatabase::insert_zone);
+	ClassDB::bind_method(D_METHOD("update_zone_end", "zone_index", "end_ns"), &InsightsDatabase::update_zone_end);
 	ClassDB::bind_method(D_METHOD("insert_frame_marker", "frame_index", "start_ns", "end_ns"), &InsightsDatabase::insert_frame_marker);
 	ClassDB::bind_method(D_METHOD("insert_allocation", "ptr", "size", "site_zone_id", "alloc_ns", "free_ns", "thread_id"), &InsightsDatabase::insert_allocation);
 	ClassDB::bind_method(D_METHOD("insert_gpu_zone", "name", "queue_id", "submit_ns", "start_ns", "end_ns", "context_id"), &InsightsDatabase::insert_gpu_zone);

@@ -24,8 +24,8 @@
 /* MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. */
 /* IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY   */
 /* CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,   */
-/* TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE      */
-/* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
+/* TORT OR OTHERWISE, ARISING OUT OF OR IN CONNECTION WITH THE SOFTWARE   */
+/* OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                          */
 /**************************************************************************/
 
 #pragma once
@@ -36,28 +36,53 @@
 class InsightsTimeline : public Control {
 	GDCLASS(InsightsTimeline, Control);
 
+public:
+	enum ChannelFilter {
+		CHANNEL_ALL = 0,
+		CHANNEL_CPU,
+		CHANNEL_GPU,
+		CHANNEL_MEMORY,
+		CHANNEL_LOADING,
+		CHANNEL_NETWORK,
+		CHANNEL_SCRIPT,
+	};
+
 private:
 	double current_scale = 1.0;
 	double scroll_x = 0.0;
+	double min_start_ns = 0.0; // Data origin for auto-fit.
 	Ref<InsightsDatabase> database;
 	Dictionary selected_zone;
 	Dictionary hovered_zone;
-	Array cpu_zones;
-	Array gpu_zones;
-	Array load_zones;
-	Array net_zones;
+	ChannelFilter channel_filter = CHANNEL_ALL;
+
+	// Filtered zone data for display.
+	Array filtered_zones;
 	Array frame_markers_data;
 
+	// Interaction state.
+	bool is_dragging = false;
+	double drag_start_x = 0.0;
+	double drag_start_scroll = 0.0;
+
 	void _load_data();
+	void _auto_fit();
 	void _draw_timeline();
+	void _draw_zone_track(const String &p_label, const Array &p_zones, const Color &p_color, int &r_track_y, int p_track_y_start, int p_max_depth, const Size2i &p_size, int p_track_height);
 
 protected:
 	static void _bind_methods();
 	void _notification(int p_what);
 
+	virtual void gui_input(const Ref<InputEvent> &p_event) override;
+
 public:
 	void set_database(const Ref<InsightsDatabase> &p_db);
 	Ref<InsightsDatabase> get_database() const;
+
+	void set_channel_filter(ChannelFilter p_filter);
+	ChannelFilter get_channel_filter() const;
+
 	double get_current_scale() const;
 	void set_current_scale(double p_scale);
 	double get_scroll_x() const;
@@ -66,6 +91,11 @@ public:
 	Rect2 get_visible_range() const;
 	Dictionary get_selected_zone() const;
 	void zoom_to_zone(const Dictionary &p_zone);
+	void zoom_in(double p_factor = 1.5);
+	void zoom_out(double p_factor = 1.5);
+	void zoom_fit();
 
 	InsightsTimeline();
 };
+
+VARIANT_ENUM_CAST(InsightsTimeline::ChannelFilter);

@@ -1,6 +1,7 @@
 #include "native_capture.h"
 
 #include "core/os/os.h"
+#include "core/os/thread.h"
 #include "core/os/time.h"
 
 void NativeCapture::_consumer_thread_func(void *p_userdata) {
@@ -9,6 +10,9 @@ void NativeCapture::_consumer_thread_func(void *p_userdata) {
 }
 
 void NativeCapture::_process_events() {
+	// Stack of open zone indices (per thread would be ideal, but simple stack works for now).
+	LocalVector<uint32_t> open_zone_stack;
+
 	while (true) {
 		// Swap buffers under mutex.
 		{
@@ -26,6 +30,7 @@ void NativeCapture::_process_events() {
 			switch (ev.type) {
 				case EventType::ZONE_BEGIN: {
 					if (database.is_valid()) {
+						uint32_t zone_idx = database->get_zone_count();
 						database->insert_zone(
 								String(ev.data.zone_begin.name),
 								String(ev.data.zone_begin.file),
@@ -37,11 +42,16 @@ void NativeCapture::_process_events() {
 								0, // end_ns will be filled by ZONE_END
 								0, // depth
 								-1); // parent_zone_id
+						open_zone_stack.push_back(zone_idx);
 					}
 				} break;
 				case EventType::ZONE_END: {
-					// Zone end updates are deferred to Phase 2.
-					// For now, we just record the event.
+					// Pop the last open zone and update its end_ns.
+					if (database.is_valid() && open_zone_stack.size() > 0) {
+						uint32_t zone_idx = open_zone_stack[open_zone_stack.size() - 1];
+						open_zone_stack.resize(open_zone_stack.size() - 1);
+						database->update_zone_end(zone_idx, ev.data.zone_end.end_ns);
+					}
 				} break;
 				case EventType::ALLOC: {
 					if (database.is_valid()) {
@@ -59,9 +69,23 @@ void NativeCapture::_process_events() {
 				} break;
 				case EventType::FRAME: {
 					if (database.is_valid()) {
-						uint64_t frame_start = start_time_ns + (uint64_t)(ev.data.frame.frame_time * 1e6);
-						uint64_t frame_end = frame_start + (uint64_t)(ev.data.frame.frame_time * 1e6);
-						database->insert_frame_marker(frame_count, frame_start, frame_end);
+						// Use current time as the end of this frame.
+						uint64_t frame_end_ns = Time::get_singleton()->get_ticks_usec() * 1000; // usec → nsec
+						// Estimate frame start from frame_time delta.
+						uint64_t frame_duration_ns = (uint64_t)(ev.data.frame.frame_time * 1000000000.0);
+						uint64_t frame_start_ns = frame_end_ns > frame_duration_ns ? frame_end_ns - frame_duration_ns : start_time_ns;
+						database->insert_frame_marker(frame_count, frame_start_ns, frame_end_ns);
+
+						// Also insert a CPU zone for this frame so the Timeline has visible data.
+						String frame_name = "Frame " + itos(frame_count);
+						database->insert_zone(
+								frame_name,
+								"", 0, "",
+								"godot:cpu/frame",
+								Thread::get_caller_id() ? Thread::get_caller_id() : 1,
+								frame_start_ns,
+								frame_end_ns,
+								0, -1);
 						frame_count++;
 					}
 				} break;
@@ -351,15 +375,17 @@ void NativeCapture::on_gpu_zone(const String &p_name, uint32_t p_queue_id, uint6
 
 void NativeCapture::flush() {
 	// Wait for the consumer thread to process all pending events.
-	// This is a simple busy-wait approach; a more sophisticated
-	// implementation would use a condition variable.
 	while (true) {
-		MutexLock lock(event_mutex);
-		if (event_queue.is_empty()) {
-			break;
+		{
+			MutexLock lock(event_mutex);
+			if (event_queue.is_empty()) {
+				break;
+			}
 		}
+		OS::get_singleton()->delay_usec(1000); // 1ms
 	}
-	OS::get_singleton()->delay_usec(100);
+	// Give the consumer thread time to finish processing the write_buffer.
+	OS::get_singleton()->delay_usec(5000); // 5ms
 }
 
 void NativeCapture::set_database(const Ref<InsightsDatabase> &p_database) {

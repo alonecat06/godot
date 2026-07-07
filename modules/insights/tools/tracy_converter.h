@@ -24,8 +24,8 @@
 /* MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. */
 /* IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY   */
 /* CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,   */
-/* TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE      */
-/* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
+/* TORT OR OTHERWISE, ARISING OUT OF OR IN CONNECTION WITH THE SOFTWARE   */
+/* OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                          */
 /**************************************************************************/
 
 #pragma once
@@ -36,8 +36,21 @@ class TracyConverter : public RefCounted {
 	GDCLASS(TracyConverter, RefCounted);
 
 public:
+	// Convert .gitracy → .tracy (native Tracy binary format).
+	// This uses the Tracy native file protocol with LZ4/ZSTD compression
+	// to produce a file that the Tracy profiler application can open directly.
 	Error gitracy_to_tracy(const String &p_gitracy_path, const String &p_tracy_path) const;
+
+	// Convert .tracy → .gitracy (Godot Insights internal format).
 	Error tracy_to_gitracy(const String &p_tracy_path, const String &p_gitracy_path) const;
+
+	// Convert .gitracy → Chrome Trace Event JSON (.json).
+	// Tracy can import Chrome Trace JSON via File → Open.
+	// This is the recommended way to view .gitracy data in Tracy
+	// because the native .tracy binary protocol is extremely complex.
+	Error gitracy_to_chrome_json(const String &p_gitracy_path, const String &p_json_path) const;
+
+	// Check if a file is a valid Tracy capture file.
 	bool is_tracy_file(const String &p_path) const;
 
 protected:
