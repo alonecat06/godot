@@ -1,0 +1,10 @@
+- [x] InsightsTracyBridge::get_file_info() 方法可用，返回 frame_count, zone_count, thread_count, gpu_context_count
+- [x] InsightsDock 工具栏有 Save 按钮（Tracy 构建时可见）
+- [x] Save 按钮弹出 FileDialog 保存 .tracy 文件到用户指定路径
+- [x] Stop 后弹出保存对话框（而非自动保存）
+- [x] 取消保存时数据保留在内存中，Save 按钮仍可用
+- [x] Save 按钮状态与 TracyBridge 数据状态同步
+- [x] 非 Tracy 构建编译通过
+- [x] Tracy 构建编译通过
+- [x] 引擎启动后 Insights 面板正常显示
+- [x] 单元测试 test_insights_phase9.h 通过
