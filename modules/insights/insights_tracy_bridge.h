@@ -42,6 +42,7 @@ public:
     int64_t get_last_time() const;
     int get_frame_count() const;
     int get_zone_count() const;
+    Dictionary get_file_info() const;
 
     // Bridge to InsightsDatabase
     Error populate_database(const Ref<InsightsDatabase> &p_db);

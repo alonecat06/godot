@@ -288,6 +288,20 @@ int InsightsTracyBridge::get_zone_count() const {
 	return count;
 }
 
+Dictionary InsightsTracyBridge::get_file_info() const {
+	Dictionary result;
+	if (!m_worker) return result;
+
+	result["zone_count"] = get_zone_count();
+	result["frame_count"] = get_frame_count();
+	result["thread_count"] = (int)m_worker->GetThreadData().size();
+	result["gpu_context_count"] = (int)m_worker->GetGpuData().size();
+	result["last_time_ns"] = m_worker->GetLastTime();
+	result["has_data"] = m_worker->HasData();
+
+	return result;
+}
+
 Error InsightsTracyBridge::populate_database(const Ref<InsightsDatabase> &p_db) {
 	if (!m_worker || !m_worker->HasData()) {
 		return ERR_UNAVAILABLE;
@@ -392,6 +406,7 @@ void InsightsTracyBridge::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_last_time"), &InsightsTracyBridge::get_last_time);
 	ClassDB::bind_method(D_METHOD("get_frame_count"), &InsightsTracyBridge::get_frame_count);
 	ClassDB::bind_method(D_METHOD("get_zone_count"), &InsightsTracyBridge::get_zone_count);
+	ClassDB::bind_method(D_METHOD("get_file_info"), &InsightsTracyBridge::get_file_info);
 	ClassDB::bind_method(D_METHOD("populate_database", "db"), &InsightsTracyBridge::populate_database);
 }
 
