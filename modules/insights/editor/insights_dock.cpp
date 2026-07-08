@@ -43,6 +43,10 @@
 #include "editor/docks/editor_dock_manager.h"
 #include "editor/editor_node.h"
 
+#ifdef TRACY_SERVER_ENABLED
+#include "modules/insights/insights_tracy_bridge.h"
+#endif
+
 InsightsDock::InsightsDock() {
 	// Toolbar.
 	toolbar = memnew(HBoxContainer);
@@ -239,6 +243,20 @@ void InsightsDock::_update_button_states() {
 }
 
 void InsightsDock::_on_start_pressed() {
+#ifdef TRACY_SERVER_ENABLED
+	if (!tracy_bridge.is_valid()) {
+		tracy_bridge.instantiate();
+	}
+	if (tracy_bridge.is_valid()) {
+		Error err = tracy_bridge->connect_to_client();
+		if (err == OK) {
+			print_line("Insights: Connected to Tracy Client via TracyBridge");
+			return;
+		}
+		print_line("Insights: TracyBridge connection failed, falling back to NativeCapture");
+	}
+#endif
+
 	InsightsManager *mgr = InsightsManager::get_singleton();
 	if (!mgr) {
 		return;
@@ -259,6 +277,17 @@ void InsightsDock::_on_start_pressed() {
 }
 
 void InsightsDock::_on_stop_pressed() {
+#ifdef TRACY_SERVER_ENABLED
+	if (tracy_bridge.is_valid() && tracy_bridge->is_connected()) {
+		tracy_bridge->disconnect();
+		// Optionally auto-save
+		String save_path = "res://insights_capture_" + Time::get_singleton()->get_datetime_string_from_system().replace(":", "-") + ".tracy";
+		tracy_bridge->save_tracy_file(save_path);
+		print_line("Insights: Tracy recording saved to " + save_path);
+		return;
+	}
+#endif
+
 	InsightsManager *mgr = InsightsManager::get_singleton();
 	if (!mgr || !mgr->is_recording()) {
 		return;
@@ -297,6 +326,21 @@ void InsightsDock::_on_open_pressed() {
 }
 
 void InsightsDock::_on_open_file_selected(const String &p_path) {
+#ifdef TRACY_SERVER_ENABLED
+	// Check if it's a .tracy file
+	if (p_path.ends_with(".tracy")) {
+		if (!tracy_bridge.is_valid()) {
+			tracy_bridge.instantiate();
+		}
+		Error err = tracy_bridge->load_tracy_file(p_path);
+		if (err == OK) {
+			print_line("Insights: Loaded .tracy file via TracyBridge");
+			return;
+		}
+		print_line("Insights: Failed to load .tracy file, trying .gitracy format");
+	}
+#endif
+
 	Ref<InsightsDatabase> db;
 	db.instantiate();
 

@@ -39,6 +39,10 @@
 #include "modules/insights/insights_core/insights_database.h"
 #include "editor/docks/editor_dock.h"
 
+#ifdef TRACY_SERVER_ENABLED
+#include "modules/insights/insights_tracy_bridge.h"
+#endif
+
 class InsightsTimeline;
 class InsightsFlamegraph;
 class InsightsMemoryPanel;
@@ -65,6 +69,10 @@ private:
 	FileDialog *compare_current_dialog = nullptr;
 	String compare_baseline_path;
 
+#ifdef TRACY_SERVER_ENABLED
+	Ref<InsightsTracyBridge> tracy_bridge;
+#endif
+
 	void _update_button_states();
 	void _set_database_recursive(Control *p_control, const Ref<InsightsDatabase> &p_db);
 
@@ -89,6 +97,9 @@ private:
 	void _on_start_pressed();
 	void _on_stop_pressed();
 	void _on_open_pressed();
+#ifdef TRACY_SERVER_ENABLED
+	void _on_tracy_save_pressed();
+#endif
 	void _on_open_file_selected(const String &p_path);
 	void _on_compare_pressed();
 	void _on_compare_baseline_selected(const String &p_path);

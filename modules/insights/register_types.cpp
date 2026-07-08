@@ -62,6 +62,9 @@
 #include "modules/insights/channels/custom_channel.h"
 #include "modules/insights/tools/web_exporter.h"
 #include "modules/insights/insights_core/ai_analyzer.h"
+#ifdef TRACY_SERVER_ENABLED
+#include "modules/insights/insights_tracy_bridge.h"
+#endif
 #ifdef TOOLS_ENABLED
 #include "modules/insights/editor/insights_contention_panel.h"
 #include "modules/insights/editor/insights_editor_plugin.h"
@@ -110,6 +113,9 @@ void initialize_insights_module(ModuleInitializationLevel p_level) {
 	GDREGISTER_CLASS(InsightsDock);
 	GDREGISTER_CLASS(InsightsEditorPlugin);
 	EditorPlugins::add_by_type<InsightsEditorPlugin>();
+#endif
+	#ifdef TRACY_SERVER_ENABLED
+	GDREGISTER_CLASS(InsightsTracyBridge);
 #endif
 	GDREGISTER_CLASS(InsightsManager);
 

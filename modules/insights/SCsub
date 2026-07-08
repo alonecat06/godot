@@ -16,4 +16,25 @@ env_insights.add_source_files(module_obj, "scripting/*.cpp")
 env_insights.add_source_files(module_obj, "tools/*.cpp")
 env_insights.add_source_files(module_obj, "editor/*.cpp")
 
+if env["profiler"] == "tracy":
+    env_tracy_server = env_insights.Clone()
+    env_tracy_server.Append(CPPDEFINES=["TRACY_SERVER_ENABLED", "TRACY_NO_SYMBOL_CODE", "TRACY_NO_STATISTICS", "TRACY_NO_FRAME_IMAGE"])
+    env_tracy_server.Prepend(CPPPATH=["#modules/insights"])
+    env_tracy_server.disable_warnings()
+
+    env_tracy_server.add_source_files(module_obj, "tracy_server/TracyWorker.cpp")
+    env_tracy_server.add_source_files(module_obj, "tracy_server/TracyThreadCompress.cpp")
+    env_tracy_server.add_source_files(module_obj, "tracy_server/TracyTaskDispatch.cpp")
+    env_tracy_server.add_source_files(module_obj, "tracy_server/TracyMemory.cpp")
+    env_tracy_server.add_source_files(module_obj, "tracy_server/TracyPrint.cpp")
+    env_tracy_server.add_source_files(module_obj, "tracy_server/TracySysUtil.cpp")
+    env_tracy_server.add_source_files(module_obj, "tracy_server/TracyMmap.cpp")
+    env_tracy_server.add_source_files(module_obj, "tracy_server/TracyTextureCompression.cpp")
+
+    env_tracy_server.add_source_files(module_obj, "tracy_common/TracySocket.cpp")
+    env_tracy_server.add_source_files(module_obj, "tracy_common/TracySystem.cpp")
+    env_tracy_server.add_source_files(module_obj, "tracy_common/TracyStackFrames.cpp")
+    env_tracy_server.add_source_files(module_obj, "tracy_common/tracy_lz4.cpp")
+    env_tracy_server.add_source_files(module_obj, "tracy_common/tracy_lz4hc.cpp")
+
 env.modules_sources += module_obj

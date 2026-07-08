@@ -1,0 +1,12 @@
+- [x] Tracy server/ 和 common/ 源文件已复制到 modules/insights/tracy_server/ 和 tracy_common/
+- [x] include 路径修复完成，所有复制的文件能正确找到依赖
+- [x] SCsub 条件编译逻辑正确，profiler=tracy 时定义 TRACY_SERVER_ENABLED
+- [x] 非 Tracy 构建（无 profiler=tracy）编译通过，模块功能正常（NativeCapture 回退）
+- [x] Tracy 构建（profiler=tracy）编译通过，无链接错误
+- [x] InsightsTracyBridge 类实现，所有方法被 #ifdef TRACY_SERVER_ENABLED 包裹
+- [x] InsightsTracyBridge::connect_to_client() 能创建 Worker 连接到 127.0.0.1:8086
+- [x] InsightsTracyBridge::save_tracy_file() 通过 Worker.Write() 生成标准 .tracy 文件
+- [x] InsightsTracyBridge::load_tracy_file() 通过 Worker(FileRead) 加载 .tracy 文件
+- [x] InsightsDock 的 Start/Stop 按钮使用 TracyBridge（Tracy 构建时）或 NativeCapture（非 Tracy 构建时）
+- [x] InsightsTracyBridge 在 register_types.cpp 中注册
+- [x] 引擎启动后 Insights 面板正常显示

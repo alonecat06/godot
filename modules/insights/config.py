@@ -34,6 +34,7 @@ def get_doc_classes():
         "CustomChannel",
         "WebExporter",
         "AIAnalyzer",
+        "InsightsTracyBridge",
         "InsightsContentionPanel",
         "InsightsTimeline",
         "InsightsFlamegraph",
