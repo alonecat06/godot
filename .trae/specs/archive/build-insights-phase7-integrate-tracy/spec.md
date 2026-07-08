@@ -1,0 +1,1 @@
+﻿- **THEN** InsightsDock 使用 NativeCapture 作为回退，模块正常编译
