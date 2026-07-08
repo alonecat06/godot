@@ -45,6 +45,7 @@
 
 #ifdef TRACY_SERVER_ENABLED
 #include "modules/insights/insights_tracy_bridge.h"
+#include "scene/main/timer.h"
 #endif
 
 InsightsDock::InsightsDock() {
@@ -251,6 +252,23 @@ void InsightsDock::_on_start_pressed() {
 		Error err = tracy_bridge->connect_to_client();
 		if (err == OK) {
 			print_line("Insights: Connected to Tracy Client via TracyBridge");
+
+			// Create live database for real-time display
+			tracy_live_db.instantiate();
+			tracy_live_db->open("tracy_live");
+
+			// Start refresh timer
+			if (!tracy_refresh_timer) {
+				tracy_refresh_timer = memnew(Timer);
+				add_child(tracy_refresh_timer);
+				tracy_refresh_timer->connect("timeout", callable_mp(this, &InsightsDock::_on_tracy_refresh_timeout));
+			}
+			tracy_refresh_timer->start(0.5); // 500ms
+
+			// Update button states
+			btn_start->set_disabled(true);
+			btn_stop->set_disabled(false);
+			btn_start->set_text(TTR("Recording..."));
 			return;
 		}
 		print_line("Insights: TracyBridge connection failed, falling back to NativeCapture");
@@ -276,14 +294,51 @@ void InsightsDock::_on_start_pressed() {
 	_update_button_states();
 }
 
+#ifdef TRACY_SERVER_ENABLED
+void InsightsDock::_on_tracy_refresh_timeout() {
+	if (!tracy_bridge.is_valid() || !tracy_live_db.is_valid()) {
+		return;
+	}
+
+	// Clear and re-populate the database with latest data
+	tracy_live_db->close();
+	tracy_live_db->clear();
+	tracy_live_db->open("tracy_live");
+
+	tracy_bridge->populate_database(tracy_live_db);
+	set_database(tracy_live_db);
+}
+#endif
+
 void InsightsDock::_on_stop_pressed() {
 #ifdef TRACY_SERVER_ENABLED
-	if (tracy_bridge.is_valid() && tracy_bridge->is_connected()) {
-		tracy_bridge->disconnect();
-		// Optionally auto-save
+	if (tracy_bridge.is_valid() && (tracy_bridge->is_connected() || tracy_bridge->has_data())) {
+		// Stop refresh timer
+		if (tracy_refresh_timer) {
+			tracy_refresh_timer->stop();
+		}
+
+		// Final data refresh
+		if (tracy_live_db.is_valid()) {
+			tracy_live_db->close();
+			tracy_live_db->clear();
+			tracy_live_db->open("tracy_live");
+			tracy_bridge->populate_database(tracy_live_db);
+			set_database(tracy_live_db);
+		}
+
+		// Save .tracy file
 		String save_path = "res://insights_capture_" + Time::get_singleton()->get_datetime_string_from_system().replace(":", "-") + ".tracy";
 		tracy_bridge->save_tracy_file(save_path);
 		print_line("Insights: Tracy recording saved to " + save_path);
+
+		// Disconnect
+		tracy_bridge->disconnect();
+
+		// Update button states
+		btn_start->set_disabled(false);
+		btn_stop->set_disabled(true);
+		btn_start->set_text(TTR("Start"));
 		return;
 	}
 #endif
@@ -335,6 +390,15 @@ void InsightsDock::_on_open_file_selected(const String &p_path) {
 		Error err = tracy_bridge->load_tracy_file(p_path);
 		if (err == OK) {
 			print_line("Insights: Loaded .tracy file via TracyBridge");
+
+			// Populate database for UI display
+			Ref<InsightsDatabase> tracy_db;
+			tracy_db.instantiate();
+			tracy_bridge->populate_database(tracy_db);
+			set_database(tracy_db);
+
+			print_line(vformat("Insights: Loaded %d zones, %d frames from .tracy file.",
+					tracy_db->get_zone_count(), tracy_db->get_frame_marker_count()));
 			return;
 		}
 		print_line("Insights: Failed to load .tracy file, trying .gitracy format");

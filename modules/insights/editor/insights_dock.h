@@ -43,6 +43,7 @@
 #include "modules/insights/insights_tracy_bridge.h"
 #endif
 
+class Timer;
 class InsightsTimeline;
 class InsightsFlamegraph;
 class InsightsMemoryPanel;
@@ -71,6 +72,9 @@ private:
 
 #ifdef TRACY_SERVER_ENABLED
 	Ref<InsightsTracyBridge> tracy_bridge;
+	Timer *tracy_refresh_timer = nullptr;
+	Ref<InsightsDatabase> tracy_live_db;
+	void _on_tracy_refresh_timeout();
 #endif
 
 	void _update_button_states();
