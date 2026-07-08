@@ -74,7 +74,11 @@ private:
 	Ref<InsightsTracyBridge> tracy_bridge;
 	Timer *tracy_refresh_timer = nullptr;
 	Ref<InsightsDatabase> tracy_live_db;
+	Button *btn_save = nullptr;
+	FileDialog *save_dialog = nullptr;
 	void _on_tracy_refresh_timeout();
+	void _on_save_pressed();
+	void _on_save_file_selected(const String &p_path);
 #endif
 
 	void _update_button_states();

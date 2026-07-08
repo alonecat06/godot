@@ -90,6 +90,14 @@ InsightsDock::InsightsDock() {
 	toolbar->add_child(btn_float);
 	btn_float->connect(SceneStringName(pressed), callable_mp(this, &InsightsDock::_on_float_pressed));
 
+#ifdef TRACY_SERVER_ENABLED
+	btn_save = memnew(Button);
+	btn_save->set_text(TTR("Save"));
+	btn_save->set_tooltip_text(TTR("Save the current Tracy capture as a .tracy file."));
+	toolbar->add_child(btn_save);
+	btn_save->connect(SceneStringName(pressed), callable_mp(this, &InsightsDock::_on_save_pressed));
+#endif
+
 	// File dialogs.
 	open_dialog = memnew(FileDialog);
 	open_dialog->set_file_mode(FileDialog::FILE_MODE_OPEN_FILE);
@@ -112,6 +120,15 @@ InsightsDock::InsightsDock() {
 	compare_current_dialog->add_filter(TTR("*.gitracy ; Godot Insights Capture"));
 	compare_current_dialog->connect("file_selected", callable_mp(this, &InsightsDock::_on_compare_current_selected));
 	add_child(compare_current_dialog);
+
+#ifdef TRACY_SERVER_ENABLED
+	save_dialog = memnew(FileDialog);
+	save_dialog->set_file_mode(FileDialog::FILE_MODE_SAVE_FILE);
+	save_dialog->set_title(TTR("Save Tracy Capture"));
+	save_dialog->add_filter(TTR("*.tracy ; Tracy Capture"));
+	save_dialog->connect("file_selected", callable_mp(this, &InsightsDock::_on_save_file_selected));
+	add_child(save_dialog);
+#endif
 
 	// Channel tabs.
 	channel_tabs = memnew(TabContainer);
@@ -241,6 +258,13 @@ void InsightsDock::_update_button_states() {
 	} else {
 		btn_start->set_text(TTR("Start"));
 	}
+
+#ifdef TRACY_SERVER_ENABLED
+	if (btn_save) {
+		bool has_tracy_data = tracy_bridge.is_valid() && tracy_bridge->has_data();
+		btn_save->set_disabled(!has_tracy_data);
+	}
+#endif
 }
 
 void InsightsDock::_on_start_pressed() {
@@ -327,18 +351,20 @@ void InsightsDock::_on_stop_pressed() {
 			set_database(tracy_live_db);
 		}
 
-		// Save .tracy file
-		String save_path = "res://insights_capture_" + Time::get_singleton()->get_datetime_string_from_system().replace(":", "-") + ".tracy";
-		tracy_bridge->save_tracy_file(save_path);
-		print_line("Insights: Tracy recording saved to " + save_path);
-
-		// Disconnect
+		// Disconnect from client
 		tracy_bridge->disconnect();
 
 		// Update button states
 		btn_start->set_disabled(false);
 		btn_stop->set_disabled(true);
 		btn_start->set_text(TTR("Start"));
+
+		// Prompt user to save
+		if (tracy_bridge.is_valid() && tracy_bridge->has_data()) {
+			String default_name = "insights_capture_" + Time::get_singleton()->get_datetime_string_from_system().replace(":", "-") + ".tracy";
+			save_dialog->set_current_file(default_name);
+			save_dialog->popup_file_dialog();
+		}
 		return;
 	}
 #endif
@@ -562,6 +588,32 @@ InsightsNetworkPanel *InsightsDock::get_network_panel() const {
 InsightsComparePanel *InsightsDock::get_compare_panel() const {
 	return _find_child_of_type<InsightsComparePanel>(channel_tabs);
 }
+
+#ifdef TRACY_SERVER_ENABLED
+void InsightsDock::_on_save_pressed() {
+	if (!tracy_bridge.is_valid() || !tracy_bridge->has_data()) {
+		WARN_PRINT("Insights: No Tracy data to save.");
+		return;
+	}
+	// Set default filename with timestamp
+	String default_name = "insights_capture_" + Time::get_singleton()->get_datetime_string_from_system().replace(":", "-") + ".tracy";
+	save_dialog->set_current_file(default_name);
+	save_dialog->popup_file_dialog();
+}
+
+void InsightsDock::_on_save_file_selected(const String &p_path) {
+	if (!tracy_bridge.is_valid() || !tracy_bridge->has_data()) {
+		WARN_PRINT("Insights: No Tracy data to save.");
+		return;
+	}
+	Error err = tracy_bridge->save_tracy_file(p_path);
+	if (err == OK) {
+		print_line("Insights: Tracy capture saved to " + p_path);
+	} else {
+		WARN_PRINT(vformat("Insights: Failed to save Tracy capture to %s (error %d)", p_path, err));
+	}
+}
+#endif
 
 void InsightsDock::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_database", "db"), &InsightsDock::set_database);
