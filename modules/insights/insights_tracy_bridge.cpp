@@ -87,7 +87,7 @@ Array InsightsTracyBridge::get_thread_list() const {
 		Dictionary thread_info;
 		thread_info["id"] = (int64_t)td->id;
 		thread_info["name"] = String(m_worker->GetThreadName(td->id));
-		thread_info["zone_count"] = 0; // Will be filled when iterating
+		thread_info["zone_count"] = (int)td->timeline.size();
 		result.append(thread_info);
 	}
 	return result;
@@ -278,6 +278,102 @@ int InsightsTracyBridge::get_frame_count() const {
 	return m_worker->GetFrameCount();
 }
 
+int InsightsTracyBridge::get_zone_count() const {
+	if (!m_worker) return 0;
+	int count = 0;
+	const auto &threads = m_worker->GetThreadData();
+	for (const auto &td : threads) {
+		count += (int)td->timeline.size();
+	}
+	return count;
+}
+
+Error InsightsTracyBridge::populate_database(const Ref<InsightsDatabase> &p_db) {
+	if (!m_worker || !m_worker->HasData()) {
+		return ERR_UNAVAILABLE;
+	}
+	if (!p_db.is_valid()) {
+		return ERR_INVALID_PARAMETER;
+	}
+
+	// Open the database for writing
+	p_db->open("tracy_bridge_data");
+
+	// 1. CPU Zones: iterate all threads
+	const auto &threads = m_worker->GetThreadData();
+	for (const auto &td : threads) {
+		uint64_t tid = td->id;
+		const auto &timeline = td->timeline;
+		for (size_t i = 0; i < timeline.size(); i++) {
+			const auto &ze = timeline[i];
+			if (!ze) continue;
+
+			int64_t start_ns = (int64_t)ze->Start();
+			int64_t end_ns = ze->IsEndValid() ? (int64_t)ze->End() : -1;
+			if (end_ns < 0) continue; // Skip incomplete zones
+
+			int16_t srcloc = ze->Srcloc();
+			const auto &sl = m_worker->GetSourceLocation(srcloc);
+			String name = String(m_worker->GetZoneName(sl));
+			String function = String(sl.function.active ? m_worker->GetString(sl.function.str) : "");
+			String file = String(sl.file.active ? m_worker->GetString(sl.file.str) : "");
+			int line = (int)sl.line;
+
+			// Determine channel from zone name prefix
+			String channel = "cpu";
+			if (name.begins_with("godot:gpu/") || name.begins_with("gpu/")) {
+				channel = "gpu";
+			} else if (name.begins_with("godot:memory/") || name.begins_with("memory/")) {
+				channel = "memory";
+			} else if (name.begins_with("godot:loading/") || name.begins_with("loading/")) {
+				channel = "loading";
+			} else if (name.begins_with("godot:network/") || name.begins_with("network/")) {
+				channel = "network";
+			} else if (name.begins_with("godot:script/") || name.begins_with("script/")) {
+				channel = "script";
+			}
+
+			p_db->insert_zone(name, file, line, function, channel, tid, (uint64_t)start_ns, (uint64_t)end_ns, 0, -1);
+		}
+	}
+
+	// 2. GPU Zones
+	const auto &gpuCtx = m_worker->GetGpuData();
+	for (const auto &ctx : gpuCtx) {
+		uint32_t ctx_id = ctx->context;
+		const auto &timeline = ctx->timeline;
+		for (size_t i = 0; i < timeline.size(); i++) {
+			const auto &ge = timeline[i];
+			if (!ge) continue;
+
+			int64_t gpu_start = (int64_t)ge->GpuStart();
+			int64_t gpu_end = (int64_t)ge->GpuEnd();
+			if (gpu_start < 0 || gpu_end < 0) continue;
+
+			int16_t srcloc = ge->Srcloc();
+			const auto &sl = m_worker->GetSourceLocation(srcloc);
+			String name = String(m_worker->GetZoneName(sl));
+
+			p_db->insert_gpu_zone(name, (uint64_t)ctx_id, (uint64_t)ge->CpuStart(), (uint64_t)gpu_start, (uint64_t)gpu_end, (int)ctx_id);
+		}
+	}
+
+	// 3. Frame markers
+	const auto &frames = m_worker->GetFrames();
+	for (size_t fi = 0; fi < frames.size(); fi++) {
+		const auto &fd = frames[fi];
+		const auto &frameData = fd->data;
+		for (size_t i = 0; i < frameData.size(); i++) {
+			uint64_t start_ns = (uint64_t)frameData[i].start;
+			uint64_t end_ns = fd->continuous ? start_ns : (uint64_t)frameData[i].end;
+			p_db->insert_frame_marker((int)fi, start_ns, end_ns);
+		}
+	}
+
+	p_db->close();
+	return OK;
+}
+
 void InsightsTracyBridge::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("connect_to_client", "addr", "port"), &InsightsTracyBridge::connect_to_client, DEFVAL("127.0.0.1"), DEFVAL(8086));
 	ClassDB::bind_method(D_METHOD("load_tracy_file", "path"), &InsightsTracyBridge::load_tracy_file);
@@ -295,6 +391,8 @@ void InsightsTracyBridge::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_plots"), &InsightsTracyBridge::get_plots);
 	ClassDB::bind_method(D_METHOD("get_last_time"), &InsightsTracyBridge::get_last_time);
 	ClassDB::bind_method(D_METHOD("get_frame_count"), &InsightsTracyBridge::get_frame_count);
+	ClassDB::bind_method(D_METHOD("get_zone_count"), &InsightsTracyBridge::get_zone_count);
+	ClassDB::bind_method(D_METHOD("populate_database", "db"), &InsightsTracyBridge::populate_database);
 }
 
 #endif // TRACY_SERVER_ENABLED

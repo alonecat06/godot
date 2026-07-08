@@ -6,6 +6,8 @@
 #include "core/variant/array.h"
 #include "core/variant/dictionary.h"
 
+#include "modules/insights/insights_core/insights_database.h"
+
 #include <memory>
 #include <cstdint>
 
@@ -39,6 +41,10 @@ public:
     Array get_plots() const;
     int64_t get_last_time() const;
     int get_frame_count() const;
+    int get_zone_count() const;
+
+    // Bridge to InsightsDatabase
+    Error populate_database(const Ref<InsightsDatabase> &p_db);
 
 protected:
     static void _bind_methods();
