@@ -1,0 +1,15 @@
+- [x] populate_database() 桥接 Memory allocation 数据到 InsightsDatabase
+- [x] populate_database() 桥接 Message 数据到 InsightsDatabase
+- [x] populate_database() 桥接 Plot/Counter 数据到 InsightsDatabase（含 insert_plot_point 新方法）
+- [x] populate_database() 桥接 Lock 事件数据到 InsightsDatabase（含 insert_lock_event 新方法）
+- [x] InsightsTracyBridge::get_lock_events() 方法可用
+- [x] InsightsTracyBridge::get_callstack() 方法可用
+- [x] Timeline GPU channel 行上渲染 GPU Zone 矩形
+- [x] InsightsMemoryPanel 显示内存分配/释放事件列表
+- [x] InsightsPlotPanel 显示 Plot 曲线图
+- [x] InsightsMessagePanel 显示消息日志列表
+- [x] Memory/Plots/Messages 标签页集成到 InsightsDock
+- [x] .tracy 测试数据生成辅助文件可用（tracy_test_data.h）
+- [x] 非 Tracy 构建编译通过
+- [x] Tracy 构建编译验证（需要 profiler_path 指向 Tracy 源码）
+- [x] 单元测试 test_insights_phase10.h 创建完成（8个测试用例）
