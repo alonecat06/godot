@@ -31,6 +31,7 @@
 #include "modules/insights/editor/insights_timeline.h"
 
 #include "core/string/ustring.h"
+#include "core/templates/hash_map.h"
 
 InsightsTimeline::InsightsTimeline() {
 	set_clip_contents(true);
@@ -139,6 +140,7 @@ void InsightsTimeline::zoom_fit() {
 void InsightsTimeline::_load_data() {
 	filtered_zones.clear();
 	frame_markers_data.clear();
+	gpu_zone_data.clear();
 
 	if (database.is_valid()) {
 		Array all_zones = database->query_zones_in_range(0, UINT64_MAX);
@@ -177,6 +179,11 @@ void InsightsTimeline::_load_data() {
 		}
 		frame_markers_data = database->query_frame_markers(0, UINT64_MAX);
 
+		// Load GPU zone records from the database.
+		if (channel_filter == CHANNEL_ALL || channel_filter == CHANNEL_GPU) {
+			gpu_zone_data = database->query_gpu_zones_in_range(0, UINT64_MAX);
+		}
+
 		_auto_fit();
 	}
 }
@@ -209,6 +216,13 @@ void InsightsTimeline::_auto_fit() {
 	}
 	for (int i = 0; i < frame_markers_data.size(); i++) {
 		Dictionary d = frame_markers_data[i];
+		uint64_t s = (uint64_t)(int64_t)d["start_ns"];
+		if (s < min_start) {
+			min_start = s;
+		}
+	}
+	for (int i = 0; i < gpu_zone_data.size(); i++) {
+		Dictionary d = gpu_zone_data[i];
 		uint64_t s = (uint64_t)(int64_t)d["start_ns"];
 		if (s < min_start) {
 			min_start = s;
@@ -397,6 +411,65 @@ void InsightsTimeline::_draw_timeline() {
 	}
 	if (channel_filter == CHANNEL_ALL || channel_filter == CHANNEL_GPU) {
 		_draw_zone_track("GPU", gpu_zones, Color(0.76, 0.35, 0.83), track_y, track_y_start, 4, size, track_height);
+
+		// Draw GPU Zone Records (from GPUZoneRecord, grouped by context_id).
+		if (gpu_zone_data.size() > 0) {
+			// Group GPU zone records by context_id for row assignment.
+			HashMap<int, Array> context_groups;
+			for (int i = 0; i < gpu_zone_data.size(); i++) {
+				Dictionary gz = gpu_zone_data[i];
+				int ctx_id = (int)gz["context_id"];
+				if (!context_groups.has(ctx_id)) {
+					context_groups[ctx_id] = Array();
+				}
+				context_groups[ctx_id].push_back(gz);
+			}
+
+			// Sort context_ids for deterministic rendering order.
+			Vector<int> sorted_keys;
+			for (const KeyValue<int, Array> &E : context_groups) {
+				sorted_keys.push_back(E.key);
+			}
+			sorted_keys.sort();
+
+			Ref<Font> font = get_theme_font(SNAME("font"));
+			int font_size = get_theme_font_size(SNAME("font_size"));
+			Color gpu_rect_color(0.4, 0.3, 0.8, 0.85);
+			Color gpu_text_color(1.0, 1.0, 1.0, 0.9);
+
+			for (int k = 0; k < sorted_keys.size(); k++) {
+				int ctx_id = sorted_keys[k];
+				String row_label = vformat("GPU Zone (ctx %d)", ctx_id);
+				draw_string(font, Point2(4, track_y + 14), row_label, HORIZONTAL_ALIGNMENT_LEFT, -1, font_size, Color(0.8, 0.8, 0.8));
+				track_y += track_height;
+
+				const Array &ctx_zones = context_groups[ctx_id];
+				for (int i = 0; i < ctx_zones.size(); i++) {
+					Dictionary gz = ctx_zones[i];
+					uint64_t gz_start = (uint64_t)(int64_t)gz["start_ns"];
+					uint64_t gz_end = (uint64_t)(int64_t)gz["end_ns"];
+					String gz_name = gz["name"];
+
+					double x1 = ((double)gz_start - scroll_x) * current_scale;
+					double x2 = ((double)gz_end - scroll_x) * current_scale;
+
+					if (x2 >= 0 && x1 < size.x) {
+						Rect2 rect(Point2(x1, track_y), Size2(MAX(x2 - x1, 1.0), track_height - 2));
+						draw_rect(rect, gpu_rect_color);
+
+						if (rect.size.x > 30) {
+							String zone_label = gz_name;
+							if (rect.size.x > 80 && gz_end > gz_start) {
+								double dur_ms = (double)(gz_end - gz_start) / 1000000.0;
+								zone_label += vformat(" (%.2fms)", dur_ms);
+							}
+							draw_string(font, Point2(x1 + 4, track_y + track_height - 5), zone_label, HORIZONTAL_ALIGNMENT_LEFT, x2 - x1 - 8, font_size, gpu_text_color);
+						}
+					}
+				}
+				track_y += track_height;
+			}
+		}
 	}
 	if (channel_filter == CHANNEL_ALL || channel_filter == CHANNEL_MEMORY) {
 		_draw_zone_track("Memory", mem_zones, Color(0.83, 0.27, 0.56), track_y, track_y_start, 4, size, track_height);

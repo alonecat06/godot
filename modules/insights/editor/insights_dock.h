@@ -38,6 +38,9 @@
 #include "scene/gui/file_dialog.h"
 #include "modules/insights/insights_core/insights_database.h"
 #include "editor/docks/editor_dock.h"
+#include "insights_memory_panel.h"
+#include "insights_plot_panel.h"
+#include "insights_message_panel.h"
 
 #ifdef TRACY_SERVER_ENABLED
 #include "modules/insights/insights_tracy_bridge.h"
@@ -50,6 +53,8 @@ class InsightsMemoryPanel;
 class InsightsLoadingPanel;
 class InsightsNetworkPanel;
 class InsightsComparePanel;
+class InsightsPlotPanel;
+class InsightsMessagePanel;
 
 class InsightsDock : public VBoxContainer {
 	GDCLASS(InsightsDock, VBoxContainer);
@@ -127,6 +132,8 @@ public:
 	InsightsLoadingPanel *get_loading_panel() const;
 	InsightsNetworkPanel *get_network_panel() const;
 	InsightsComparePanel *get_compare_panel() const;
+	InsightsPlotPanel *get_plot_panel() const;
+	InsightsMessagePanel *get_message_panel() const;
 
 	InsightsDock();
 };

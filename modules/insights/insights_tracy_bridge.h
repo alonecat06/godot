@@ -43,6 +43,8 @@ public:
     int get_frame_count() const;
     int get_zone_count() const;
     Dictionary get_file_info() const;
+    Array get_lock_events() const;
+    Array get_callstack(int p_srcloc) const;
 
     // Bridge to InsightsDatabase
     Error populate_database(const Ref<InsightsDatabase> &p_db);

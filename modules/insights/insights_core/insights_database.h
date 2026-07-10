@@ -94,6 +94,20 @@ public:
 		int zone_id = -1;
 	};
 
+	struct PlotPointRecord {
+		String plot_name;
+		uint64_t time_ns = 0;
+		double value = 0.0;
+	};
+
+	struct LockEventRecord {
+		uint64_t lock_id = 0;
+		int64_t srcloc = -1;
+		uint64_t time_ns = 0;
+		int type = 0; // 0=wait, 1=acquire, 2=release
+		uint64_t thread_id = 0;
+	};
+
 private:
 	String file_path;
 	bool is_open = false;
@@ -104,6 +118,8 @@ private:
 	LocalVector<GPUZoneRecord> gpu_zones;
 	LocalVector<ResourceLoadRecord> resource_loads;
 	LocalVector<MessageRecord> messages;
+	LocalVector<PlotPointRecord> plot_points;
+	LocalVector<LockEventRecord> lock_events;
 
 	HashMap<String, LocalVector<uint32_t>> zone_name_index;
 
@@ -124,6 +140,8 @@ public:
 	void insert_gpu_zone(const String &p_name, uint64_t p_queue_id, uint64_t p_submit_ns, uint64_t p_start_ns, uint64_t p_end_ns, int p_context_id);
 	void insert_resource_load(const String &p_path, const String &p_loader, uint64_t p_start_ns, uint64_t p_end_ns, uint64_t p_size_bytes, const String &p_parent_path, uint64_t p_thread_id);
 	void insert_message(int p_level, const String &p_text, uint64_t p_timestamp_ns, int p_zone_id);
+	void insert_plot_point(const String &p_plot_name, uint64_t p_time_ns, double p_value);
+	void insert_lock_event(uint64_t p_lock_id, int64_t p_srcloc, uint64_t p_time_ns, int p_type, uint64_t p_thread_id);
 
 	Array query_zone(const String &p_name, uint64_t p_start_ns, uint64_t p_end_ns) const;
 	Array query_zones_in_range(uint64_t p_start_ns, uint64_t p_end_ns) const;
@@ -137,13 +155,24 @@ public:
 	Array query_allocations_by_size(uint64_t p_min_size) const;
 	Array query_resource_loads() const;
 	Array query_resource_dependencies(const String &p_path) const;
+	Array query_messages() const;
 	uint64_t get_peak_memory() const;
 	Array get_leaked_allocations() const;
 	uint64_t get_total_duration_ns() const;
 
+	Array get_plot_names() const;
+	Array get_plot_data(const String &p_plot_name) const;
+
 	uint32_t get_zone_count() const;
 	uint32_t get_frame_marker_count() const;
 	uint32_t get_allocation_count() const;
+
+	Array query_plot_points(const String &p_plot_name, uint64_t p_start_ns, uint64_t p_end_ns) const;
+	Array query_lock_events(uint64_t p_start_ns, uint64_t p_end_ns) const;
+	uint32_t get_plot_point_count() const;
+	uint32_t get_lock_event_count() const;
+	uint32_t get_message_count() const;
+	uint32_t get_gpu_zone_count() const;
 
 	Error save_to_file(const String &p_path) const;
 	Error load_from_file(const String &p_path);

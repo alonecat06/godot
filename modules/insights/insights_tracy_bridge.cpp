@@ -302,6 +302,64 @@ Dictionary InsightsTracyBridge::get_file_info() const {
 	return result;
 }
 
+Array InsightsTracyBridge::get_lock_events() const {
+	Array result;
+	if (!m_worker) return result;
+
+	const auto &lockMap = m_worker->GetLockMap();
+	for (const auto &lockPair : lockMap) {
+		const auto &lock = lockPair.second;
+		if (!lock) continue;
+		Dictionary lock_info;
+		lock_info["lock_id"] = (int64_t)lockPair.first;
+		lock_info["thread_count"] = (int)lock->threadList.size();
+		lock_info["is_contended"] = lock->isContended;
+		lock_info["timeline_size"] = (int)lock->timeline.size();
+		result.append(lock_info);
+	}
+	return result;
+}
+
+Array InsightsTracyBridge::get_callstack(int p_srcloc) const {
+	Array result;
+	if (!m_worker) return result;
+
+	// Tracy Worker stores callstacks per-zone, not per-srcloc directly.
+	// Search through all thread zones to find matching callstacks for the given srcloc.
+	const auto &threads = m_worker->GetThreadData();
+	for (const auto &td : threads) {
+		const auto &timeline = td->timeline;
+		for (size_t i = 0; i < timeline.size(); i++) {
+			const auto &ze = timeline[i];
+			if (!ze) continue;
+			if (ze->Srcloc() != p_srcloc) continue;
+
+			const auto &extra = m_worker->GetZoneExtra(*ze);
+			uint32_t cs_idx = extra.callstack.Val();
+			if (cs_idx == 0) continue;
+
+			const auto &cs = m_worker->GetCallstack(cs_idx);
+			Array frames;
+			for (size_t j = 0; j < cs.size(); j++) {
+				const auto *frameData = m_worker->GetCallstackFrame(cs[j]);
+				if (!frameData) continue;
+				for (uint8_t k = 0; k < frameData->size; k++) {
+					const auto &frame = frameData->data[k];
+					Dictionary frame_info;
+					frame_info["name"] = String(m_worker->GetString(frame.name));
+					frame_info["file"] = String(m_worker->GetString(frame.file));
+					frame_info["line"] = (int)frame.line;
+					frames.append(frame_info);
+				}
+			}
+			if (frames.size() > 0) {
+				return frames; // Return the first matching callstack found.
+			}
+		}
+	}
+	return result;
+}
+
 Error InsightsTracyBridge::populate_database(const Ref<InsightsDatabase> &p_db) {
 	if (!m_worker || !m_worker->HasData()) {
 		return ERR_UNAVAILABLE;
@@ -384,6 +442,71 @@ Error InsightsTracyBridge::populate_database(const Ref<InsightsDatabase> &p_db) 
 		}
 	}
 
+	// 4. Memory allocations
+	const auto &memMap = m_worker->GetMemNameMap();
+	for (const auto &pair : memMap) {
+		const auto *md = pair.second;
+		if (!md) continue;
+		for (size_t i = 0; i < md->data.size(); i++) {
+			const auto &me = md->data[i];
+			uint64_t ptr = me.Ptr();
+			uint64_t size = me.Size();
+			uint64_t alloc_ns = (uint64_t)me.TimeAlloc();
+			uint64_t free_ns = (uint64_t)me.TimeFree();
+			uint64_t thread_id = (uint64_t)me.ThreadAlloc();
+			p_db->insert_allocation(ptr, size, -1, alloc_ns, free_ns, thread_id);
+		}
+	}
+
+	// 5. Messages
+	const auto &msgs = m_worker->GetMessages();
+	for (size_t i = 0; i < msgs.size(); i++) {
+		const auto &msg = msgs[i];
+		if (!msg) continue;
+		p_db->insert_message(0, String(m_worker->GetString(msg->ref)), (uint64_t)msg->time, -1);
+	}
+
+	// 6. Plots
+	const auto &plots = m_worker->GetPlots();
+	for (const auto &plot : plots) {
+		String plot_name = String(m_worker->GetString(plot->name));
+		for (size_t i = 0; i < plot->data.size(); i++) {
+			const auto &dp = plot->data.begin()[i];
+			p_db->insert_plot_point(plot_name, (uint64_t)dp.time.Val(), dp.val);
+		}
+	}
+
+	// 7. Lock events
+	const auto &lockMap = m_worker->GetLockMap();
+	for (const auto &lockPair : lockMap) {
+		uint64_t lock_id = (uint64_t)lockPair.first;
+		const auto &lock = lockPair.second;
+		if (!lock->valid) continue;
+		const auto &timeline = lock->timeline;
+		for (size_t i = 0; i < timeline.size(); i++) {
+			const auto &lep = timeline[i];
+			const auto *lev = lep.ptr;
+			if (!lev) continue;
+
+			int64_t time_ns = lev->Time();
+			int16_t srcloc = lev->SrcLoc();
+			uint8_t thread_idx = lev->thread;
+			uint64_t thread_id = (thread_idx < lock->threadList.size()) ? lock->threadList[thread_idx] : 0;
+
+			int type = 0;
+			switch (lev->type) {
+				case tracy::LockEvent::Type::Wait: type = 0; break;
+				case tracy::LockEvent::Type::Obtain: type = 1; break;
+				case tracy::LockEvent::Type::Release: type = 2; break;
+				case tracy::LockEvent::Type::WaitShared: type = 0; break;
+				case tracy::LockEvent::Type::ObtainShared: type = 1; break;
+				case tracy::LockEvent::Type::ReleaseShared: type = 2; break;
+				default: type = 0; break;
+			}
+			p_db->insert_lock_event(lock_id, (int64_t)srcloc, (uint64_t)time_ns, type, thread_id);
+		}
+	}
+
 	p_db->close();
 	return OK;
 }
@@ -407,6 +530,8 @@ void InsightsTracyBridge::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_frame_count"), &InsightsTracyBridge::get_frame_count);
 	ClassDB::bind_method(D_METHOD("get_zone_count"), &InsightsTracyBridge::get_zone_count);
 	ClassDB::bind_method(D_METHOD("get_file_info"), &InsightsTracyBridge::get_file_info);
+	ClassDB::bind_method(D_METHOD("get_lock_events"), &InsightsTracyBridge::get_lock_events);
+	ClassDB::bind_method(D_METHOD("get_callstack", "srcloc"), &InsightsTracyBridge::get_callstack);
 	ClassDB::bind_method(D_METHOD("populate_database", "db"), &InsightsTracyBridge::populate_database);
 }
 

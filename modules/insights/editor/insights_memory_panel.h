@@ -30,51 +30,23 @@
 
 #pragma once
 
-#include "scene/gui/control.h"
-#include "modules/insights/insights_core/insights_database.h"
+#include "scene/gui/box_container.h"
+#include "scene/gui/tree.h"
 
-class InsightsMemoryPanel : public Control {
-	GDCLASS(InsightsMemoryPanel, Control);
+class InsightsDatabase;
 
-public:
-	struct AllocEntry {
-		uint64_t ptr = 0;
-		uint64_t size = 0;
-		String alloc_site;
-		uint64_t start_ns = 0;
-		uint64_t end_ns = 0;
-	};
-
-	struct LeakEntry {
-		uint64_t ptr = 0;
-		uint64_t size = 0;
-		String alloc_site;
-	};
+class InsightsMemoryPanel : public VBoxContainer {
+	GDCLASS(InsightsMemoryPanel, VBoxContainer);
 
 private:
-	Ref<InsightsDatabase> database;
-	Vector<AllocEntry> allocations;
-	Vector<LeakEntry> leaked_objects;
-	uint64_t size_filter = 0;
-	uint64_t peak_memory = 0;
-
-	void _load_data();
+	Tree *mem_tree = nullptr;
+	int filtered_count = 0;
 
 protected:
 	static void _bind_methods();
-	void _notification(int p_what);
 
 public:
-	void set_database(const Ref<InsightsDatabase> &p_db);
-	Ref<InsightsDatabase> get_database() const;
-
-	uint64_t get_peak_memory() const;
-	Array get_leaked_allocations() const;
-
-	void set_size_filter(uint64_t p_min_size);
-	uint64_t get_size_filter() const;
-
-	Array get_filtered_allocations() const;
-
+	void update_data(const Ref<InsightsDatabase> &p_db);
 	InsightsMemoryPanel();
+	~InsightsMemoryPanel();
 };

@@ -38,6 +38,8 @@
 #include "modules/insights/editor/insights_loading_panel.h"
 #include "modules/insights/editor/insights_network_panel.h"
 #include "modules/insights/editor/insights_compare_panel.h"
+#include "modules/insights/editor/insights_plot_panel.h"
+#include "modules/insights/editor/insights_message_panel.h"
 #include "modules/insights/insights_core/insights_manager.h"
 #include "core/os/time.h"
 #include "editor/docks/editor_dock_manager.h"
@@ -225,6 +227,30 @@ InsightsDock::InsightsDock() {
 	InsightsComparePanel *compare_panel = memnew(InsightsComparePanel);
 	channel_tabs->add_child(compare_panel);
 	channel_tabs->set_tab_title(channel_tabs->get_tab_count() - 1, TTR("Compare"));
+
+	// Plots tab.
+	{
+		VBoxContainer *plot_vbox = memnew(VBoxContainer);
+		plot_vbox->set_v_size_flags(SIZE_EXPAND_FILL);
+		channel_tabs->add_child(plot_vbox);
+		channel_tabs->set_tab_title(channel_tabs->get_tab_count() - 1, TTR("Plots"));
+
+		InsightsPlotPanel *plot_panel = memnew(InsightsPlotPanel);
+		plot_panel->set_v_size_flags(SIZE_EXPAND_FILL);
+		plot_vbox->add_child(plot_panel);
+	}
+
+	// Messages tab.
+	{
+		VBoxContainer *msg_vbox = memnew(VBoxContainer);
+		msg_vbox->set_v_size_flags(SIZE_EXPAND_FILL);
+		channel_tabs->add_child(msg_vbox);
+		channel_tabs->set_tab_title(channel_tabs->get_tab_count() - 1, TTR("Messages"));
+
+		InsightsMessagePanel *message_panel = memnew(InsightsMessagePanel);
+		message_panel->set_v_size_flags(SIZE_EXPAND_FILL);
+		msg_vbox->add_child(message_panel);
+	}
 
 	// Playback bar.
 	playback_bar = memnew(HBoxContainer);
@@ -541,7 +567,7 @@ void InsightsDock::_set_database_recursive(Control *p_control, const Ref<Insight
 	}
 	InsightsMemoryPanel *memory = Object::cast_to<InsightsMemoryPanel>(p_control);
 	if (memory) {
-		memory->set_database(p_db);
+		memory->update_data(p_db);
 	}
 	InsightsLoadingPanel *loading = Object::cast_to<InsightsLoadingPanel>(p_control);
 	if (loading) {
@@ -550,6 +576,14 @@ void InsightsDock::_set_database_recursive(Control *p_control, const Ref<Insight
 	InsightsNetworkPanel *network = Object::cast_to<InsightsNetworkPanel>(p_control);
 	if (network) {
 		network->set_database(p_db);
+	}
+	InsightsPlotPanel *plot = Object::cast_to<InsightsPlotPanel>(p_control);
+	if (plot) {
+		plot->update_data(p_db);
+	}
+	InsightsMessagePanel *message = Object::cast_to<InsightsMessagePanel>(p_control);
+	if (message) {
+		message->update_data(p_db);
 	}
 
 	// Recurse into children.
@@ -587,6 +621,14 @@ InsightsNetworkPanel *InsightsDock::get_network_panel() const {
 
 InsightsComparePanel *InsightsDock::get_compare_panel() const {
 	return _find_child_of_type<InsightsComparePanel>(channel_tabs);
+}
+
+InsightsPlotPanel *InsightsDock::get_plot_panel() const {
+	return _find_child_of_type<InsightsPlotPanel>(channel_tabs);
+}
+
+InsightsMessagePanel *InsightsDock::get_message_panel() const {
+	return _find_child_of_type<InsightsMessagePanel>(channel_tabs);
 }
 
 #ifdef TRACY_SERVER_ENABLED

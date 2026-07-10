@@ -127,6 +127,24 @@ void InsightsDatabase::insert_message(int p_level, const String &p_text, uint64_
 	messages.push_back(rec);
 }
 
+void InsightsDatabase::insert_plot_point(const String &p_plot_name, uint64_t p_time_ns, double p_value) {
+	PlotPointRecord rec;
+	rec.plot_name = p_plot_name;
+	rec.time_ns = p_time_ns;
+	rec.value = p_value;
+	plot_points.push_back(rec);
+}
+
+void InsightsDatabase::insert_lock_event(uint64_t p_lock_id, int64_t p_srcloc, uint64_t p_time_ns, int p_type, uint64_t p_thread_id) {
+	LockEventRecord rec;
+	rec.lock_id = p_lock_id;
+	rec.srcloc = p_srcloc;
+	rec.time_ns = p_time_ns;
+	rec.type = p_type;
+	rec.thread_id = p_thread_id;
+	lock_events.push_back(rec);
+}
+
 Array InsightsDatabase::query_zone(const String &p_name, uint64_t p_start_ns, uint64_t p_end_ns) const {
 	Array result;
 	HashMap<String, LocalVector<uint32_t>>::ConstIterator it = zone_name_index.find(p_name);
@@ -276,6 +294,67 @@ uint32_t InsightsDatabase::get_allocation_count() const {
 	return allocations.size();
 }
 
+Array InsightsDatabase::query_plot_points(const String &p_plot_name, uint64_t p_start_ns, uint64_t p_end_ns) const {
+	Array result;
+	for (uint32_t i = 0; i < plot_points.size(); i++) {
+		const PlotPointRecord &rec = plot_points[i];
+		if (rec.plot_name == p_plot_name && rec.time_ns >= p_start_ns && rec.time_ns <= p_end_ns) {
+			Dictionary dict;
+			dict["plot_name"] = rec.plot_name;
+			dict["time_ns"] = (int64_t)rec.time_ns;
+			dict["value"] = rec.value;
+			result.push_back(dict);
+		}
+	}
+	return result;
+}
+
+Array InsightsDatabase::query_lock_events(uint64_t p_start_ns, uint64_t p_end_ns) const {
+	Array result;
+	for (uint32_t i = 0; i < lock_events.size(); i++) {
+		const LockEventRecord &rec = lock_events[i];
+		if (rec.time_ns >= p_start_ns && rec.time_ns <= p_end_ns) {
+			Dictionary dict;
+			dict["lock_id"] = (int64_t)rec.lock_id;
+			dict["srcloc"] = rec.srcloc;
+			dict["time_ns"] = (int64_t)rec.time_ns;
+			dict["type"] = rec.type;
+			dict["thread_id"] = (int64_t)rec.thread_id;
+			result.push_back(dict);
+		}
+	}
+	return result;
+}
+
+Array InsightsDatabase::get_plot_names() const {
+	Array result;
+	HashSet<String> seen;
+	for (uint32_t i = 0; i < plot_points.size(); i++) {
+		const String &name = plot_points[i].plot_name;
+		if (!seen.has(name)) {
+			seen.insert(name);
+			result.append(name);
+		}
+	}
+	return result;
+}
+
+uint32_t InsightsDatabase::get_plot_point_count() const {
+	return plot_points.size();
+}
+
+uint32_t InsightsDatabase::get_lock_event_count() const {
+	return lock_events.size();
+}
+
+uint32_t InsightsDatabase::get_message_count() const {
+	return messages.size();
+}
+
+uint32_t InsightsDatabase::get_gpu_zone_count() const {
+	return gpu_zones.size();
+}
+
 Error InsightsDatabase::save_to_file(const String &p_path) const {
 	Ref<FileAccess> f = FileAccess::open(p_path, FileAccess::WRITE);
 	if (f.is_null()) {
@@ -284,7 +363,7 @@ Error InsightsDatabase::save_to_file(const String &p_path) const {
 
 	// Magic + version.
 	f->store_buffer((const uint8_t *)"GDIN", 4);
-	f->store_32(1); // version
+	f->store_32(2); // version
 
 	// Zones.
 	f->store_32(zones.size());
@@ -352,6 +431,24 @@ Error InsightsDatabase::save_to_file(const String &p_path) const {
 		f->store_32(messages[i].zone_id);
 	}
 
+	// Plot points.
+	f->store_32(plot_points.size());
+	for (uint32_t i = 0; i < plot_points.size(); i++) {
+		f->store_pascal_string(plot_points[i].plot_name);
+		f->store_64(plot_points[i].time_ns);
+		f->store_double(plot_points[i].value);
+	}
+
+	// Lock events.
+	f->store_32(lock_events.size());
+	for (uint32_t i = 0; i < lock_events.size(); i++) {
+		f->store_64(lock_events[i].lock_id);
+		f->store_64(lock_events[i].srcloc);
+		f->store_64(lock_events[i].time_ns);
+		f->store_32(lock_events[i].type);
+		f->store_64(lock_events[i].thread_id);
+	}
+
 	return OK;
 }
 
@@ -369,7 +466,7 @@ Error InsightsDatabase::load_from_file(const String &p_path) {
 	}
 
 	uint32_t version = f->get_32();
-	if (version != 1) {
+	if (version < 1 || version > 2) {
 		return ERR_FILE_CORRUPT;
 	}
 
@@ -465,6 +562,31 @@ Error InsightsDatabase::load_from_file(const String &p_path) {
 		messages.push_back(rec);
 	}
 
+	// Plot points and lock events (version 2+).
+	if (version >= 2) {
+		uint32_t pp_count = f->get_32();
+		plot_points.reserve(pp_count);
+		for (uint32_t i = 0; i < pp_count; i++) {
+			PlotPointRecord rec;
+			rec.plot_name = f->get_pascal_string();
+			rec.time_ns = f->get_64();
+			rec.value = f->get_double();
+			plot_points.push_back(rec);
+		}
+
+		uint32_t le_count = f->get_32();
+		lock_events.reserve(le_count);
+		for (uint32_t i = 0; i < le_count; i++) {
+			LockEventRecord rec;
+			rec.lock_id = f->get_64();
+			rec.srcloc = (int64_t)f->get_64();
+			rec.time_ns = f->get_64();
+			rec.type = f->get_32();
+			rec.thread_id = f->get_64();
+			lock_events.push_back(rec);
+		}
+	}
+
 	file_path = p_path;
 	is_open = true;
 	return OK;
@@ -477,6 +599,8 @@ void InsightsDatabase::clear() {
 	gpu_zones.clear();
 	resource_loads.clear();
 	messages.clear();
+	plot_points.clear();
+	lock_events.clear();
 	zone_name_index.clear();
 }
 
@@ -517,6 +641,78 @@ Array InsightsDatabase::query_allocations_by_size(uint64_t p_min_size) const {
 			result.push_back(dict);
 		}
 	}
+	return result;
+}
+
+Array InsightsDatabase::query_messages() const {
+	Array result;
+	for (uint32_t i = 0; i < messages.size(); i++) {
+		const MessageRecord &rec = messages[i];
+		Dictionary dict;
+		dict["level"] = rec.level;
+		dict["text"] = rec.text;
+		dict["timestamp_ns"] = (int64_t)rec.timestamp_ns;
+		dict["zone_id"] = rec.zone_id;
+		result.push_back(dict);
+	}
+	return result;
+}
+
+Array InsightsDatabase::get_plot_data(const String &p_plot_name) const {
+	Array result;
+
+	if (p_plot_name == "Frame Time") {
+		for (uint32_t i = 0; i < frame_markers.size(); i++) {
+			const FrameMarker &rec = frame_markers[i];
+			Dictionary point;
+			point["x"] = (double)rec.frame_index;
+			double frame_ms = (double)(rec.end_ns - rec.start_ns) / 1e6;
+			point["y"] = frame_ms;
+			result.push_back(point);
+		}
+	} else if (p_plot_name == "Memory Usage") {
+		// Compute memory usage over time from allocation/free events.
+		struct MemEvent {
+			uint64_t time_ns;
+			uint64_t size;
+			bool is_alloc;
+		};
+
+		LocalVector<MemEvent> events;
+		events.reserve(allocations.size() * 2);
+		for (uint32_t i = 0; i < allocations.size(); i++) {
+			const AllocationRecord &rec = allocations[i];
+			events.push_back({ rec.alloc_ns, rec.size, true });
+			if (rec.free_ns != 0) {
+				events.push_back({ rec.free_ns, rec.size, false });
+			}
+		}
+
+		// Sort by time (simple bubble sort for small data).
+		for (uint32_t i = 0; i < events.size(); i++) {
+			for (uint32_t j = i + 1; j < events.size(); j++) {
+				if (events[j].time_ns < events[i].time_ns) {
+					MemEvent tmp = events[i];
+					events[i] = events[j];
+					events[j] = tmp;
+				}
+			}
+		}
+
+		uint64_t current = 0;
+		for (uint32_t i = 0; i < events.size(); i++) {
+			if (events[i].is_alloc) {
+				current += events[i].size;
+			} else {
+				current -= events[i].size;
+			}
+			Dictionary point;
+			point["x"] = (double)events[i].time_ns / 1e6;
+			point["y"] = (double)current;
+			result.push_back(point);
+		}
+	}
+
 	return result;
 }
 
@@ -663,6 +859,8 @@ void InsightsDatabase::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("insert_gpu_zone", "name", "queue_id", "submit_ns", "start_ns", "end_ns", "context_id"), &InsightsDatabase::insert_gpu_zone);
 	ClassDB::bind_method(D_METHOD("insert_resource_load", "path", "loader", "start_ns", "end_ns", "size_bytes", "parent_path", "thread_id"), &InsightsDatabase::insert_resource_load);
 	ClassDB::bind_method(D_METHOD("insert_message", "level", "text", "timestamp_ns", "zone_id"), &InsightsDatabase::insert_message);
+	ClassDB::bind_method(D_METHOD("insert_plot_point", "plot_name", "time_ns", "value"), &InsightsDatabase::insert_plot_point);
+	ClassDB::bind_method(D_METHOD("insert_lock_event", "lock_id", "srcloc", "time_ns", "type", "thread_id"), &InsightsDatabase::insert_lock_event);
 
 	ClassDB::bind_method(D_METHOD("query_zone", "name", "start_ns", "end_ns"), &InsightsDatabase::query_zone);
 	ClassDB::bind_method(D_METHOD("query_zones_in_range", "start_ns", "end_ns"), &InsightsDatabase::query_zones_in_range);
@@ -676,13 +874,24 @@ void InsightsDatabase::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("query_allocations_by_size", "min_size"), &InsightsDatabase::query_allocations_by_size);
 	ClassDB::bind_method(D_METHOD("query_resource_loads"), &InsightsDatabase::query_resource_loads);
 	ClassDB::bind_method(D_METHOD("query_resource_dependencies", "path"), &InsightsDatabase::query_resource_dependencies);
+	ClassDB::bind_method(D_METHOD("query_messages"), &InsightsDatabase::query_messages);
 	ClassDB::bind_method(D_METHOD("get_peak_memory"), &InsightsDatabase::get_peak_memory);
 	ClassDB::bind_method(D_METHOD("get_leaked_allocations"), &InsightsDatabase::get_leaked_allocations);
 	ClassDB::bind_method(D_METHOD("get_total_duration_ns"), &InsightsDatabase::get_total_duration_ns);
 
+	ClassDB::bind_method(D_METHOD("get_plot_names"), &InsightsDatabase::get_plot_names);
+	ClassDB::bind_method(D_METHOD("get_plot_data", "plot_name"), &InsightsDatabase::get_plot_data);
+
 	ClassDB::bind_method(D_METHOD("get_zone_count"), &InsightsDatabase::get_zone_count);
 	ClassDB::bind_method(D_METHOD("get_frame_marker_count"), &InsightsDatabase::get_frame_marker_count);
 	ClassDB::bind_method(D_METHOD("get_allocation_count"), &InsightsDatabase::get_allocation_count);
+
+	ClassDB::bind_method(D_METHOD("query_plot_points", "plot_name", "start_ns", "end_ns"), &InsightsDatabase::query_plot_points);
+	ClassDB::bind_method(D_METHOD("query_lock_events", "start_ns", "end_ns"), &InsightsDatabase::query_lock_events);
+	ClassDB::bind_method(D_METHOD("get_plot_point_count"), &InsightsDatabase::get_plot_point_count);
+	ClassDB::bind_method(D_METHOD("get_lock_event_count"), &InsightsDatabase::get_lock_event_count);
+	ClassDB::bind_method(D_METHOD("get_message_count"), &InsightsDatabase::get_message_count);
+	ClassDB::bind_method(D_METHOD("get_gpu_zone_count"), &InsightsDatabase::get_gpu_zone_count);
 
 	ClassDB::bind_method(D_METHOD("save_to_file", "path"), &InsightsDatabase::save_to_file);
 	ClassDB::bind_method(D_METHOD("load_from_file", "path"), &InsightsDatabase::load_from_file);
