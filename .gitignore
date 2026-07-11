@@ -394,3 +394,4 @@ $RECYCLE.BIN/
 *.msp
 *.lnk
 *.generated.props
+_validate/node_modules/
