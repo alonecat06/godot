@@ -541,6 +541,275 @@ driver/threads/thread_model = 2  ; 1=Safe, 2=Separate
 - 不支持线程的平台（如某些 Web 目标）所有线程选项被强制关闭
 - 物理线程默认关闭，需手动开启，但比渲染线程更稳定
 
+## 5.6 渲染对象多线程方案：RID 句柄模式 vs UE SceneProxy 模式
+
+### 5.6.1 UE 的 Component/SceneProxy 双对象模式
+
+UE 采用**双对象**架构，游戏线程和渲染线程各持有独立对象：
+
+```
+游戏线程                           渲染线程
+┌──────────────────────┐          ┌──────────────────────┐
+│ UPrimitiveComponent  │          │ FPrimitiveSceneProxy │
+│ ├── Transform        │  ──────> │ ├── Transform        │
+│ ├── Materials[]      │  ENQUEUE │ ├── Materials[]      │
+│ ├── Bounds           │  RENDER  │ ├── Bounds           │
+│ ├── Visibility       │  COMMAND │ ├── Visibility       │
+│ └── MarkDirty()      │          │ └── GetMeshBatch()   │
+└──────────────────────┘          └──────────────────────┘
+         │                                  │
+         v                                  v
+    UWorld (游戏线程)                  FScene (渲染线程)
+```
+
+**UE 模式特点**：
+- 两个独立对象，严格线程归属：Component 仅游戏线程访问，SceneProxy 仅渲染线程访问
+- 通过 `ENQUEUE_RENDER_COMMAND` 异步传递更新
+- Component 有 `DoRenderUpdate()` 收集脏标记，批量同步到 SceneProxy
+- SceneProxy 在渲染线程独立完成裁剪、排序、绘制
+- 无共享可变状态，线程安全由架构保证
+
+### 5.6.2 Godot 的 RID 句柄模式
+
+Godot 采用**单对象 + RID 句柄**架构，没有渲染线程的独立代理对象：
+
+```mermaid
+flowchart LR
+    subgraph MainThread["主线程 (场景层)"]
+        A["VisualInstance3D<br>base: RID<br>instance: RID<br>transform: Transform3D<br>layers: uint32_t"]
+        B["MeshInstance3D<br>mesh: Ref~Mesh~<br>skeleton: RID<br>blend_shapes: float[]"]
+    end
+
+    subgraph RenderingServerLayer["RenderingServer (API 边界)"]
+        C["FUNC2 instance_set_transform<br>FUNC2 instance_set_base<br>FUNC2 instance_set_layer_mask"]
+    end
+
+    subgraph RenderThreadData["渲染线程数据 (RendererSceneCull)"]
+        D["Instance 结构体<br>base_type, base RID<br>transform: Transform3D<br>layer_mask: uint32_t<br>cast_shadows, visible<br>aabb, transformed_aabb<br>geometry_instance: RenderGeometryInstance*"]
+        E["RID_Owner&lt;Instance&gt;<br>instance_owner"]
+    end
+
+    A -->|"通过 RenderingServer API"| C
+    C -->|"CommandQueueMT.push<br>或直接调用"| D
+    E -->|"RID → Instance*"| D
+```
+
+**关键源码**：
+
+```cpp
+// scene/3d/visual_instance_3d.h:40-41
+// 场景节点仅持有 RID 句柄，不持有渲染数据
+RID base;      // 指向 mesh/light/etc 资源
+RID instance;  // 指向 RenderingServer 中的 Instance
+
+// servers/rendering/renderer_scene_cull.h:401-440
+// 渲染线程的 Instance 结构体，包含所有渲染所需数据
+struct Instance {
+    RS::InstanceType base_type;
+    RID base;
+    Transform3D transform;
+    uint32_t layer_mask;
+    bool visible;
+    AABB aabb;
+    AABB transformed_aabb;
+    RenderGeometryInstance *geometry_instance;  // 实际的几何渲染数据
+    // ... 更多渲染专用字段
+};
+
+// servers/rendering/renderer_scene_cull.h:1013
+// RID → Instance* 的映射，渲染线程独占
+mutable RID_Owner<Instance, true> instance_owner;
+```
+
+### 5.6.3 两种模式对比
+
+```mermaid
+flowchart TD
+    subgraph UE["UE: 双对象模式"]
+        UE1["UPrimitiveComponent<br>游戏线程对象<br>持有业务逻辑数据"]
+        UE2["FPrimitiveSceneProxy<br>渲染线程对象<br>持有渲染专用数据"]
+        UE1 -->|"ENQUEUE_RENDER_COMMAND<br>异步命令队列"| UE2
+        UE1 -.->|"DoRenderUpdate<br>收集脏标记"| UE2
+    end
+
+    subgraph Godot["Godot: RID 句柄模式"]
+        G1["VisualInstance3D<br>主线程节点<br>仅持有 RID 句柄"]
+        G2["RendererSceneCull::Instance<br>渲染线程数据<br>持有完整渲染数据"]
+        G1 -->|"RenderingServer API<br>+ CommandQueueMT"| G2
+        G1 -.->|"FUNC2 宏自动分发<br>push 或直接调用"| G2
+    end
+
+    style UE1 fill:#e3f2fd
+    style UE2 fill:#bbdefb
+    style G1 fill:#fff3e0
+    style G2 fill:#ffe0b2
+```
+
+| 维度 | UE 双对象模式 | Godot RID 句柄模式 |
+|------|-------------|-------------------|
+| **对象数量** | 2 个（Component + SceneProxy） | 1 个场景节点 + 1 个渲染 Instance |
+| **线程归属** | 严格分离：Component 游戏线程，SceneProxy 渲染线程 | 场景节点主线程，Instance 通过 RID_Owner 渲染线程访问 |
+| **数据复制** | Component 数据显式拷贝到 SceneProxy | 通过 CommandQueueMT 传参，渲染线程独立持有 |
+| **同步方式** | ENQUEUE_RENDER_COMMAND（命令 lambda） | FUNC 宏 + CommandQueueMT.push（方法 + 参数） |
+| **脏标记** | DoRenderUpdate + 脏位收集，批量同步 | 无脏标记系统，每次 set 调用立即推送到渲染线程 |
+| **创建流程** | Component::CreateSceneProxy() 在渲染线程构造 | FUNCRIDSPLIT: allocate 在当前线程，initialize 推到渲染线程 |
+| **数据所有权** | Component 和 SceneProxy 各自独立持有数据 | 渲染数据完全属于渲染线程，主线程仅持 RID |
+| **线程安全** | 架构级保证，无共享可变状态 | FUNC 宏 + CommandQueueMT 保证，RID 本身线程安全 |
+
+### 5.6.4 Godot 的 FUNC 宏分发机制
+
+Godot 通过 `server_wrap_mt_common.h` 中的宏自动决定调用路径：
+
+```mermaid
+flowchart TD
+    A["主线程调用 RenderingServer.instance_set_transform(rid, xform)"] --> B{ASYNC_COND_PUSH?}
+    B -->|"渲染线程模式下<br>调用线程 != server_thread"| C["command_queue.push<br>异步投递到渲染线程"]
+    B -->|"单线程模式下<br>调用线程 == server_thread"| D["command_queue.flush_if_pending<br>直接调用底层实现"]
+
+    C --> E["渲染线程: instance_set_transform<br>更新 Instance.transform"]
+    D --> E
+
+    style C fill:#fff3e0
+    style D fill:#e8f5e9
+```
+
+**关键源码**：
+
+```cpp
+// servers/server_wrap_mt_common.h:190-199
+#define FUNC1(m_type, m_arg1)
+    virtual void m_type(m_arg1 p1) override {
+        WRITE_ACTION
+        if (ASYNC_COND_PUSH) {
+            // 渲染线程模式: 异步推送到命令队列
+            command_queue.push(server_name, &ServerName::m_type, p1);
+        } else {
+            // 单线程模式: 先 flush 待处理命令，再直接调用
+            command_queue.flush_if_pending();
+            server_name->m_type(p1);
+        }
+    }
+
+// servers/rendering/rendering_server_default.h:899-903
+// 这些方法全部由 FUNC 宏生成，自动处理线程分发
+FUNC2(instance_set_base, RID, RID)
+FUNC2(instance_set_scenario, RID, RID)
+FUNC2(instance_set_layer_mask, RID, uint32_t)
+FUNC2(instance_set_transform, RID, const Transform3D &)
+```
+
+### 5.6.5 对象生命周期对比
+
+**UE 创建流程**：
+
+```mermaid
+sequenceDiagram
+    participant GT as 游戏线程
+    participant RT as 渲染线程
+
+    GT->>GT: UPrimitiveComponent.Register()
+    GT->>RT: ENQUEUE_RENDER_COMMAND CreateSceneProxy
+    RT->>RT: new FPrimitiveSceneProxy
+    RT->>RT: FScene.AddPrimitive
+
+    Note over GT,RT: 每帧更新
+    GT->>GT: Component.SetTransform
+    GT->>RT: ENQUEUE_RENDER_COMMAND SetTransform
+    RT->>RT: SceneProxy.SetTransform
+
+    GT->>RT: ENQUEUE_RENDER_COMMAND DestroyPrimitive
+    RT->>RT: delete SceneProxy
+```
+
+**Godot 创建流程**：
+
+```mermaid
+sequenceDiagram
+    participant MT as 主线程
+    participant RS as RenderingServer API
+    participant RT as 渲染线程 RendererSceneCull
+
+    MT->>MT: MeshInstance3D._ready
+    MT->>RS: instance_create
+
+    alt 渲染线程模式
+        RS->>RS: instance_allocate 在主线程
+        RS->>RT: command_queue.push instance_initialize
+        RT->>RT: instance_owner.initialize RID
+    else 单线程模式
+        RS->>RS: instance_allocate + initialize 直接调用
+    end
+
+    Note over MT,RT: 每帧更新
+    MT->>RS: instance_set_transform rid xform
+
+    alt 渲染线程模式
+        RS->>RT: command_queue.push instance_set_transform
+        RT->>RT: Instance.transform = xform
+    else 单线程模式
+        RS->>RS: 直接设置 Instance.transform
+    end
+
+    MT->>RS: free_rid rid
+
+    alt 渲染线程模式
+        RS->>RT: command_queue.push_and_sync free_rid
+        RT->>RT: instance_owner.free RID
+    else 单线程模式
+        RS->>RS: 直接 free
+    end
+```
+
+### 5.6.6 Godot 模式的优缺点
+
+**优点**：
+
+1. **API 简洁**：主线程只需通过 RenderingServer API 操作 RID，无需关心线程细节
+2. **单一代码路径**：FUNC 宏自动处理单线程/多线程分发，一套代码两种模式
+3. **数据所有权清晰**：渲染数据完全在渲染线程，主线程仅持 RID 句柄
+4. **RID 轻量**：RID 仅 16 字节（2 个 uint32），主线程持有成本极低
+
+**缺点**：
+
+1. **无脏标记系统**：每次 set 调用都推送到渲染线程，无法批量合并更新
+   - UE 的 DoRenderUpdate 可以收集脏标记，一帧只同步一次
+   - Godot 每次调用都生成一条命令，高频更新（如每帧 Transform）产生大量命令
+2. **无 SceneProxy 抽象**：渲染线程没有独立的"代理对象"概念
+   - UE 的 SceneProxy 可以缓存渲染专用数据（如 LOD 信息、材质排序缓存）
+   - Godot 的 Instance 直接存储原始数据，渲染时再计算
+3. **同步粒度粗**：push_and_sync 阻塞等待渲染线程处理完当前命令
+   - UE 的 ENQUEUE_RENDER_COMMAND 是纯异步的
+   - Godot 某些操作（如创建返回 RID）必须同步等待
+4. **调试困难**：RID 是不透明句柄，无法直接查看渲染线程中的对象状态
+   - UE 可以在渲染线程断点查看 SceneProxy
+   - Godot 需要 RID_Owner 查找，且渲染线程数据对主线程不可见
+
+### 5.6.7 方案总结
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│              Godot 渲染对象多线程方案总结                           │
+│                                                                    │
+│  Godot 没有采用 UE 的 Component/SceneProxy 双对象模式              │
+│  而是采用 RID 句柄模式：                                           │
+│                                                                    │
+│  ┌──────────────────┐     CommandQueueMT     ┌──────────────────┐ │
+│  │ VisualInstance3D  │ ────────────────────> │ RendererSceneCull│ │
+│  │ (主线程节点)      │     FUNC 宏自动分发    │ ::Instance       │ │
+│  │ 持有: RID 句柄    │                       │ (渲染线程数据)    │ │
+│  │                   │                       │ 持有: 全部渲染数据│ │
+│  └──────────────────┘                       └──────────────────┘ │
+│                                                                    │
+│  核心差异：                                                        │
+│  ├── UE: 两个独立对象，显式同步，脏标记批处理                      │
+│  └── Godot: RID 句柄 + FUNC 宏，命令队列逐条投递，无脏标记        │
+│                                                                    │
+│  Godot 模式更简洁但效率略低：                                      │
+│  ├── 优点: API 统一、代码路径单一、数据所有权清晰                  │
+│  └── 缺点: 无脏标记、高频更新产生大量命令、同步等待可能卡顿        │
+└────────────────────────────────────────────────────────────────────┘
+```
+
 ## 6. 各子系统线程归属
 
 ### 6.1 详细线程归属表
