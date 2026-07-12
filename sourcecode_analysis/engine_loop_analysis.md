@@ -810,6 +810,494 @@ sequenceDiagram
 └────────────────────────────────────────────────────────────────────┘
 ```
 
+### 5.6.8 push vs push_and_sync 的存在原因与高频更新优化
+
+#### 5.6.8.1 为什么 Godot 同时提供 push 和 push_and_sync
+
+CommandQueueMT 共提供三种投递语义（`core/templates/command_queue_mt.h`），对应不同的同步需求：
+
+| 方法 | 模板参数 NeedsSync | 行为 | 适用场景 |
+|------|-------------------|------|----------|
+| `push` | `false` | 投递到队列立即返回，渲染线程异步消费 | 纯 set 操作（transform/可见性/layer_mask 等），无后续依赖 |
+| `push_and_sync` | `true` | 投递后阻塞等待 `sync_cond_var` 唤醒 | 需要确认执行完成的副作用操作 |
+| `push_and_ret` | `true` | 投递后阻塞等待，且写回返回值 | 状态查询（`texture_2d_get`、`get_rendering_info` 等） |
+
+**为什么需要 push_and_sync（阻塞语义）**：
+
+```cpp
+// core/templates/command_queue_mt.h:138-148
+template <typename T, bool NeedsSync, typename... Args>
+_FORCE_INLINE_ void _push_internal(Args &&...args) {
+    MutexLock mlock(mutex);
+    create_command<T>(std::forward<Args>(args)...);
+
+    if (pump_task_id != WorkerThreadPool::INVALID_TASK_ID) {
+        WorkerThreadPool::get_singleton()->notify_yield_over(pump_task_id);
+    }
+
+    if constexpr (NeedsSync) {
+        sync_tail++;
+        _wait_for_sync(mlock);   // ← 阻塞等待
+    }
+}
+```
+
+**典型 push_and_sync 使用场景**（`servers/rendering/rendering_server_default.h` 中 FUNC0S/FUNCnS 系列）：
+
+1. **RID 创建的"分配-初始化"分离（`FUNCRIDSPLIT`）**：
+   ```cpp
+   // servers/server_wrap_mt_common.h:56-65
+   #define FUNCRIDSPLIT(m_type)                                                        \
+       virtual RID m_type##_create() override {                                        \
+           RID ret = server_name->m_type##_allocate();                                 \
+           if (ASYNC_COND_PUSH) {                                                      \
+               command_queue.push(server_name, &ServerName::m_type##_initialize, ret); \
+           } else {                                                                    \
+               server_name->m_type##_initialize(ret);                                  \
+           }                                                                           \
+           return ret;                                                                 \
+       }
+   ```
+   分配阶段（`_allocate`）在主线程立即执行并返回 RID，初始化（`_initialize`）则推到渲染线程。`push_and_sync` 在 RID 必须先于使用就绪时使用（如 free_rid 前需要确保没有未完成的引用）。
+
+2. **资源释放前的同步（`free_rid` 语义）**：
+   ```cpp
+   // RID 释放前必须确保：① 渲染线程没有正在引用该 RID ② 之前的命令都已处理
+   // 这就是 push_and_sync 的典型用途
+   ```
+
+3. **需要确认副作用完成的关键操作**：
+   - 渲染线程启动/关闭（`thread_loop` 初始化）
+   - 资源 GPU 上传完成的确认
+   - 场景切换前确保旧场景清理完毕
+
+**为什么 push 也会导致"阻塞主线程"问题**：
+
+虽然 `push` 本身不阻塞，但**整个 CommandQueueMT 体系存在两种隐式同步点**：
+
+```mermaid
+flowchart TD
+    A["主线程 push (100次/帧)"] --> B["命令队列持续增长"]
+    B --> C{"队列何时消费?"}
+    C --> D["① 渲染线程循环 flush_all"]
+    C --> E["② 队列满 (64KB) 触发 flush"]
+    C --> F["③ sync() 调用 flush_if_pending"]
+
+    D --> G["异步 不阻塞"]
+    E --> G
+    F --> H["⚠️ 阻塞主线程"]
+
+    style H fill:#ffcdd2
+```
+
+**问题点详解**：
+
+```cpp
+// servers/server_wrap_mt_common.h:91-97
+#define FUNC0(m_type)                                             \
+    virtual void m_type() override {                              \
+        WRITE_ACTION                                              \
+        if (ASYNC_COND_PUSH) {                                    \
+            command_queue.push(server_name, &ServerName::m_type); \
+        } else {                                                  \
+            command_queue.flush_if_pending();   // ← 阻塞点 1   \
+            server_name->m_type();                                \
+        }                                                         \
+    }
+```
+
+1. **`flush_if_pending()` 隐式阻塞**（FUNC 宏 else 分支）：当 push 时 `pending==true` 但又被识别为"调用线程==server_thread"时（`ASYNC_COND_PUSH` 为 false），主线程会直接 flush 队列并执行命令，造成主线程等待。
+2. **队列满导致 flush 阻塞**：CommandQueueMT 默认容量 64KB（`DEFAULT_COMMAND_MEM_SIZE_KB = 64`），高频调用（如每帧 1000+ transform 更新）可能撑爆队列。
+3. **`_prevent_sync_wraparound` 隐性开销**：`sync_head/sync_tail` 接近 UINT32_MAX 时会触发 wraparound 检查。
+
+**push_and_sync 的阻塞特征**（最坏情况）：
+
+```mermaid
+sequenceDiagram
+    participant MT as 主线程
+    participant Q as CommandQueueMT
+    participant RT as 渲染线程
+    participant CV as sync_cond_var
+
+    MT->>Q: push_and_sync (sync_tail++)
+    Q->>RT: notify_yield_over
+    MT->>CV: _wait_for_sync (释放 mutex)
+    Note over MT: 主线程阻塞
+
+    Note over RT: 渲染线程在 _flush() 中
+    RT->>Q: 处理这条命令
+    RT->>Q: cmd_local->sync == true
+    RT->>CV: sync_head++ notify_all
+
+    CV-->>MT: 唤醒
+    MT->>MT: 继续执行
+```
+
+**总结：阻塞问题的根因**：
+
+| 阻塞源 | 触发条件 | 阻塞程度 |
+|--------|---------|---------|
+| `push_and_sync` 主动阻塞 | 业务代码使用 FUNC0S 系列 | 等待渲染线程处理完当前命令 |
+| `push_and_ret` 主动阻塞 | 查询操作 | 等返回值 |
+| `flush_if_pending` 隐式阻塞 | `Thread::get_caller_id() == server_thread`（主线程被识别为 server_thread） | 取决于队列大小 |
+| `RenderingServer.sync()` | `Main::iteration()` 每帧调用 | 等待渲染线程完成上一帧 draw |
+| 队列满重分配 | 高频 push 撑爆 64KB | 内存分配 + 命令拷贝 |
+| `sync_head/tail` wraparound | 大量 push_and_sync 累积 | 罕见但可能 |
+
+#### 5.6.8.2 集中化 CommandQueueMT 提交以避免高频更新问题
+
+**问题场景**：在密集更新（如 1000+ 个 MeshInstance3D 每帧设置 transform）时，逐次 push 会产生大量命令。
+
+```cpp
+// 当前模式（FUNC2 展开）
+for (int i = 0; i < 1000; i++) {
+    RS::get_singleton()->instance_set_transform(instance_rid[i], xform[i]);
+    // → 1000 次 command_queue.push
+    // → 1000 次 MutexLock 上锁
+    // → 1000 次 command_mem.resize
+    // → 渲染线程要处理 1000 次 cmd
+}
+```
+
+**集中化方案 1：批处理 API（Godot 实际做法 — Multimesh / MultiMeshInstance）**：
+
+Godot 已经在高性能场景通过 `MultiMesh` 实现了"一次提交批量更新"：
+
+```cpp
+// core/multimesh.h 的 API
+class MultiMesh {
+    void set_buffer(const Vector<float> &p_buffer);  // 一次性设置所有实例的 transform
+    void set_instance_transform(int p_instance, const Transform3D &p_transform);
+    // ...
+};
+
+// 主线程侧：
+Vector<float> buffer;
+for (int i = 0; i < 1000; i++) {
+    // 写入本地 buffer（仅主线程操作，无命令队列）
+    buffer.write[12 * i + 0] = xform[i].basis.rows[0][0];
+    // ...
+}
+multimesh->set_buffer(buffer);
+// → 仅 1 次 push(set_buffer)，但内部携带 1000 个 transform 数据
+```
+
+**MultiMesh 的批处理实现**（`servers/rendering/renderer_scene_cull.h` 中 instance 数据）：
+
+```mermaid
+flowchart LR
+    subgraph M["主线程"]
+        A["脚本/编辑器"]
+        B["Multimesh 节点<br>本地 Vector buffer"]
+    end
+
+    subgraph S["CommandQueueMT"]
+        C["set_buffer (1次push)<br>携带 Vector 数据"]
+    end
+
+    subgraph R["渲染线程"]
+        D["MultimeshStorage::multimesh_set_buffer<br>一次 memcpy 到 GPU 缓冲"]
+        E["渲染时直接读取 buffer<br>无需逐实例 set_transform"]
+    end
+
+    A --> B
+    B -->|1次| C
+    C --> D
+    D --> E
+```
+
+**集中化方案 2：脏标记批处理（可借鉴 UE 的 DoRenderUpdate 思想）**：
+
+可以扩展 `VisualInstance3D` 增加批量同步 API：
+
+```cpp
+// 假设的脏标记批处理模式（Godot 当前未提供，但可作为优化方向）
+class VisualInstance3DBatcher {
+    HashMap<RID, DirtyData> pending_updates;
+
+    void mark_transform_dirty(RID p_rid, const Transform3D &p_xform) {
+        pending_updates[p_rid].transform = p_xform;
+    }
+
+    void mark_visible_dirty(RID p_rid, bool p_visible) {
+        pending_updates[p_rid].visible = p_visible;
+    }
+
+    void flush() {
+        // 一次性提交所有脏数据
+        RS::get_singleton()->batch_instance_updates(pending_updates);
+        pending_updates.clear();
+    }
+};
+
+// 用法：
+auto *batcher = VisualInstance3DBatcher::get_singleton();
+for (int i = 0; i < 1000; i++) {
+    batcher->mark_transform_dirty(instance_rid[i], xform[i]);
+}
+batcher->flush();  // 仅 1 次 CommandQueueMT 调用
+```
+
+**集中化方案 3：Frame-coherent Update（Godot 已经在用的隐式方案）**：
+
+观察 `VisualInstance3D::_notification`：
+
+```cpp
+// scene/3d/visual_instance_3d.cpp:90-96
+case NOTIFICATION_TRANSFORM_CHANGED: {
+    if (_is_vi_visible() && !(is_inside_tree() && get_tree()->is_physics_interpolation_enabled()) && !_is_using_identity_transform()) {
+        RenderingServer::get_singleton()->instance_set_transform(instance, get_global_transform());
+    }
+} break;
+```
+
+**Godot 已经采用的优化**：
+- `physics_interpolation_enabled` 开启时，主线程**不立即推送** transform 到渲染线程
+- 取而代之，主线程缓存 `_cached_global_transform_interpolated`（`fti_update_servers_xform`）
+- 直到主线程空闲时（如 frame end）才推送渲染线程
+- 这本质上是"延迟批处理"策略
+
+**集中化的真实限制与权衡**：
+
+```mermaid
+flowchart TD
+    A["集中化提交 (批处理)"] --> B["优点"]
+    A --> C["缺点"]
+
+    B --> B1["命令数 1000 -> 1<br>MutexLock 减少 1000x"]
+    B --> B2["命令参数打包<br>减少内存分配"]
+    B --> B3["CPU 缓存友好<br>连续访问"]
+    B --> B4["避免队列满重分配"]
+
+    C --> C1["破坏 API 简洁性<br>主线程需手动管理批量"]
+    C --> C2["延迟更新可能导致<br>同一帧内数据不一致"]
+    C --> C3["同步语义变复杂<br>push_and_sync 难以实现"]
+    C --> C4["Multimesh 已覆盖<br>高频实例更新场景"]
+
+    style B fill:#e8f5e9
+    style C fill:#fff3e0
+```
+
+**结论**：
+
+1. **当前 Godot 设计倾向于"细粒度简单 API"**：每帧 1000+ set_transform 仍是 1000 次 push
+2. **高频实例更新场景已有专用路径**：`MultiMesh`、`GPUParticles3D` 走批处理
+3. **可以但难以推广**：通用脏标记 + batch API 需要修改 FUNC 宏和整个 RenderingServer 协议
+4. **工程权衡**：Godot 选择"简洁 API + 专用批处理"而非"通用批处理 API + 复杂协议"
+
+#### 5.6.8.3 渲染专用数据能否缓存到 Instance 中
+
+**当前 Instance 的数据结构**（`servers/rendering/renderer_scene_cull.h:401-490`）已经做了部分预计算：
+
+```cpp
+struct Instance {
+    RS::InstanceType base_type;
+    RID base;
+    Transform3D transform;             // 缓存：直接存储主线程传入的 transform
+    bool teleported = false;
+    float lod_bias;
+    bool ignore_occlusion_culling;
+    bool ignore_all_culling;
+    Vector<RID> materials;
+    RS::ShadowCastingSetting cast_shadows;
+    uint32_t layer_mask;
+    bool mirror : 1;
+    bool receive_shadows : 1;
+    bool visible : 1;
+    bool baked_light : 1;
+    bool dynamic_gi : 1;
+    bool redraw_if_visible : 1;
+
+    AABB aabb;
+    AABB transformed_aabb;             // 缓存：已计算好的世界空间 AABB
+    AABB prev_transformed_aabb;        // 缓存：上一帧的 transformed_aabb（用于 motion vector）
+
+    RID self;
+    float sorting_offset = 0.0;
+    bool use_aabb_center = true;
+
+    uint64_t last_frame_pass;
+    uint64_t version;
+    // ...
+};
+```
+
+`RenderGeometryInstanceBase`（`servers/rendering/renderer_geometry_instance.h:79-156`）已经有更多预计算字段：
+
+```cpp
+class RenderGeometryInstanceBase : public RenderGeometryInstance {
+public:
+    uint32_t base_flags = 0;       // 缓存：基础标志位
+    uint32_t flags_cache = 0;      // 缓存：渲染时使用的标志
+    float depth = 0;               // 缓存：渲染时计算的深度
+    RID mesh_instance;
+    Transform3D transform;         // 缓存：transform 副本
+    bool mirror = false;
+    AABB transformed_aabb;         // 缓存：变换后 AABB
+    bool non_uniform_scale = false;// 缓存：是否非均匀缩放（影响法线计算）
+    float lod_model_scale = 1.0;   // 缓存：LOD 缩放
+    float lod_bias = 0.0;          // 缓存：LOD 偏差
+    float sorting_offset = 0.0;
+    bool use_aabb_center = true;
+    uint32_t layer_mask = 1;
+    // fade_near/fade_far 等也都已缓存
+    int32_t shader_uniforms_offset = -1;
+    // ...
+};
+```
+
+**Godot 已经缓存的渲染专用数据**（`RenderGeometryInstanceBase`）：
+
+| 字段 | 计算时机 | 用途 |
+|------|---------|------|
+| `non_uniform_scale` | `set_transform` 时 | 决定法线是否需要特殊处理 |
+| `lod_model_scale` | `set_transform` 时 | LOD 选择阈值 |
+| `transformed_aabb` | `set_transform` 时 | 视锥剔除、阴影投射 |
+| `prev_transformed_aabb` | 上一帧 | Motion Vector |
+| `depth` | 渲染时（write to depth buffer 时）| 深度排序 |
+| `base_flags` / `flags_cache` | `set_transform` 和材质变更时 | 着色器变体选择 |
+| `sorting_offset` / `use_aabb_center` | `set_pivot_data` 时 | 透明物体排序 |
+
+**哪些渲染专用数据可以进一步缓存到 Instance 中**？
+
+**A. 可以缓存但尚未缓存的项**：
+
+```cpp
+// 1. 着色器排序键（material_key）— 渲染时计算
+struct Instance {
+    uint64_t material_sort_key = 0;  // 可缓存：materials/skeleton 变更时重算
+};
+
+// 2. 视锥剔除结果（cull_result）— 上一帧剔除结果可复用作 early-cull 提示
+struct Instance {
+    uint8_t last_cull_result = 0;    // IN/OUT/PARTIAL
+    AABB last_cull_frustum;          // 上一帧视锥
+};
+
+// 3. 阴影 LOD 决策（shadow_lod_level）— 阴影 pass 选择
+struct Instance {
+    int8_t shadow_lod_override = -1; // -1=auto, 0..3=lod level
+};
+
+// 4. 屏幕空间覆盖率（screen_coverage）— 用于 LOD 选择和遮挡剔除
+struct Instance {
+    float last_screen_coverage = 0;  // 上一帧像素覆盖率
+};
+
+// 5. 光源配对缓存（light_pair_cache）— 当前帧的光源 RID 列表
+struct Instance {
+    Vector<RID> cached_light_pairs;  // 上一帧配对结果，下一帧增量更新
+};
+```
+
+**B. 不能轻易缓存的项**：
+
+| 数据 | 原因 |
+|------|------|
+| **每帧光源配对结果** | 受 camera、light culling mask 动态影响 |
+| **屏幕空间坐标** | 每帧视口/camera 改变 |
+| **每像素着色结果** | 渲染产物，本身就不属于"Instance 级别" |
+| **LOD 选择** | 受 camera 距离、screen_coverage 实时影响（但可缓存 last frame） |
+| **遮挡剔除结果** | 场景动态变化，缓存可能失效 |
+| **裁剪后顶点** | GPU 端数据，CPU 缓存收益小 |
+
+**C. 与 UE SceneProxy 缓存的对比**：
+
+| 缓存项 | UE FPrimitiveSceneProxy | Godot Instance/GeometryInstance |
+|--------|------------------------|--------------------------------|
+| transform 副本 | ✓ | ✓ |
+| transformed_aabb | ✓ | ✓ |
+| 上一帧 transform（motion）| ✓ | ✓ (prev_transformed_aabb) |
+| 标志位缓存 | ✓ | ✓ (base_flags/flags_cache) |
+| LOD scale | ✓ | ✓ (lod_model_scale) |
+| 排序键 | ✓ | ✗ (每次渲染重算) |
+| 光源配对缓存 | ✓ | ✗ (每帧重新 pair_light_instance) |
+| 屏幕覆盖率 | ✓ | ✗ |
+| 静态光照/反射快照 | ✓ | △ (lightmap_sh 已存) |
+| 阴影 LOD 决策 | ✓ | ✗ |
+
+**为什么 Godot 选择"轻缓存"策略**：
+
+```mermaid
+flowchart LR
+    A["缓存更多数据"] --> B["好处"]
+    A --> C["代价"]
+
+    B --> B1["减少渲染时计算<br>提高帧率"]
+    B --> B2["SceneProxy 模式<br>可以预排序"]
+
+    C --> C1["Instance 体积膨胀<br>100万实例 = 100MB+ 内存"]
+    C --> C2["缓存维护成本<br>数据失效逻辑复杂"]
+    C --> C3["同步点增加<br>设置 transform 时<br>可能要更新缓存"]
+    C --> C4["RID_Owner 增长<br>Instance 生命周期管理复杂"]
+    C --> C5["RID 是只读句柄<br>外部无法直接修改缓存"]
+
+    style B fill:#e8f5e9
+    style C fill:#fff3e0
+```
+
+**具体原因**：
+
+1. **RID 句柄模式的数据所有权限制**：
+   - Instance 由 `RID_Owner<Instance>` 管理，外部访问必须通过 RID 查找
+   - 缓存数据增多意味着每次 set_transform 都要计算更多派生字段（`non_uniform_scale`、`lod_model_scale` 等已经这样做）
+   - 缓存失效逻辑分散在每个 set_* 方法中
+
+2. **Godot 的批量优化已通过 MultiMesh 实现**：
+   - 单实例场景下，缓存收益小（100 实例不值得）
+   - 大规模场景通过 MultiMesh 处理，10000 个实例共享 1 个 Mesh，缓存只对"渲染 Mesh 自身"做
+   - 实质上 MultiMesh 的 Mesh 部分充当了"轻量 SceneProxy"
+
+3. **渲染线程已足够快**：
+   - 每帧的 AABB 更新、视锥剔除、深度排序在 GPU 端很便宜
+   - 现代 GPU 的 tile-based 渲染和早-Z 优化减少了 CPU 端排序收益
+   - Godot 优先保证简单性而非极限性能
+
+4. **缓存会导致 RID 句柄与主线程数据脱钩**：
+   - UE 的 SceneProxy 在渲染线程，缓存可以独立维护
+   - Godot 的 Instance 在 RID_Owner 中，主线程访问需要 lock 或 find
+   - 在 Instance 上缓存大量数据会让"主线程 set 立即可见"这个特性消失
+
+**结论**：
+
+- **当前设计已经做了适度的渲染专用数据缓存**（`non_uniform_scale`、`transformed_aabb` 等）
+- **可以进一步缓存**（material_sort_key、screen_coverage、light_pair_cache 等）但需要权衡：
+  - 收益：减少渲染时计算 1-5%
+  - 代价：Instance 体积膨胀、缓存失效逻辑复杂、RID 句柄访问变慢
+- **MultiMesh 路径上已经做得好**：1000+ 实例的 batch update 不需要逐 Instance 缓存
+- **不推荐简单照搬 UE SceneProxy 模式**：
+  - Godot 的 RID 句柄模式有自身的简洁性优势
+  - 缓存应该按"对热路径贡献大"的项逐项添加
+  - 保持 RID_Owner 内存占用可控
+
+**实际优化建议**：
+
+```cpp
+// 推荐：在 Instance 中增加轻量级缓存（仅必要项）
+struct Instance {
+    // ... 已有字段 ...
+
+    // 1. 排序键（仅 8 字节，热路径用）
+    uint64_t material_sort_key = 0;
+
+    // 2. 上一帧剔除结果（仅 1 字节，遮挡剔除优化）
+    uint8_t last_cull_result = 0;
+
+    // 3. 静态/动态分类（仅 1 位，决定是否参与 lightmap 计算）
+    bool is_static : 1;
+};
+```
+
+不建议：
+
+```cpp
+// 反例：缓存每帧都变的数据（如光源配对）会引入复杂的状态机
+struct Instance {
+    Vector<RID> cached_light_pairs;  // ← ❌ 维护成本高、收益有限
+    float last_screen_coverage;     // ← ❌ 数据变化频繁
+};
+```
+
 ## 6. 各子系统线程归属
 
 ### 6.1 详细线程归属表
