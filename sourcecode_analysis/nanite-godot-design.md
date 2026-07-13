@@ -16,6 +16,7 @@
 4. [方案二:独立 C++ Module](#4-方案二独立-c-module)
 5. [方案三:深度引擎改造](#5-方案三深度引擎改造)
 6. [三方案横向对比与推荐实施路径](#6-三方案横向对比与推荐实施路径)
+7. [Nanite 与 Godot 阴影/Forward 渲染的搭配](#7-nanite-与-godot-阴影forward-渲染的搭配)
 
 ---
 
@@ -1138,6 +1139,387 @@ flowchart LR
 | `nanite_material_eval.glsl` | compute(8x8) | visbuffer, vertex_pool, materials, G-buffer | shaded color per pixel |
 | `nanite_composite.glsl` | compute(8x8) | shaded color | main color attachment |
 | `nanite_shadow_cull.glsl` | compute(64) | instance/node buffers, light view-proj | indirect draw args for shadow depth |
+
+## 7. Nanite 与 Godot 阴影/Forward 渲染的搭配
+
+本节专门讨论 Nanite 在 **Forward+(及 Mobile)** 渲染管线中如何与**标准 Forward 几何**、**阴影渲染**正确共存,核心问题是: Nanite 走自己的 GPU-Driven 流水线,而 Godot 原生 mesh 仍走标准 forward + shadow pass;两类几何必须共享同一份 shadow atlas / G-Buffer / 光照数据,避免互相覆盖或漏绘。
+
+### 7.1 Godot 阴影/Forward 渲染管线现状(源码依据)
+
+`RenderForwardClustered::_render_scene`(`servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.cpp:1704`)整体顺序:
+
+```
+_render_scene
+├─ _update_sdfgi / voxel_gi_setup        (GI 准备)
+├─ _render_shadow_begin                   (清空 SECONDARY list)
+│   ├─ for cube_shadows:    _render_shadow_pass(...)   // OmniLight cube shadow 单独处理
+│   ├─ update_directional_shadow_atlas (clear depth)
+│   ├─ _render_shadow_begin()
+│   ├─ for directional_shadows: _render_shadow_pass(...) // PSSM 多 split
+│   ├─ for positional_shadows: _render_shadow_pass(...)  // SpotLight
+│   ├─ _render_shadow_process()                          // _fill_render_list(SECONDARY) + _fill_instance_data
+│   └─ _render_shadow_end()                              // _render_list_with_draw_list → 写 depth
+│       ‖ (与 GI 并行)
+├─ gi.process_gi                          (SDFGI / VoxelGI)
+├─ _update_volumetric_fog
+├─ _process_ssao / _process_ssr / _process_ssil
+├─ current_cluster_builder->bake_cluster()                // clustered lighting grid
+├─ _renderOpaqueForward(p_render_data, ...)              // 标准 forward 不透明
+│   ‖ 触发 CompositorEffect: BEFORE_OPAQUE_PASS / AFTER_OPAQUE_PASS
+├─ _render_sky / _render_sky_fog
+├─ _render_transparent
+└─ post-process (TAA / DOF / Bloom / Tonemap ...)
+```
+
+阴影 pass 内部(`_render_shadow_append`,`render_forward_clustered.cpp:2806`):
+1. 用光视图 `light_projection` / `light_transform` 构造 `RenderSceneDataRD`(标记 `shadow_pass=true`);
+2. 调用 `_fill_render_list(RENDER_LIST_SECONDARY, ..., PASS_MODE_SHADOW, ...)`,把所有可能投阴影的实例填入次级渲染列表;
+3. `_fill_instance_data` 写顶点 uniform;
+4. `_render_shadow_end` 遍历每个 ShadowPass,用 `_render_list_with_draw_list` 把深度写入光对应的 atlas 区域(directional 走 `direction_shadow_get_fb()`,spot/omni 走 shadow atlas 的子矩形或 cubemap face)。
+
+**关键约束**:
+- 阴影 pass 在主相机渲染**之前**执行,所以 Nanite 的"运行时 BVH 遍历 + LOD 选择"如果只为相机视图做一次,那么阴影光视图下看不到 Nanite 的精确几何,会丢阴影;
+- 阴影 atlas 总尺寸受限(默认 Forward+ 可到 16384),Nanite 高密度 mesh 全量写入会爆;
+- `_fill_render_list` 是 CPU 端遍历实例的,没有 BVH/cluster 信息,Nanite 实例需要被旁路。
+
+### 7.2 搭配总原则
+
+| 资源 | 共享/独立 | 说明 |
+|---|---|---|
+| `shadow_atlas` / directional shadow FB | **共享** | Nanite 必须写入同一个 atlas,否则 forward pass 的 `light_instance_get_shadow_atlas_rect` 采样落空 |
+| Light buffer / cluster grid | **共享** | Nanite shading 阶段读同一份 `LightData` + `cluster_builder` |
+| Depth buffer(主相机) | **共享** | Nanite 软光栅/硬光栅都要写主 depth,供 SSAO/SSIL/SSR/SSS 使用 |
+| Visibility Buffer | **独立(Nanite 专属)** | 仅 Nanite 写;主 forward 不读 |
+| Geometry instance 列表 | **分流** | Nanite 实例从 `_fill_render_list` 中排除,改由 NaniteStorage 自己处理 |
+| Material pipeline | **共享(方案三)/独立(方案一二)** | 见 7.5 |
+
+### 7.3 类图 — 阴影/Forward 搭配
+
+```mermaid
+classDiagram
+    class RenderForwardClustered {
+        +_render_scene(RenderDataRD)
+        +_render_shadow_begin/append/process/end
+        +_renderOpaqueForward(...)
+        -_fill_render_list(list, render_data, pass_mode, ...)
+        +_compositor_effects_has_flag(...)
+    }
+    class RenderGeometryInstance {
+        +bool nanite_flag  // 新增标记
+    }
+    class RendererSceneCull {
+        +_collect_instances_for_shadow(light, PagedArray)
+        +_collect_instances_for_camera(PagedArray)
+        +instance_set_nanite(RID, bool)
+    }
+    class RendererNaniteStorageRD {
+        +update_instance_transforms(instances)
+        +render_for_camera(render_data)
+        +render_for_shadow(render_data, light, shadow_pass_index)
+        +request_pages_for_view(light_view_frustum)
+    }
+    class PageCache {
+        +request_pages(page_ids)
+        +flush_to_gpu(RD)
+    }
+    class LightStorage {
+        +shadow_atlas_get_size()
+        +shadow_atlas_get_quadrant_rect()
+        +direction_shadow_get_fb()
+        +light_instance_get_shadow_camera(light, pass)
+        +light_instance_get_shadow_transform(light, pass)
+    }
+    class ClusterBuilder {
+        +begin(cam_transform, cam_projection)
+        +bake_cluster()
+    }
+
+    RenderForwardClustered ..> RendererSceneCull : pulls instances
+    RenderForwardClustered ..> LightStorage : shadow atlas / light data
+    RenderForwardClustered ..> ClusterBuilder : light grid
+    RendererSceneCull --> RenderGeometryInstance : flags nanite
+    RenderForwardClustered --> RendererNaniteStorageRD : delegates nanite
+    RendererNaniteStorageRD --> LightStorage : reads shadow camera/rect
+    RendererNaniteStorageRD --> PageCache : page-in
+```
+
+### 7.4 渲染管线流程 — Nanite 与阴影/Forward 共存
+
+下面流程图描述了**方案三(深度改造)**下的完整 pass 顺序(方案一/二在 `CompositorEffect` 钩子内做相同工作,只是位置不能插入到阴影 pass 内部,见 7.6)。
+
+```mermaid
+flowchart TD
+    A[RendererSceneCull::render_camera] --> B[Collect instances<br/>split: standard / nanite]
+    B --> S0[For each shadow light:<br/>cull instances vs light frustum]
+    S0 --> S1{_render_shadow_begin}
+    S1 --> S2[For standard instances:<br/>_fill_render_list SECONDARY]
+    S2 --> S3[For nanite instances:<br/>_nanite_render_shadow_pass per light]
+    S3 --> S3a[Compute: BVH cull vs light frustum<br/>use light_transform as camera]
+    S3a --> S3b[Compute: shadow LOD select<br/>higher error threshold (coarser)]
+    S3b --> S3c[Compute: page-request for shadow-visible clusters]
+    S3c --> S3d[Draw indirect: depth-only pipeline<br/>write into SAME shadow atlas rect]
+    S3d --> S4[_render_shadow_process / _render_shadow_end]
+
+    S4 --> M0[_render_scene main body]
+    M0 --> M1[_update_sdfgi / gi.process_gi]
+    M1 --> M2[ssao / ssil / ssr]
+    M2 --> M3[cluster_builder.bake_cluster<br/>for forward lighting]
+    M3 --> M4[CompositorEffect BEFORE_OPAQUE_PASS]
+    M4 --> M4a[Nanite cull pass<br/>BVH traversal from camera view]
+    M4a --> M4b[Nanite page-request]
+    M4b --> M4c[Nanite raster visibility buffer<br/>硬光栅 + compute 软光栅]
+    M4c --> M4d[Nanite build HZB from current depth<br/>for next frame occlusion]
+    M4d --> M5[_renderOpaqueForward<br/>standard instances only]
+    M5 --> M6[CompositorEffect AFTER_OPAQUE_PASS]
+    M6 --> M6a[Nanite material eval pass<br/>shade VisBuffer pixels using shared light buffer]
+    M6a --> M6b[Composite nanite shaded color<br/>into main color attachment]
+    M6b --> M7[_render_sky / volumetric_fog]
+    M7 --> M8[_render_transparent<br/>standard transparent<br/>+ nanite two-sided transparent fallback]
+    M8 --> M9[post-process: TAA / DOF / Bloom / Tonemap]
+    M9 --> Z[Present]
+```
+
+### 7.5 阴影路径的细节
+
+#### 7.5.1 Nanite 阴影的 BVH 遍历差异
+
+相机视图和光视图使用**同一份 BVH**,但参数不同:
+
+| 参数 | 相机视图 | 光视图(阴影) |
+|---|---|---|
+| `view_proj` | 主相机 | `light_instance_get_shadow_camera/transform` |
+| `error_threshold` | 用户设置(默认 ≈ 1 像素) | 放大 N 倍(如 4-8 像素),降低阴影几何面数 |
+| `screen_scale` | 基于主相机投影 | 基于光视图投影 + shadow map 分辨率 |
+| HZB 遮挡剔除 | 用上一帧 HZB | 通常**关闭**(阴影光视图不需要遮挡剔除,所有可见物都需投阴影) |
+| Page 请求 | 高优先级 | 与相机视图合并,共享同一 page cache(避免重复加载) |
+| 输出 | `visibility_buffer` | 直接写 `shadow_atlas` 的 depth attachment |
+
+#### 7.5.2 PSSM 多 split 处理
+
+方向光的 `LIGHT_DIRECTIONAL_SHADOW_PARALLEL_4_SPLITS` 会调用 `_render_shadow_pass` 4 次,每次光视图不同。Nanite 需要在**每个 split 内独立做一次 BVH 遍历**,但可以利用:
+
+- 同一帧的 4 次遍历共用一个 `visible_cluster_buffer`,只是分段;
+- 第二个 split 起可重用上一 split 已 page-in 的 cluster,减少磁盘 IO。
+
+#### 7.5.3 阴影 shader — 仅写 depth
+
+Nanite 的 shadow pipeline 不需要材质/纹理,只需把顶点变换到光裁剪空间并写深度:
+
+```glsl
+// nanite_shadow.vert.glsl
+#[vertex]
+#version 450
+layout(set=0,binding=0,std430) readonly buffer Vertices { float v[]; } vertices;
+layout(set=0,binding=1,std430) readonly buffer Clusters { Cluster c[]; } clusters;
+layout(set=0,binding=2,std430) readonly buffer VisibleList { uint cluster_ids[]; } visible;
+layout(set=0,binding=3) uniform LightData { mat4 light_view_proj; };
+layout(push_constant) uniform PC { uint draw_id; };
+
+void main() {
+    uint cluster_id = visible.cluster_ids[draw_id];  // 由 indirect args 索引
+    Cluster cl = clusters.c[cluster_id];
+    uint local_vidx = gl_VertexIndex;
+    uint vidx = cl.vertex_offset + local_vidx;
+    vec3 pos = vec3(vertices.v[vidx*3+0], vertices.v[vidx*3+1], vertices.v[vidx*3+2]);
+    // instance transform 通过 InstanceData push
+    gl_Position = light_view_proj * instance_transform * vec4(pos, 1.0);
+}
+```
+
+```glsl
+// nanite_shadow.frag.glsl — 空,只写 depth
+#[fragment]
+#version 450
+void main() {}
+```
+
+#### 7.5.4 阴影的 LOD 简化策略
+
+为避免高密度 mesh 在阴影里也按 1 像素精度采样,Nanite 阴影用**更粗 LOD**:
+
+```glsl
+// 在 nanite_shadow_cull.glsl 中
+float shadow_error_threshold = camera_error_threshold * 4.0;  // 阴影可粗 4 倍
+// 同时把 screen_scale 换成基于 shadow map texel 的尺度
+float texel_scale = shadow_map_size / (world_aabb_size / distance_to_light);
+bool on_cut = node.error * texel_scale <= shadow_error_threshold;
+```
+
+这样阴影 cluster 数量可降到相机视图的 1/4 ~ 1/8,避免 shadow atlas 爆炸。
+
+### 7.6 三套方案下阴影搭配的差异
+
+#### 方案一(GDExtension)
+- **入口限制**:`CompositorEffect` 仅暴露 `BEFORE_OPAQUE_PASS` / `AFTER_OPAQUE_PASS` / `BEFORE_POST` / `AFTER_POST` 等,**没有阴影 callback**;
+- **后果**:无法在引擎 shadow pass 内插入 Nanite shadow;
+- **变通办法**:
+  1. 在 `BEFORE_OPAQUE_PASS` 中,如果检测到场景有方向光/聚光开阴影,**自己跑一遍 Nanite shadow cull + 写 depth 到独立 RT,然后把它作为 shadow sampler 注入材质**(自定义材质系统);
+  2. 或者**让 Nanite 实例 `cast_shadow=false`**,接受"Nanite 不投阴影"的限制(原型阶段常用);
+  3. 在 `_render_callback` 内通过 `RenderingDevice::draw_list_begin(light_storage->direction_shadow_get_fb())` 直接拿到 shadow atlas FB 并自己绘制(依赖内部 RID 通过 friend/反射拿,不保证跨版本稳定)。
+- **推荐**:原型阶段用 (2),正式生产用 (1)。
+
+#### 方案二(C++ Module)
+- 同样没有阴影 callback,但模块**可直接访问 `LightStorage` 的内部 RID**(`direction_shadow_get_fb()` / `shadow_atlas_get_quadrant_rect()`),且可在 `_render_scene` 调用前 hook 一个内部 "before shadow" 钩子;
+- 实现上,让 `NaniteRenderStepRD` 提供 `pre_shadow_pass(render_data, light, pass_index)`,在 `RendererSceneCull::_render_camera` 收集 shadow instances 后、调 `_render_shadow_pass` 前调用;
+- 这样 Nanite 阴影能与标准阴影共享同一个 atlas 区域,无缝集成。
+
+#### 方案三(深度改造)
+- 在 `RenderForwardClustered::_render_shadow_pass` 内部追加:
+
+```cpp
+void RenderForwardClustered::_render_shadow_pass(...) {
+    // ... 原有 setup atlas_rect / render_fb / light_transform ...
+
+    // 标准 mesh 部分(原代码)
+    _render_shadow_append(render_fb, p_instances, light_projection, light_transform,
+                          zfar, 0, 0, reverse_cull_face, using_dual_paraboloid,
+                          using_dual_paraboloid_flip, use_pancake, ...);
+
+    // 新增:Nanite 部分 — 把 Nanite 实例从 p_instances 中分流后单独处理
+    if (p_render_data->has_nanite_instances) {
+        _nanite_render_shadow_pass(p_render_data, p_light, p_pass,
+                                   light_projection, light_transform,
+                                   atlas_rect, render_fb);
+    }
+}
+```
+
+`_nanite_render_shadow_pass` 内部:
+
+```cpp
+void RenderForwardClustered::_nanite_render_shadow_pass(
+        RenderDataRD *p_render_data, RID p_light, int p_pass,
+        const Projection &p_light_projection, const Transform3D &p_light_transform,
+        const Rect2i &p_atlas_rect, RID p_render_fb) {
+    RenderingDevice *rd = RenderingDevice::get_singleton();
+    NaniteStorage *ns = RSG::nanite_storage;
+
+    // 1. 把光视图打包到 instance uniform(只更新本光的)
+    ns->update_shadow_view_uniform(p_light, p_pass, p_light_projection, p_light_transform);
+
+    // 2. compute: BVH 遍历(光视图) + 阴影 LOD select + 间接参数
+    rd->draw_command_begin_label("Nanite Shadow Cull");
+    RID cs = nanite_shader.shadow_cull_pipeline;
+    rd->compute_list_begin();
+    rd->compute_list_bind_compute_pipeline(cs);
+    ns->bind_shadow_cull_uniform_set(rd, /*set=*/0);
+    rd->compute_list_dispatch((ns->get_instance_count() + 63) / 64, 1, 1);
+    rd->compute_list_end();
+    rd->draw_command_end_label();
+
+    // 3. draw indirect: depth-only pipeline → 写同一份 render_fb
+    RID ds_pipeline = nanite_shader.shadow_depth_pipeline;
+    rd->draw_list_begin(p_render_fb, RD::DRAW_DEFAULT_ALL,  // 不 clear,继承标准 mesh 写入
+                        Vector<Color>(), 0.0f, 0, p_atlas_rect);
+    rd->draw_list_bind_render_pipeline(ds_pipeline);
+    ns->bind_shadow_draw_uniform_set(rd, /*set=*/0);
+    rd->draw_list_bind_index_array(ns->get_index_array_rid());
+    rd->draw_list_draw_indirect(ns->get_shadow_indirect_args_rid(), /*count=*/ns->get_material_count());
+    rd->draw_list_end();
+}
+```
+
+### 7.7 时序图 — Nanite + 阴影 + Forward 协同一帧
+
+```mermaid
+sequenceDiagram
+    participant App as Application
+    participant Cull as RendererSceneCull
+    participant FC as RenderForwardClustered
+    participant LS as LightStorage
+    participant NS as NaniteStorage
+    participant PC as PageCache
+    participant RD as RenderingDevice
+
+    App->>Cull: render_camera()
+    Cull->>Cull: split instances: std / nanite
+    Cull->>LS: collect shadow lights + their instance lists
+
+    Note over FC,LS: ===== 阴影阶段(每个光) =====
+    FC->>FC: _render_shadow_begin()
+    loop each shadow light
+        FC->>FC: _render_shadow_pass(light, pass)
+        FC->>FC: _render_shadow_append → _fill_render_list(SECONDARY, std only)
+        FC->>NS: _nanite_render_shadow_pass(light, pass, light_proj, atlas_rect, fb)
+        NS->>NS: update shadow view uniform
+        NS->>RD: compute: nanite_shadow_cull.glsl (BVH + LOD coarse)
+        NS->>RD: compute: nanite_page_request.glsl
+        par Async page-in (shared with camera pass)
+            NS->>PC: request_pages
+            PC->>PC: Thread: read .nanite
+            PC->>RD: staging buffer (next frame copy)
+        end
+        NS->>RD: draw_list_begin(same shadow fb, no clear)
+        NS->>RD: draw_list_draw_indirect(depth-only pipeline)
+        NS->>RD: draw_list_end
+    end
+    FC->>FC: _render_shadow_process / _render_shadow_end
+
+    Note over FC,NS: ===== 主相机阶段 =====
+    FC->>FC: _update_sdfgi / GI / SSAO / SSR
+    FC->>FC: cluster_builder.bake_cluster (light grid)
+    FC->>FC: CompositorEffect BEFORE_OPAQUE_PASS
+    FC->>NS: render_for_camera(render_data)
+    NS->>NS: update camera instance transforms
+    NS->>RD: compute: nanite_cull.glsl (BVH from camera, HZB occlusion)
+    NS->>RD: compute: nanite_page_request.glsl
+    NS->>RD: draw_list_begin(visbuffer FB)
+    NS->>RD: draw_list_draw_indirect (hard raster)
+    NS->>RD: draw_list_end
+    NS->>RD: compute: nanite_soft_raster.glsl (small tris)
+    NS->>RD: compute: nanite_hzb_build.glsl (for next frame)
+    FC->>FC: _renderOpaqueForward(std instances only)
+    FC->>FC: CompositorEffect AFTER_OPAQUE_PASS
+    FC->>NS: material_eval(render_data)
+    NS->>RD: compute: nanite_material_eval.glsl<br/>(reads shared LightData + cluster grid)
+    NS->>RD: compute: composite_into_main_color.glsl
+    FC->>FC: _render_sky / volumetric_fog
+    FC->>FC: _render_transparent (std + nanite fallback)
+    FC->>FC: post-process
+    FC-->>Cull: done
+    Cull-->>App: rendered
+```
+
+### 7.8 透明物体与特殊场景
+
+| 场景 | 处理 |
+|---|---|
+| **透明 Nanite mesh** | Nanite 原生不适合 alpha-blend。降级方案:对 `transparency != ALPHA_DISABLED` 的材质,Nanite 自动 fallback 到标准 mesh(把该 surface 标 `SURFACE_STANDARD`),走 forward transparent pass |
+| **双面材质 / Alpha Scissor** | 在 `nanite_material_eval.glsl` 内 `discard`,与标准 ShaderMaterial 一致;VisBuffer 写入时也做 alpha-test |
+| **Decal / FogVolume** | 不影响 Nanite — Decal 在 forward 后处理时基于 depth buffer 投影,Nanite 已写 depth,自然支持 |
+| **SSS / SSSS** | 走标准 forward 的 SSS 路径会把 Nanite 当不透明物体处理;方案三需让 Nanite shading 写入 SSS 通道 |
+| **VoxelGI 烘焙** | VoxelGI 需要把场景体素化。Nanite mesh 应在 bake 时提供"低 LOD 代表几何"(error 阈值放大 16x),避免大量三角形撑爆体素化 |
+| **SDFGI** | SDFGI 基于场景 SDF;Nanite mesh 需参与 SDF 烘焙(同样用低 LOD 代表) |
+
+### 7.9 性能/正确性注意事项
+
+1. **实例分流时机**:`RendererSceneCull` 在收集 `render_shadows[i].instances` 时就应分流,否则标准 shadow pass 会误把 Nanite 实例当普通 mesh 渲染(导致绘制两遍);
+2. **Page cache 共享**:相机视图和光视图的 page 请求必须去重,否则同一 page 被加载两次;
+3. **HZB 复用**:主相机的 HZB 在同一帧可被 Nanite 多次 BVH 遍历复用,避免重复构建;
+4. **Indirect args buffer 复用**:阴影和相机的 indirect args buffer 应分开(尺寸不同),但可见 cluster buffer 可共用(都按 cluster_id 索引);
+5. **Mobile renderer**:Mobile 不支持软光栅(compute shader 受限),Nanite 在 Mobile 下应**自动降级**为仅硬光栅 + 标准 LOD(跳过 VisBuffer,直接走 forward);即 Mobile 不开 Nanite;
+6. **Compatibility renderer**(OpenGL):不支持 Nanite,自动 fallback 到标准 mesh;
+7. **阴影 atlas 尺寸**:Nanite 阴影几何虽用粗 LOD,但 cluster 数仍可能很大;建议提供项目设置 `nanite/shadow/max_clusters_per_light`,超过则按距离丢弃远 cluster;
+8. **阴影 acne**:Nanite 阴影用同一 bias 系数;但因其顶点是 LOD 简化版本,几何位置有误差,**建议阴影 bias 比标准 mesh 放大 1.5x**,或基于 cluster error 动态调整。
+
+### 7.10 小结
+
+| 渲染阶段 | Nanite 参与 | 标准 Forward 参与 | 共享资源 |
+|---|---|---|---|
+| Shadow pass | ✅(方案二三) / ⚠️(方案一需变通) | ✅ | shadow_atlas, LightStorage |
+| GI bake / update | ✅(用低 LOD 代表) | ✅ | voxel volume, SDF |
+| Cluster lighting bake | ❌(由 forward 消费) | ✅ | cluster grid |
+| Depth prepass | ✅(写主 depth) | ✅ | depth attachment |
+| BEFORE_OPAQUE cull + VisBuffer | ✅ | ❌ | instance buffer |
+| Opaque forward | ❌(由 Nanite material eval 替代) | ✅ | color attachment |
+| AFTER_OPAQUE material eval + composite | ✅ | ❌ | color, light, cluster grid |
+| Sky / fog | ❌ | ✅ | — |
+| Transparent | ⚠️ fallback 到标准 mesh | ✅ | color, depth |
+| Post-process | ❌(自动消费) | ✅ | color, motion vectors |
+
+核心结论:**Nanite 与 Forward+ 共存的关键是"几何分流 + 资源共享"** — 几何上让 Nanite 完全接管自己实例的可见性/着色,而所有光照/阴影/深度 buffer/GI 体素则与标准 forward 共享同一份,这样既不破坏 Godot 现有材质/光照系统,又能拿到 Nanite 的细节优势。
+
+---
 
 ## 附录 B:资源文件格式(序列化)
 
