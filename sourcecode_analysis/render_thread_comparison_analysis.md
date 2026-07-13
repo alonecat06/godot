@@ -709,7 +709,310 @@ flowchart TD
     style F1 fill:#ffcdd2
 ```
 
-## 8. 详细功能对比表
+## 8. 渲染对象对应关系详解
+
+本节将 Godot 的 RD / draw_list / RenderingDeviceDriver 与 UE 的 FMeshBatch / FMeshDrawCommand / FRHICommandList 逐层对应，帮助理解两个引擎在"渲染数据结构与 GPU 命令编码"这一层的异同。
+
+### 8.1 概念层次对应
+
+| 概念层次 | Godot 对应 | UE 对应 | 说明 |
+|---------|-----------|---------|------|
+| **可见性判断结果** | `RenderList<GeometryInstanceSurfaceDataCache*>` | `FMeshElementArray` / `FMeshBatch` | 单个可绘制单元 |
+| **完整绘制批次** | `GeometryInstanceSurfaceDataCache` | `FMeshBatch` | 一组材质 + 顶点 + 索引 |
+| **PSO + 参数** | `RID Pipeline` + `RID UniformSet` | `FMeshDrawCommand` | 完整 GPU 绘制命令 |
+| **命令编码器** | `DrawList`（RD 内部） | `FRHICommandList` | 记录命令 |
+| **命令缓存** | `InstructionList` → `RecordedDrawListCommand` | `FRHICommandList` 内部缓冲 | 中间表示 |
+| **图 / 调度器** | `RenderingDeviceGraph` | `FRDGBuilder` | 命令编排 |
+| **底层驱动** | `RenderingDeviceDriver` (RDD) | `FRHICommandList` 执行（Vulkan/D3D12 RHI） | GPU 原生调用 |
+
+### 8.2 渲染数据结构对应类图
+
+```mermaid
+classDiagram
+    class GeometryInstanceSurfaceDataCache {
+        +GeometryInstanceForwardClustered owner
+        +RID material_uniform_set
+        +RID material_uniform_set_shadow
+        +ShaderData shader
+        +void surface
+        +uint32_t flags
+        +int32_t instance_count
+        +SortKey sort_key
+        +bool active
+    }
+    class RenderList {
+        +LocalVector~GeometryInstanceSurfaceDataCache~ elements
+        +uint32_t element_count
+    }
+    class DrawList {
+        +LocalVector~uint8_t~ draw_instructions
+        +RDD::RenderPassID driver_render_pass
+        +int32_t current_subpass
+        +Rect2i viewport
+    }
+    class InstructionList {
+        +LocalVector~uint8_t~ data
+        +LocalVector~ResourceTracker~ command_trackers
+        +LocalVector~ResourceUsage~ command_tracker_usages
+    }
+    class RecordedDrawListCommand {
+        +InstructionList instruction_list
+        +uint32_t framebuffer_format
+        +RDD::RenderPassID render_pass
+        +Rect2i viewport
+    }
+    GeometryInstanceSurfaceDataCache --> RenderList : 加入
+    DrawList --> InstructionList : 序列化
+    InstructionList <|-- RecordedDrawListCommand
+```
+
+```mermaid
+classDiagram
+    class FMeshBatch {
+        +FVertexFactory VertexFactory
+        +FMeshBatchElement Elements
+        +uint32_t NumElements
+        +FMaterialRenderProxy MaterialRenderProxy
+        +int32_t LODLevel
+        +uint32_t bWireframe
+    }
+    class FMeshBatchElement {
+        +uint32_t NumInstances
+        +uint32_t FirstIndex
+        +uint32_t NumPrimitives
+        +FIndexBuffer IndexBuffer
+        +FUniformBufferRHIRef InstancedShaderResourceData
+    }
+    class FMeshDrawCommand {
+        +FMeshBatch MeshBatch
+        +FGraphicsPipelineStateInitializer PipelineState
+        +TArray VertexStreams
+        +TArray VertexBuffers
+        +FUniformBufferRHIRef SceneUniforms
+        +FUniformBufferRHIRef ViewUniforms
+    }
+    class FRHICommandList {
+        +TArray Commands
+        +SetViewport()
+        +SetGraphicsPipelineState()
+        +SetStreamSource()
+        +DrawIndexedPrimitive()
+    }
+    class FMeshPassProcessor {
+        +AddMeshBatch(FMeshBatch Mesh)
+        +CreateMeshDrawCommand()
+        +BuildMeshDrawCommands()
+    }
+    FMeshBatch --> FMeshBatchElement : contains
+    FMeshPassProcessor --> FMeshDrawCommand : creates
+    FMeshDrawCommand --> FMeshBatch : references
+    FMeshDrawCommand --> FRHICommandList : encodes to
+```
+
+**关键对应关系**：
+- `GeometryInstanceSurfaceDataCache` ↔ `FMeshBatch`：都是"一个可绘制面片"的数据载体
+- `RenderList` ↔ `FMeshPassProcessor` 输出的 `FMeshDrawCommand` 列表：都是 Pass 的可绘制集合
+- `DrawList`（RD 内部） ↔ `FRHICommandList`：都是命令编码器
+- `InstructionList` ↔ `FRHICommand` 数组：都是中间命令表示
+
+### 8.3 命令编码流程对应时序图
+
+```mermaid
+sequenceDiagram
+    participant GCull as Godot SceneCull
+    participant GList as Godot RenderList
+    participant GSurf as GeometryInstanceSurfaceDataCache
+    participant GDrawList as RD DrawList
+    participant GRDG as RenderingDeviceGraph
+    participant GRDD as RenderingDeviceDriver
+
+    participant UProxy as UE SceneProxy
+    participant UProc as FMeshPassProcessor
+    participant UDraw as FMeshDrawCommand
+    participant URHI as FRHICommandList
+    participant URHIThread as RHI Thread
+
+    Note over GCull,GRDD: === Godot: 渲染线程内串行 ===
+
+    GCull->>GList: _fill_render_list
+    GList->>GSurf: 遍历 GeometryInstance.surface_cache
+    GSurf->>GSurf: 排序 (sort_key: material, depth, ...)
+    GCull->>GDrawList: RD::draw_list_begin(framebuffer)
+
+    loop 每个 surface
+        GDrawList->>GDrawList: bind_pipeline(shader_pipeline)
+        Note over GDrawList: 序列化到 InstructionList.data
+        GDrawList->>GDrawList: bind_uniform_set(material_ub)
+        GDrawList->>GDrawList: bind_vertex_buffers(vb)
+        GDrawList->>GDrawList: draw_indexed(index_count, instance_count)
+    end
+
+    GDrawList->>GRDG: draw_list_end → RecordedDrawListCommand
+    Note over GRDG: _add_command_to_graph<br>屏障 + 排序
+    GRDG->>GRDD: command_buffer_begin
+    GRDG->>GRDD: render_pass_begin
+    GRDG->>GRDD: pipeline_barrier
+    GRDG->>GRDD: bind_pipeline
+    GRDG->>GRDD: bind_uniform_set
+    GRDG->>GRDD: bind_vertex_buffers
+    GRDG->>GRDD: draw_indexed
+    GRDG->>GRDD: render_pass_end
+    GRDG->>GRDD: command_buffer_end
+    GRDD->>GRDD: queue_submit
+
+    Note over UProxy,URHIThread: === UE: 三线程并行 ===
+
+    UProxy->>UProc: GetMeshBatch()
+    UProc->>UProc: BuildMeshDrawCommands
+    UProc->>UDraw: CreateMeshDrawCommand
+    Note over UDraw: 含 PSO + VertexStream + IndexBuffer<br>+ UniformBuffers + SortKey
+    UDraw->>UDraw: SetupForDraw(FRHICommandList)
+
+    Note over URHI: Render Thread 编码
+    UDraw->>URHI: SetGraphicsPipelineState
+    UDraw->>URHI: SetStreamSource
+    UDraw->>URHI: DrawIndexedPrimitive
+
+    Note over URHIThread: RHI Thread 执行
+    URHI->>URHIThread: vkCmdBindPipeline
+    URHIThread->>URHIThread: vkCmdBindVertexBuffers
+    URHIThread->>URHIThread: vkCmdDrawIndexed
+    URHIThread->>URHIThread: vkQueueSubmit
+```
+
+### 8.4 数据结构细节对应
+
+#### 8.4.1 GeometryInstanceSurfaceDataCache ↔ FMeshBatch
+
+| 属性 | Godot | UE |
+|------|-------|-----|
+| **材质** | `material_uniform_set` (RID) | `MaterialRenderProxy` (指针) |
+| **着色器** | `shader` (ShaderData*) | `FMaterialResource` 内嵌 |
+| **顶点数据** | `surface` (void*, Mesh RID) | `VertexFactory` + `IndexBuffer` |
+| **实例数** | `instance_count` | `NumInstances` |
+| **LOD** | `owner->lod_model_scale` | `LODLevel` |
+| **排序键** | `sort_key` (uint64) | `DrawCommandKey` (uint32) |
+| **阴影版本** | `surface_shadow` + `shader_shadow` | `ShadowMeshPassProcessor` 独立处理 |
+
+#### 8.4.2 DrawList ↔ FRHICommandList
+
+| 属性 | Godot DrawList | UE FRHICommandList |
+|------|---------------|-------------------|
+| **类型** | `InstructionList` 字节流 | `TArray<FRHICommand*>` 命令链表 |
+| **渲染通道** | `driver_render_pass` (RDD::RenderPassID) | `FRHIRenderPassInfo` |
+| **视口** | `viewport` (Rect2i) | `SetViewport()` 命令 |
+| **命令记录** | 序列化到 `data` 字节流 | 追加到 `Commands` 数组 |
+| **资源追踪** | `command_trackers` | 无（由 RDG 负责） |
+| **pipeline 状态** | `bind_pipeline` 写入流 | `SetGraphicsPipelineState()` |
+| **uniform 绑定** | `bind_uniform_set` 写入流 | `SetShaderUniformBuffer()` |
+| **顶点绑定** | `bind_vertex_buffers` 写入流 | `SetStreamSource()` |
+| **绘制** | `draw_indexed` 写入流 | `DrawIndexedPrimitive()` |
+| **提交方式** | `draw_list_end` → RDG 编码 | `FRHICommandList` 提交给 RHI Thread |
+
+#### 8.4.3 RenderingDeviceGraph ↔ FRDGBuilder
+
+| 维度 | Godot RDG | UE RDG | 说明 |
+|------|----------|--------|------|
+| **命令单元** | `RecordedCommand` | `FRDGPass` | Godot 更细粒度 |
+| **资源追踪** | `ResourceTracker` | `FRDGResource` + First/LastPass | UE 更完整 |
+| **屏障** | 自动插入 | 自动 + 早屏障优化 | UE 更智能 |
+| **资源别名** | ❌ | ✅ Transient Allocator | UE 内存更优 |
+| **Pass 剔除** | ❌ | ✅ | UE CPU 开销更低 |
+| **并行编码** | ❌ 单线程 | ✅ 多线程 | UE CPU 更快 |
+| **执行线程** | 渲染线程内 | Render Thread 编码 → RHI Thread 执行 | UE 可并行 |
+
+#### 8.4.4 RenderingDeviceDriver ↔ RHI Backend
+
+| 维度 | Godot RDD | UE RHI Backend |
+|------|----------|----------------|
+| **抽象层次** | RenderingDevice 与 Vulkan/Metal/D3D12 之间 | RHI 接口与后端实现之间 |
+| **后端** | Vulkan / Metal / D3D12 | Vulkan / D3D11 / D3D12 / Metal / OpenGL |
+| **命令执行** | 渲染线程直接调用 | RHI Thread 调用 |
+| **Pipeline Cache** | `RDD::PipelineCacheID` | `FRHIPipelineState` |
+| **资源 ID** | `RDD::BufferID` / `RDD::TextureID` | `FRHIBuffer*` / `FRHITexture*` |
+| **同步原语** | `RDD::SemaphoreID` / `RDD::FenceID` | `FRHIFence` / `FRHIGPUFence` |
+
+### 8.5 命令编码模型对比
+
+```mermaid
+flowchart TD
+    subgraph GodotModel["Godot 命令编码模型"]
+        A1["GeometryInstanceSurfaceDataCache<br>(含 material RID + surface RID)"] --> A2["RenderList<br>排序后的 surface 数组"]
+        A2 --> A3["RD::draw_list_begin<br>创建 DrawList"]
+        A3 --> A4["遍历 surface<br>bind_pipeline / bind_uniform_set / draw_indexed"]
+        A4 --> A5["InstructionList 字节流<br>序列化命令"]
+        A5 --> A6["draw_list_end<br>→ RecordedDrawListCommand"]
+        A6 --> A7["RenderingDeviceGraph<br>屏障 + 排序 + 编码"]
+        A7 --> A8["RDD::command_buffer<br>vkCmd* 调用"]
+        A8 --> A9["queue_submit<br>GPU 执行"]
+    end
+
+    subgraph UEModel["UE 命令编码模型"]
+        B1["FPrimitiveSceneProxy<br>::GetMeshBatch()"] --> B2["FMeshPassProcessor<br>::BuildMeshDrawCommands"]
+        B2 --> B3["FMeshDrawCommand<br>PSO + Vertex + Index + Uniforms"]
+        B3 --> B4["FMeshDrawCommand::SubmitDrawStart<br>提交到 FRHICommandList"]
+        B4 --> B5["FRHICommandList<br>命令链表"]
+        B5 --> B6["FRDGBuilder::Execute<br>编排 Pass 顺序"]
+        B6 --> B7["RHI Thread<br>vkCmd* 调用"]
+        B7 --> B8["queue_submit<br>GPU 执行"]
+    end
+
+    A9 -.->|"同线程"| B8
+    B8 -.->|"RHI Thread 独立"| A9
+
+    style A8 fill:#fff3e0
+    style B7 fill:#e8f5e9
+```
+
+**核心差异**：
+- Godot 的 `DrawList` 是**临时对象**，在 `draw_list_begin` 创建、`draw_list_end` 销毁，中间结果序列化到 `InstructionList`
+- UE 的 `FMeshDrawCommand` 是**持久化对象**，可在帧间缓存（Static Draw Lists），避免每帧重建
+
+### 8.6 对象生命周期对比
+
+```mermaid
+flowchart LR
+    subgraph GodotLife["Godot 对象生命周期"]
+        GA["GeometryInstanceSurfaceDataCache<br>scene_tree_enter 时创建"] --> GB["每帧<br>_fill_render_list 填充"]
+        GB --> GC["每帧<br>draw_list 编码 + 提交"]
+        GC --> GD["scene_tree_exit 时<br>销毁"]
+    end
+
+    subgraph UELife["UE 对象生命周期"]
+        UA["FMeshDrawCommand<br>PSO Cached 帧间复用"] --> UB["Static Mesh Pass<br>跨帧缓存"]
+        UB --> UC["每帧<br>SetupForDraw 更新参数"]
+        UC --> UD["每帧<br>SubmitDraw 到 RHICommandList"]
+        UE["Dynamic Mesh<br>每帧新建"] --> UF["每帧<br>GetMeshBatch 新建"]
+        UF --> UC
+    end
+
+    style GA fill:#e3f2fd
+    style UA fill:#e8f5e9
+    style UE fill:#fff3e0
+```
+
+**关键差异**：
+- **Godot** 的 `GeometryInstanceSurfaceDataCache` 在物体进入场景树时创建，每帧填充到 RenderList，但**不跨帧缓存绘制命令**
+- **UE** 的 `FMeshDrawCommand` 支持 **Static Mesh Pass**：静态网格的绘制命令在场景构建时生成并缓存，每帧只需更新少量 Uniform 参数，避免重复 PSO 查找和顶点流绑定
+
+### 8.7 对应关系总结表
+
+| Godot 对象 | UE 对应对象 | 对应关系 | 说明 |
+|-----------|------------|---------|------|
+| `GeometryInstanceSurfaceDataCache` | `FMeshBatch` | **数据层** | 一个可绘制面片 |
+| `RenderList` | `FMeshElementArray` | **集合层** | Pass 的可绘制列表 |
+| `RD::Pipeline` (RID) | `FGraphicsPipelineStateInitializer` | **PSO 层** | 管线状态对象 |
+| `RD::UniformSet` (RID) | `FUniformBufferRHIRef` | **参数层** | Shader 常量 |
+| `DrawList` | `FRHICommandList` | **编码层** | 命令记录器 |
+| `InstructionList` | `FRHICommand` 链表 | **中间表示** | 序列化命令 |
+| `RecordedDrawListCommand` | `FMeshDrawCommand` | **完整命令** | 含 PSO+参数+绘制 |
+| `RenderingDeviceGraph` | `FRDGBuilder` | **调度层** | 编排 + 屏障 |
+| `RenderingDeviceDriver` | RHI Backend (Vulkan/D3D12) | **驱动层** | GPU 原生调用 |
+| `RDD::RenderPassID` | `FRHIRenderPassInfo` | **通道层** | Render Pass 定义 |
+| `RDD::BufferID` | `FRHIBuffer*` | **资源层** | GPU Buffer |
+| `RDD::TextureID` | `FRHITexture*` | **资源层** | GPU Texture |
+
+## 9. 详细功能对比表
 
 | 功能 | Godot 当前 | UE | Godot 优化建议 |
 |------|-----------|-----|---------------|
@@ -725,8 +1028,10 @@ flowchart TD
 | **AsyncCompute** | ⚠️ 手动 | ✅ 自动 | ⚠️ 可逐步引入 |
 | **GPU 提交并行** | ❌ | ✅ | ❌ 仅 3A 场景 |
 | **移动端兼容** | ✅ | ⚠️ | ✅ 保持 |
+| **绘制命令缓存** | ❌ 每帧重建 | ✅ Static Draw List 帧间复用 | ⚠️ 可借鉴 |
+| **PSO 缓存** | ✅ PipelineCache | ✅ FPSO 缓存 | 相当 |
 
-## 9. 性能对比估算
+## 10. 性能对比估算
 
 | 场景 | Godot 当前 | Godot Level 1-3 优化后 | UE |
 |------|-----------|----------------------|-----|
@@ -737,9 +1042,9 @@ flowchart TD
 | **渲染线程帧时间** | 串行 10-20ms | 串行 10-20ms | 编码 5-10ms + RHI 提交并行 |
 | **GPU 利用率** | 60-80% | 70-85% | 85-95% |
 
-## 10. 总结
+## 11. 总结
 
-### 10.1 核心结论
+### 11.1 核心结论
 
 ```mermaid
 flowchart TD
@@ -765,7 +1070,7 @@ flowchart TD
     style D6 fill:#ffcdd2
 ```
 
-### 10.2 两种设计哲学
+### 11.2 两种设计哲学
 
 | 维度 | Godot | UE |
 |------|-------|-----|
@@ -777,7 +1082,7 @@ flowchart TD
 | **代码量** | 少 | 多 |
 | **极致性能** | ⚠️ 需要优化 | ✅ 原生支持 |
 
-### 10.3 最终评判
+### 11.3 最终评判
 
 站在极致性能出发点：
 - **Godot 不需要引入 UE 的双对象模式**，因为 RID 句柄模式在架构上已经实现了主线程与渲染线程的数据隔离
