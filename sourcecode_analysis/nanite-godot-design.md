@@ -18,6 +18,7 @@
 6. [三方案横向对比与推荐实施路径](#6-三方案横向对比与推荐实施路径)
 7. [Nanite 与 Godot 阴影/Forward 渲染的搭配](#7-nanite-与-godot-阴影forward-渲染的搭配)
 8. [离线构建模块:基于 meshoptimizer 的层次化 Meshlet + BVH](#8-离线构建模块基于-meshoptimizer-的层次化-meshlet--bvh)
+9. [综合架构:Nanite 核心 + 三桥接层](#9-综合架构nanite-核心--三桥接层)
 
 ---
 
@@ -2370,6 +2371,1000 @@ Godot 已有的 LOD(`MeshInstance3D::lods[]`)基于**几何简化 + 屏幕大小
 | shadow | 标准 shadow pass | 专用 shadow pass(粗 LOD) |
 
 **建议**:Nanite 资源**完全替代** Godot LOD;如果 Nanite 不可用(Compatibility renderer),则 fallback 到 Godot LOD。
+
+---
+
+## 9. 综合架构:Nanite 核心 + 三桥接层
+
+### 9.1 设计动机
+
+前三套方案的核心问题:**算法实现是相同的,差异只在"如何对接到 Godot"**。把算法实现复制三份会导致维护噩梦。因此引入"核心 + 桥接"分层架构:
+
+- **NaniteCore**(核心层):实现 Nanite 全部算法 —— 离线构建、运行时 GPU 流水线、数据结构、shader 调度。**不知道 Godot 存在**,只用标准 C++17 + 自带的 GPU 抽象。
+- **桥接层 ×3**:
+  - `NaniteBridgeGDExtension`:用 `CompositorEffect` + `RenderingDevice` 注入渲染;
+  - `NaniteBridgeModule`:模块 C++ 直接调用 + 钩子 `RendererSceneCull`;
+  - `NaniteBridgeDeep`:改 Forward+ 源码,把 Nanite pass 内嵌为引擎一等公民。
+- 三桥接层都把"引擎资源/事件"翻译为对 NaniteCore 的统一调用。
+
+这样:
+- 算法升级(如换 HZB 策略)只改核心;
+- 跟随 Godot API 变化只改对应桥接;
+- 用户可按需选择"轻接入 / 中接入 / 深接入",无需重写算法。
+
+### 9.2 总体架构图
+
+```mermaid
+flowchart TB
+    subgraph Godot["Godot Engine"]
+        RS[RenderingServer<br/>+ RenderingDevice]
+        RSC[RendererSceneCull<br/>实例收集/分流]
+        RFC[RenderForwardClustered<br/>_render_scene 主流程]
+        ST[Servers: MeshStorage /<br/> LightStorage / MaterialStorage]
+        CE[CompositorEffect<br/>扩展点]
+        MSH[ArrayMesh / SurfaceTool<br/>资源系统]
+        RES[ResourceSaver /<br/> ResourceFormatLoader]
+    end
+
+    subgraph Bridge["桥接层 (3 选 1)"]
+        direction LR
+        B1[NaniteBridgeGDExtension]
+        B2[NaniteBridgeModule]
+        B3[NaniteBridgeDeep]
+    end
+
+    subgraph Core["NaniteCore (引擎无关)"]
+        direction TB
+        CS[NaniteCoreScene<br/>运行时场景状态]
+        CB[NaniteCoreBuilder<br/>离线构建]
+        CG[NaniteCoreGPU<br/>GPU pipeline]
+        CN[NaniteCoreNetwork<br/>shader 调度]
+        CD[NaniteCoreData<br/>数据结构/序列化]
+    end
+
+    %% Engine → Bridge → Core
+    RS --> B1
+    CE --> B1
+    B1 --> CS
+    RSC --> B2
+    RFC --> B2
+    B2 --> CS
+    RFC --> B3
+    RSC --> B3
+    ST --> B3
+    B3 --> CS
+
+    %% Core internal
+    CS --> CG
+    CB --> CD
+    CG --> CN
+    CS --> CD
+
+    %% Bridge accesses core
+    B1 --> CB
+    B2 --> CB
+    B3 --> CB
+
+    %% Mesh import path
+    MSH --> Bridge
+    RES --> Bridge
+```
+
+### 9.3 NaniteCore 接口设计
+
+NaniteCore 是一个**纯 C++ 库**(可编译为静态库或动态库),只依赖 STL + 一个极小的 GPU 抽象接口(`INaniteGPUBackend`)。它不知道 RID、不知道 Object、不知道 Resource。
+
+#### 9.3.1 核心模块组成
+
+```mermaid
+classDiagram
+    class INaniteGPUBackend {
+        <<interface>>
+        +create_buffer(size, usage)  BufferHandle
+        +create_texture(w, h, format)  TextureHandle
+        +map_buffer(BufferHandle)  void*
+        +unmap_buffer(BufferHandle)
+        +begin_compute_pass()  ComputeList
+        +begin_draw_pass(TextureHandle color, TextureHandle depth)  DrawList
+        +submit()
+        +readback(BufferHandle)  Span~byte~
+    }
+    class ComputeList {
+        +bind_pipeline(PipelineHandle)
+        +bind_uniform_set(slot, ResourceSet)
+        +dispatch(x, y, z)
+    }
+    class DrawList {
+        +bind_pipeline(PipelineHandle)
+        +bind_vertex_buffer(BufferHandle)
+        +bind_index_buffer(BufferHandle)
+        +draw_indexed_indirect(BufferHandle, count)
+    }
+    class NaniteCoreData {
+        +struct Cluster
+        +struct ClusterNode
+        +struct MeshResource
+        +struct InstanceData
+        +struct PageTable
+    }
+    class NaniteCoreBuilder {
+        +build(vertex_span, index_span, BuildConfig)  MeshResource
+        -preprocess(...)
+        -build_l0_clusters(...)
+        -build_hierarchy(...)
+        -emit_auxiliary_data(...)
+        -serialize(MeshResource, path)
+    }
+    class NaniteCoreScene {
+        -HashMap~MeshId, MeshResource~ meshes
+        -HashMap~InstanceId, InstanceData~ instances
+        -BufferHandle instance_buffer
+        -BufferHandle node_buffer
+        -BufferHandle cluster_buffer
+        -BufferHandle vertex_pool
+        -BufferHandle index_pool
+        -BufferHandle visible_cluster_buffer
+        -BufferHandle page_request_buffer
+        -BufferHandle indirect_args_buffer
+        -TextureHandle visibility_buffer
+        -TextureHandle hzb_texture
+        +add_mesh(MeshResource)  MeshId
+        +remove_mesh(MeshId)
+        +create_instance(MeshId)  InstanceId
+        +destroy_instance(InstanceId)
+        +set_instance_transform(InstanceId, Mat4)
+        +set_instance_visible(InstanceId, bool)
+        +update_gpu_residency(INaniteGPUBackend*)
+    }
+    class NaniteCoreGPU {
+        -INaniteGPUBackend* backend
+        +cull_pass(Scene*, CameraData, PipelineSet*)
+        +raster_pass(Scene*, PipelineSet*)
+        +build_hzb_pass(Scene*, PipelineSet*)
+        +material_eval_pass(Scene*, PipelineSet*, MaterialBindingSet*)
+        +shadow_pass(Scene*, LightData, PipelineSet*)
+        +page_request_process(Scene*)
+    }
+    class NaniteCoreShaderCache {
+        -HashMap~string, PipelineHandle~ pipelines
+        +init(INaniteGPUBackend*, ShaderSourceProvider*)
+        +get_pipeline(name)  PipelineHandle
+        +reload_shaders()
+    }
+    class NaniteCorePageCache {
+        -HashMap~PageId, PageState~ pages
+        -Span~byte~ disk_pages_blob
+        +request_pages(Span~PageId~)
+        +process_pending(INaniteGPUBackend*)
+        +is_resident(PageId)  bool
+    }
+
+    INaniteGPUBackend <|.. ComputeList : creates
+    INaniteGPUBackend <|.. DrawList : creates
+    NaniteCoreScene --> INaniteGPUBackend : uses
+    NaniteCoreGPU --> INaniteGPUBackend : uses
+    NaniteCoreGPU --> NaniteCoreScene : operates on
+    NaniteCoreGPU --> NaniteCoreShaderCache : uses
+    NaniteCoreGPU --> NaniteCorePageCache : triggers
+    NaniteCoreBuilder ..> NaniteCoreData : produces
+    NaniteCoreScene ..> NaniteCoreData : stores
+```
+
+#### 9.3.2 核心 C++ API 草案
+
+```cpp
+// nanite_core/api.h  — 引擎无关的对外 API
+namespace nanite {
+
+struct BuildConfig {
+    uint32_t max_vertices        = 64;
+    uint32_t min_triangles       = 32;
+    uint32_t max_triangles       = 128;
+    uint32_t partition_size      = 4;
+    float    cone_weight         = 0.5f;
+    float    split_factor        = 0.5f;
+    float    simplification_ratio = 0.5f;
+    float    target_error        = 0.5f;
+    uint32_t page_size_bytes     = 65536;
+    bool     lock_partition_border = true;
+    // ...
+};
+
+struct CameraData {
+    float view_proj[16];
+    float camera_pos[3];
+    float error_threshold;
+    uint32_t viewport_w, viewport_h;
+    bool    shadow_pass;
+    float   shadow_bias_scale;
+};
+
+struct LightData {
+    float view_proj[16];
+    float light_pos[3];
+    int   light_type;   // 0=directional, 1=spot, 2=omni
+    uint32_t shadow_map_resolution;
+    float    shadow_atlas_rect[4];
+};
+
+struct MaterialBinding {
+    uint32_t material_index;
+    // 引擎材质的 GPU resource set 句柄(由桥接层翻译)
+    void*    gpu_resource_set_handle;
+};
+
+// —— 离线构建 ——
+MeshResource build_mesh(Span<const float> positions,
+                        Span<const uint32_t> indices,
+                        const BuildConfig &cfg);
+bool save_mesh(const MeshResource &m, const char *path);
+bool load_mesh(const char *path, MeshResource &out);
+
+// —— 运行时场景 ——
+class Scene {
+public:
+    MeshId    add_mesh(const MeshResource &);
+    void      remove_mesh(MeshId);
+    InstanceId create_instance(MeshId);
+    void      destroy_instance(InstanceId);
+    void      set_instance_transform(InstanceId, const float *world_xform);
+    void      set_instance_visible(InstanceId, bool);
+
+    // 每帧由桥接层调用,把 GPU backend 注入
+    void      update_gpu_residency(INaniteGPUBackend *gpu);
+
+    // 由桥接层每帧调用,执行 GPU 流水线
+    void      render_camera(INaniteGPUBackend *gpu,
+                             const CameraData &cam,
+                             const Span<MaterialBinding> &materials,
+                             NaniteCoreShaderCache *shaders,
+                             NaniteCorePageCache *page_cache);
+    void      render_shadow(INaniteGPUBackend *gpu,
+                             const LightData &light,
+                             NaniteCoreShaderCache *shaders,
+                             NaniteCorePageCache *page_cache);
+};
+
+} // namespace nanite
+```
+
+#### 9.3.3 INaniteGPUBackend:引擎无关 GPU 抽象
+
+桥接层负责实现 `INaniteGPUBackend`,把核心的 GPU 操作翻译为引擎特定 API。这样 NaniteCore 不直接依赖 `RenderingDevice`:
+
+```cpp
+// nanite_core/gpu_backend.h
+namespace nanite {
+
+class INaniteGPUBackend {
+public:
+    virtual ~INaniteGPUBackend() = default;
+
+    // 资源管理
+    virtual BufferHandle  create_buffer(size_t size, BufferUsage usage) = 0;
+    virtual void          destroy_buffer(BufferHandle) = 0;
+    virtual void*         map_buffer(BufferHandle, MapMode) = 0;
+    virtual void          unmap_buffer(BufferHandle) = 0;
+    virtual void          buffer_update(BufferHandle, size_t offset, Span<const byte>) = 0;
+
+    virtual TextureHandle create_texture(uint32_t w, uint32_t h, TextureFormat, TextureUsage) = 0;
+    virtual void          destroy_texture(TextureHandle) = 0;
+
+    // Pipeline / shader
+    virtual PipelineHandle create_compute_pipeline(const ShaderSource &) = 0;
+    virtual PipelineHandle create_graphics_pipeline(const GraphicsPipelineDesc &) = 0;
+
+    // Pass 组织
+    virtual ComputeListHandle begin_compute_pass(const char *label) = 0;
+    virtual DrawListHandle    begin_draw_pass(Span<TextureHandle> colors,
+                                              TextureHandle depth,
+                                              const Rect &area) = 0;
+    virtual void end_pass() = 0;
+
+    // Compute / Draw 命令
+    virtual void compute_bind_pipeline(ComputeListHandle, PipelineHandle) = 0;
+    virtual void compute_bind_uniform(ComputeListHandle, uint32_t slot, const UniformSet &) = 0;
+    virtual void compute_dispatch(ComputeListHandle, uint32_t x, uint32_t y, uint32_t z) = 0;
+
+    virtual void draw_bind_pipeline(DrawListHandle, PipelineHandle) = 0;
+    virtual void draw_bind_index(DrawListHandle, BufferHandle) = 0;
+    virtual void draw_bind_vertex(DrawListHandle, BufferHandle) = 0;
+    virtual void draw_bind_uniform(DrawListHandle, uint32_t slot, const UniformSet &) = 0;
+    virtual void draw_indexed_indirect(DrawListHandle, BufferHandle args, uint32_t count) = 0;
+
+    // 提交与回读
+    virtual void submit() = 0;
+    virtual Span<byte> readback_buffer(BufferHandle) = 0;
+};
+
+} // namespace nanite
+```
+
+### 9.4 桥接层 1:NaniteBridgeGDExtension
+
+#### 9.4.1 职责
+
+把 NaniteCore 装进 Godot,作为外部插件:
+- 实现 `INaniteGPUBackend`,内部委托给 `RenderingServer::get_singleton()->get_rendering_device()`;
+- 继承 `CompositorEffect`,在 `BEFORE_OPAQUE_PASS` / `AFTER_OPAQUE_PASS` callback 中调用 `Scene::render_camera`;
+- 继承 `EditorImportPlugin`,在 mesh 导入时调 `nanite::build_mesh` + `nanite::save_mesh`;
+- 继承 `Node`(或 `MeshInstance3D`)作为 `NaniteMeshInstance3D`,在 `_notification` 中调用 `Scene::create_instance`。
+
+#### 9.4.2 类图
+
+```mermaid
+classDiagram
+    class RenderingDevice {
+        <<Godot>>
+        +compute_list_begin()
+        +draw_list_begin()
+        +buffer_create()
+        +texture_create()
+    }
+    class CompositorEffect {
+        <<Godot>>
+        +set_callback(type, callable)
+    }
+    class EditorImportPlugin {
+        <<Godot>>
+        +import(file, options)
+    }
+    class Node {
+        <<Godot>>
+    }
+    class NaniteRDBackend {
+        <<implements INaniteGPUBackend>>
+        -RenderingDevice* rd
+        +create_buffer(size, usage)  BufferHandle
+        +begin_compute_pass()  ComputeListHandle
+        +begin_draw_pass(colors, depth)  DrawListHandle
+        +submit()
+    }
+    class NaniteGDExtCompositor {
+        -nanite::Scene* scene
+        -NaniteRDBackend* backend
+        -NaniteCoreShaderCache* shaders
+        -NaniteCorePageCache* page_cache
+        +_render_callback(Ref~RenderDataExtension~)
+        -dispatch_camera_pass(RenderData*)
+        -dispatch_shadow_pass(RenderData*)
+        -dispatch_material_eval_pass(RenderData*)
+    }
+    class NaniteGDExtImporter {
+        +import(source_file, options)
+        -build_nanite_resource(PackedArrays)
+    }
+    class NaniteMeshInstance3D {
+        -Ref~NaniteMeshResource~ resource
+        -nanite::InstanceId instance_id
+        +set_nanite_mesh(Ref~NaniteMeshResource~)
+        +_ready()
+        +_notification(NOTIFICATION_INTERNAL_PROCESS)
+        +_get_property_list()
+    }
+    class NaniteMeshResource {
+        -String nanite_file_path
+        -nanite::MeshResource core_resource
+        +build_from_arrays(PackedArrays)
+        +save(path)
+        +load(path)
+    }
+
+    RenderingDevice <.. NaniteRDBackend : wraps
+    CompositorEffect <|-- NaniteGDExtCompositor
+    EditorImportPlugin <|-- NaniteGDExtImporter
+    Node <|-- NaniteMeshInstance3D
+    NaniteMeshInstance3D --> NaniteMeshResource : holds
+    NaniteGDExtCompositor --> NaniteRDBackend : owns
+    NaniteGDExtCompositor --> nanite::Scene : owns
+    NaniteMeshInstance3D ..> nanite::Scene : registers instance via singleton
+    NaniteGDExtImporter ..> nanite::build_mesh : calls
+```
+
+#### 9.4.3 关键代码
+
+```cpp
+// bridge_gdext/rd_backend.h
+class NaniteRDBackend : public nanite::INaniteGPUBackend {
+    RenderingDevice *rd;
+
+    ComputeListHandle begin_compute_pass(const char *label) override {
+        rd->draw_command_begin_label(label);
+        return rd->compute_list_begin();   // 直接返回 RID 作为 handle
+    }
+    void compute_dispatch(ComputeListHandle list, uint32_t x, uint32_t y, uint32_t z) override {
+        rd->compute_list_dispatch(RID(list), x, y, z);
+    }
+    void end_pass() override { rd->compute_list_end(); }
+    // ... 其他方法把 nanite 接口翻译为 RenderingDevice 调用
+};
+
+// bridge_gdext/compositor_effect.cpp
+void NaniteGDExtCompositor::_bind_methods() {
+    ClassDB::bind_method(D_METHOD("_render_callback", "render_data"),
+                          &NaniteGDExtCompositor::_render_callback);
+}
+void NaniteGDExtCompositor::init() {
+    set_callback(RSE::COMPOSITOR_EFFECT_CALLBACK_BEFORE_OPAQUE_PASS,
+                 Callable(this, "_render_callback"));
+    set_callback(RSE::COMPOSITOR_EFFECT_CALLBACK_AFTER_OPAQUE_PASS,
+                 Callable(this, "_render_callback"));
+    backend = memnew(NaniteRDBackend);
+    scene   = new nanite::Scene();
+    shaders = new nanite::NaniteCoreShaderCache();
+    shaders->init(backend, /*source_provider=*/...);
+    page_cache = new nanite::NaniteCorePageCache();
+}
+void NaniteGDExtCompositor::_render_callback(const Ref<RenderDataExtension> &p_rd) {
+    auto cb = get_active_callback_type();
+    if (cb == RSE::COMPOSITOR_EFFECT_CALLBACK_BEFORE_OPAQUE_PASS) {
+        scene->update_gpu_residency(backend);
+        nanite::CameraData cam = translate_camera(p_rd);
+        Vector<nanite::MaterialBinding> mats = translate_materials(p_rd);
+        scene->render_camera(backend, cam, mats, shaders, page_cache);
+
+        // GDExt 限制:无阴影 callback,所以在 BEFORE_OPAQUE 内自己做
+        if (scene_has_shadow_lights(p_rd)) {
+            for (const auto &light : get_visible_lights(p_rd)) {
+                if (light.cast_shadow) {
+                    scene->render_shadow(backend, translate_light(light), shaders, page_cache);
+                }
+            }
+        }
+    } else {
+        // AFTER_OPAQUE:material eval 已经在 render_camera 内完成,这里仅做 composite
+        // 或者把 material eval 拆到这里
+    }
+}
+```
+
+### 9.5 桥接层 2:NaniteBridgeModule
+
+#### 9.5.1 职责
+
+作为 `modules/nanite/` 编译进引擎。比 GDExtension 强的是:
+- 可访问引擎**私有头**(`RendererSceneCull::_instance_initialize`、`RenderingServerDefault::storage[]`);
+- 可注册新 `NaniteServer` Object 与 ClassDB 类型,API 自然;
+- 可在 `RendererSceneCull` 收集实例时通过新增的 `instance_set_nanite` API 标记实例,避免双重绘制;
+- 可在 shadow pass 调用前 hook(没有 callback,但有 friend 方法)。
+
+#### 9.5.2 类图
+
+```mermaid
+classDiagram
+    class RendererSceneCull {
+        <<Godot, friend access>>
+        +_instance_filter_nanite(...)
+    }
+    class RenderingServerDefault {
+        <<Godot, friend access>>
+        +nanite_storage
+    }
+    class RendererRDStorage {
+        <<Godot>>
+    }
+    class NaniteServer {
+        +Object* singleton
+        +NaniteRDBackend* backend
+        +nanite::Scene* scene
+        +update_instances()
+        +render_camera(render_data)
+        +render_shadow(render_data, light, pass)
+    }
+    class NaniteRDBackend {
+        <<implements INaniteGPUBackend>>
+        -RenderingDevice* rd
+    }
+    class NaniteMeshInstance3D {
+        -Ref~NaniteMeshResource~ resource
+        -RID nanite_instance_rid
+        +set_nanite_mesh(...)
+    }
+    class NaniteMeshResource {
+        -nanite::MeshResource core
+        +build_from_arrays(...)
+    }
+    class NaniteImporter {
+        +import(...)
+    }
+    class NaniteEditorPlugin {
+        +EditorInspectorPlugin
+    }
+
+    NaniteServer --> NaniteRDBackend : owns
+    NaniteServer --> nanite::Scene : owns
+    NaniteMeshInstance3D --> NaniteServer : registers via
+    NaniteMeshInstance3D --> NaniteMeshResource : holds
+    NaniteImporter ..> nanite::build_mesh : calls
+    NaniteEditorPlugin ..> NaniteMeshInstance3D : adds inspector
+    RendererSceneCull ..> NaniteServer : queries for nanite instances
+    RenderingServerDefault --> NaniteServer : registers
+```
+
+#### 9.5.3 关键代码
+
+```cpp
+// modules/nanite/nanite_server.h
+class NaniteServer : public Object {
+    GDCLASS(NaniteServer, Object);
+    static NaniteServer *singleton;
+    NaniteRDBackend *backend;
+    nanite::Scene *scene;
+    nanite::NaniteCoreShaderCache *shaders;
+    nanite::NaniteCorePageCache *page_cache;
+public:
+    static NaniteServer *get_singleton() { return singleton; }
+    void render_camera_render_data(RenderData *p_render_data);  // 在 RendererSceneCull 调用
+    void render_shadow_render_data(RenderData *p_render_data, RID light, int pass);
+
+    RID nanite_mesh_create();
+    void nanite_mesh_set_resource(RID, Ref<NaniteMeshResource>);
+    RID nanite_instance_create(RID base);
+    // ...
+};
+
+// modules/nanite/register_types.cpp
+void register_nanite_types() {
+    ClassDB::register_class<NaniteMeshResource>();
+    ClassDB::register_class<NaniteMeshInstance3D>();
+    NaniteServer::create_singleton();
+    if (Engine::get_singleton()->is_editor_hint()) {
+        EditorNode::add_editor_plugin(memnew(NaniteEditorPlugin));
+    }
+}
+
+// modules/nanite/nanite_server.cpp
+void NaniteServer::render_camera_render_data(RenderData *p_rd) {
+    scene->update_gpu_residency(backend);
+    nanite::CameraData cam = translate_camera(p_rd);
+    Vector<nanite::MaterialBinding> mats = translate_materials(p_rd);
+    scene->render_camera(backend, cam, mats, shaders, page_cache);
+}
+```
+
+### 9.6 桥接层 3:NaniteBridgeDeep
+
+#### 9.6.1 职责
+
+把 Nanite 提升为引擎一等公民。桥接层与引擎核心深度集成:
+- 在 `RenderForwardClustered` 内调用 `NaniteServer` 的方法;
+- `RendererSceneCull` 直接感知 Nanite 实例并分流;
+- `StandardMaterial3D` 可直接绑定为 Nanite 材质;
+- 阴影/GI 透明集成。
+
+此桥接层最薄,因为大部分逻辑都已下沉到引擎源码。它主要是把引擎已有的 `RenderingServerDefault` 的调用翻译为对 NaniteCore 的调用。
+
+#### 9.6.2 类图
+
+```mermaid
+classDiagram
+    class RenderingServer {
+        <<改动:nanite_* 方法>>
+        +nanite_mesh_create()
+        +nanite_instance_create()
+    }
+    class RenderingServerDefault {
+        +NaniteServer* nanite_server
+    }
+    class RendererSceneCull {
+        <<改动:Nanite 实例分流>>
+        +instance_set_nanite(RID, bool)
+        -_instance_filter_nanite(...)
+    }
+    class RenderForwardClustered {
+        <<改动:新增 _nanite_*_pass>>
+        -_nanite_cull_pass(...)
+        -_nanite_raster_pass(...)
+        -_nanite_material_eval_pass(...)
+        -_nanite_render_shadow_pass(...)
+    }
+    class MeshInstance3D {
+        <<改动>>
+        +set_nanite_mesh(Ref~NaniteMesh~)
+    }
+    class NaniteServer {
+        <<同方案二,但 engine-internal>>
+        +NaniteRDBackend* backend
+        +nanite::Scene* scene
+    }
+    class NaniteRDBackend {
+        <<implements INaniteGPUBackend>>
+        -RenderingDevice* rd
+    }
+
+    RenderingServerDefault --> NaniteServer : owns
+    NaniteServer --> NaniteRDBackend : owns
+    NaniteServer --> nanite::Scene : owns
+    RenderForwardClustered --> NaniteServer : invokes _nanite_*_pass
+    RendererSceneCull --> NaniteServer : queries + sets nanite flag
+    MeshInstance3D ..> NaniteServer : creates instance via
+```
+
+#### 9.6.3 关键代码
+
+```cpp
+// servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.cpp(改动)
+void RenderForwardClustered::_render_scene(RenderDataRD *p_rd, ...) {
+    // ... existing shadow setup ...
+    if (p_rd->has_nanite_instances) {
+        // 阴影阶段:每个光调用 NaniteServer
+        for (auto &sp : p_rd->render_shadows) {
+            NaniteServer::get_singleton()->render_shadow_render_data(p_rd, sp.light, sp.pass);
+        }
+    }
+    // ... existing depth prepass ...
+    if (p_rd->has_nanite_instances) {
+        NaniteServer::get_singleton()->render_camera_render_data(p_rd);
+    }
+    // ... existing opaque list (Nanite 实例已排除) ...
+    if (p_rd->has_nanite_instances) {
+        NaniteServer::get_singleton()->material_eval_render_data(p_rd);
+    }
+    // ... sky / transparent / post ...
+}
+```
+
+### 9.7 三桥接层对比
+
+```mermaid
+classDiagram
+    class BridgeBase {
+        <<interface>>
+        +NaniteRDBackend* backend
+        +nanite::Scene* scene
+        +translate_camera(rd)  CameraData
+        +translate_materials(rd)  Vector~MaterialBinding~
+        +translate_light(light)  LightData
+        +on_import_mesh(file)  MeshResource
+        +on_instance_created(node)
+        +on_instance_destroyed(node)
+    }
+    class BridgeGDExtension {
+        +CompositorEffect hook
+        +EditorImportPlugin importer
+        +NaniteMeshInstance3D node_type
+        +no shadow callback (变通)
+        +cannot skip std _render_list
+    }
+    class BridgeModule {
+        +NaniteServer singleton
+        +access to RendererSceneCull private
+        +instance_set_nanite() skip std cull
+        +hook before shadow pass via friend
+        +WorkerThreadPool build
+    }
+    class BridgeDeep {
+        +RenderForwardClustered source patched
+        +StandardMaterial3D direct binding
+        +shadow pass integrated
+        +EditorInspectorPlugin built-in
+        +no translation overhead
+    }
+
+    BridgeBase <|-- BridgeGDExtension
+    BridgeBase <|-- BridgeModule
+    BridgeBase <|-- BridgeDeep
+```
+
+### 9.8 桥接层通用接口
+
+每个桥接层都实现同一个抽象接口 `INaniteBridge`,确保核心可以**无差别**地被三套方案使用:
+
+```cpp
+// nanite_bridge.h (在核心包内)
+namespace nanite {
+
+class INaniteBridge {
+public:
+    virtual ~INaniteBridge() = default;
+
+    // —— 资源导入 ——
+    virtual MeshResource build_mesh_from_arrays(Span<const float> positions,
+                                                  Span<const uint32_t> indices,
+                                                  const BuildConfig &cfg) = 0;
+    virtual bool save_mesh_to_file(const MeshResource &m, const char *path) = 0;
+    virtual bool load_mesh_from_file(const char *path, MeshResource &out) = 0;
+
+    // —— 实例管理 ——
+    virtual InstanceId create_instance(MeshId mesh_id) = 0;
+    virtual void       destroy_instance(InstanceId) = 0;
+    virtual void       set_instance_transform(InstanceId, const float *world_xform) = 0;
+
+    // —— 帧回调 ——
+    virtual void on_pre_camera_render(void *engine_render_data) = 0;
+    virtual void on_post_camera_render(void *engine_render_data) = 0;
+    virtual void on_shadow_render(void *engine_render_data, void *light, int pass) = 0;
+
+    // —— GPU 后端访问 ——
+    virtual INaniteGPUBackend *get_gpu_backend() = 0;
+};
+
+} // namespace nanite
+```
+
+桥接层负责实现此接口,核心代码不感知具体方案:
+
+```cpp
+// 在 NaniteCoreScene::render_camera 内
+void Scene::render_camera(INaniteGPUBackend *gpu,
+                           const CameraData &cam,
+                           const Span<MaterialBinding> &mats,
+                           NaniteCoreShaderCache *shaders,
+                           NaniteCorePageCache *page_cache) {
+    // 完全不知道自己是被 CompositorEffect 还是 _render_scene 调用的
+    gpu->begin_compute_pass("Nanite Cull");
+    gpu->compute_bind_pipeline(/*cull_pipeline*/);
+    // ...
+    gpu->end_pass();
+}
+```
+
+### 9.9 关键设计决策与权衡
+
+#### 9.9.1 GPU 资源句柄的统一
+
+| 决策 | 说明 |
+|---|---|
+| `BufferHandle` / `TextureHandle` 是 `uint64_t` | 引擎无关,桥接层把它映射为 RID(方案二三)或 RID-like 整数(方案一); |
+| 句柄所有权归桥接层 | 桥接层负责 `create_*` / `destroy_*`,核心只持有句柄值; |
+| 资源生命周期与 `Scene` 绑定 | `Scene` 析构时桥接层在 backend 上释放所有 buffer |
+
+#### 9.9.2 着色器源码管理
+
+```mermaid
+flowchart LR
+    Src[NaniteCore<br/>自带 .glsl 源码] --> SP[ShaderSourceProvider]
+    SP -->|方案一| GDSP[GDShader SP<br/>通过 RenderingServer.shader_create]
+    SP -->|方案二| ModSP[ModuleSP<br/>RDShaderFile 编译]
+    SP -->|方案三| DeepSP[DeepSP<br/>与 ForwardClustered 共享 RDShaderFile]
+    GDSP --> Pipeline[PipelineHandle]
+    ModSP --> Pipeline
+    DeepSP --> Pipeline
+    Pipeline --> Scene[Scene 使用]
+```
+
+NaniteCore 自带 GLSL 源码,但**编译 pipeline 的责任在桥接层**。这样:
+- 方案一用 GDShader(`RenderingServer::shader_compile_spirv_from_source`)或直接提交 SPIR-V;
+- 方案二三用 `RDShaderFile` 与引擎 shader 一致。
+
+#### 9.9.3 材质绑定
+
+| 方案 | 材质绑定的实现 |
+|---|---|
+| 方案一 | 桥接层从 `RenderDataExtension` 取材质 uniform,转成 `nanite::MaterialBinding.gpu_resource_set_handle`(其实就是 RID) |
+| 方案二 | 同上,但桥接层可访问 `MaterialStorage` 直接拿 uniform set |
+| 方案三 | `StandardMaterial3D` 直接绑到 Nanite pipeline;`MaterialBinding` 退化,核心 shader 直接用引擎材质 uniform set |
+
+### 9.10 完整调用时序(以方案二 Module 为例)
+
+```mermaid
+sequenceDiagram
+    participant App as Application
+    participant Cull as RendererSceneCull
+    participant FC as RenderForwardClustered
+    participant Srv as NaniteServer (Bridge)
+    class NSrv
+    participant Scene as nanite::Scene (Core)
+    class NScene
+    participant GPU as NaniteRDBackend (Bridge)
+    class NGPU
+    participant RD as RenderingDevice (Godot)
+    participant MO as meshoptimizer
+
+    Note over App,MO: === 导入阶段(离线)===
+    App->>Srv: nanite_mesh_create() from importer
+    Srv->>Scene: add_mesh(MeshResource)
+    Scene->>MO: build_mesh (内部调用)
+    MO-->>Scene: MeshResource
+    Scene->>GPU: create_buffer for vertex/index/node/cluster
+    GPU->>RD: buffer_create
+    Scene-->>Srv: MeshId
+
+    Note over App,RD: === 运行时实例注册 ===
+    App->>Srv: nanite_instance_create(mesh_id)
+    Srv->>Scene: create_instance
+    Scene-->>Srv: InstanceId
+
+    Note over App,RD: === 每帧渲染 ===
+    App->>Cull: render_camera
+    Cull->>Cull: split std / nanite instances
+    Cull->>Srv: query nanite instance list
+    Srv->>Scene: set_instance_transform(per-instance)
+    Cull->>FC: _render_scene
+
+    FC->>Srv: render_shadow_render_data(rd, light, pass)
+    Srv->>Srv: translate_light(light) → nanite::LightData
+    Srv->>Scene: render_shadow(backend, light_data, shaders, page_cache)
+    Scene->>GPU: begin_compute_pass
+    GPU->>RD: compute_list_begin
+    Scene->>GPU: compute_dispatch(cull shader)
+    GPU->>RD: compute_list_dispatch
+    Scene->>GPU: end_pass
+    GPU->>RD: compute_list_end
+    Scene->>GPU: begin_draw_pass(shadow fb)
+    GPU->>RD: draw_list_begin
+    Scene->>GPU: draw_indexed_indirect
+    GPU->>RD: draw_list_draw_indirect
+    Scene->>GPU: end_pass
+    GPU->>RD: draw_list_end
+    Scene-->>Srv: done
+    Srv-->>FC: continue
+
+    FC->>Srv: render_camera_render_data(rd)
+    Srv->>Srv: translate_camera(rd) → nanite::CameraData
+    Srv->>Scene: render_camera(backend, cam, mats, shaders, page_cache)
+    Scene->>GPU: update_gpu_residency
+    GPU->>RD: buffer_update / staging
+    Scene->>GPU: cull_pass / raster_pass / hzb / material_eval
+    GPU->>RD: 各种 RD 调用
+    Scene->>GPU: page_request_process
+    GPU->>RD: readback_buffer(page_request_buffer)
+    Scene-->>Srv: done
+    Srv-->>FC: continue
+    FC->>FC: render std opaque list (Nanite excluded)
+    FC-->>Cull: done
+    Cull-->>App: rendered
+```
+
+### 9.11 包结构建议
+
+```
+nanite_project/
+├── nanite_core/                          # 引擎无关核心(纯 C++17 静态库)
+│   ├── include/nanite/
+│   │   ├── api.h                         # 对外 API:Scene/MeshResource/...
+│   │   ├── gpu_backend.h                 # INaniteGPUBackend 接口
+│   │   ├── bridge.h                      # INaniteBridge 接口
+│   │   └── data.h                        # Cluster/ClusterNode/...
+│   ├── src/
+│   │   ├── builder.cpp                   # build_mesh 实现
+│   │   ├── scene.cpp                     # Scene 实现
+│   │   ├── gpu.cpp                       # GPU pipeline 调度
+│   │   ├── page_cache.cpp
+│   │   └── shader_cache.cpp
+│   ├── shaders/                          # GLSL 源码(引擎无关)
+│   │   ├── cull.glsl
+│   │   ├── raster.vert
+│   │   ├── raster.frag
+│   │   ├── soft_raster.glsl
+│   │   ├── material_eval.glsl
+│   │   ├── hzb_build.glsl
+│   │   └── shadow_cull.glsl
+│   └── CMakeLists.txt / SCsub            # 可独立构建
+
+├── bridge_gdext/                         # 桥接层 1:GDExtension
+│   ├── rd_backend.h/.cpp                 # NaniteRDBackend impl
+│   ├── compositor_effect.h/.cpp          # NaniteGDExtCompositor
+│   ├── importer.h/.cpp                   # NaniteGDExtImporter
+│   ├── mesh_instance.h/.cpp              # NaniteMeshInstance3D
+│   ├── resource.h/.cpp                   # NaniteMeshResource (.res)
+│   ├── shader_provider.h/.cpp            # GDShader → SPIR-V
+│   ├── .gdextension
+│   └── SCsub
+
+├── bridge_module/                        # 桥接层 2:C++ Module
+│   ├── register_types.cpp
+│   ├── nanite_server.h/.cpp              # NaniteServer
+│   ├── rd_backend.h/.cpp
+│   ├── importer.h/.cpp
+│   ├── mesh_instance.h/.cpp
+│   ├── resource.h/.cpp
+│   ├── shader_provider.h/.cpp            # RDShaderFile
+│   ├── editor_plugin.h/.cpp
+│   └── SCsub
+
+├── bridge_deep/                          # 桥接层 3:引擎深度改造(作为 patch)
+│   ├── patches/
+│   │   ├── rendering_server.h.patch
+│   │   ├── render_forward_clustered.patch
+│   │   ├── renderer_scene_cull.patch
+│   │   ├── mesh_instance_3d.patch
+│   │   └── ...
+│   ├── nanite_server.h/.cpp              # engine-internal
+│   ├── rd_backend.h/.cpp
+│   ├── shader_provider.h/.cpp
+│   └── README.md                          # patch 应用流程
+
+└── tests/
+    ├── core_unit_tests/                   # 测试核心,无引擎
+    └── integration_tests/                 # 每个桥接层一个测试套件
+```
+
+### 9.12 三桥接层的对照矩阵
+
+| 能力 / 桥接层 | BridgeGDExtension | BridgeModule | BridgeDeep |
+|---|---|---|---|
+| **接入方式** | 外部插件 (.so/.dll) | 编译进 modules/ | 改引擎源码 |
+| **引擎源码改动** | 0 | 仅新增 | 多处修改 |
+| **核心调用入口** | CompositorEffect callback | RendererSceneCull + NaniteServer | RenderForwardClustered._render_scene |
+| **GPU 资源创建** | RenderingDevice | RenderingDevice | RenderingDevice (共享) |
+| **GPU 资源句柄映射** | RID → uint64_t | RID → uint64_t | RID 直接是句柄 |
+| **实例分流** | 通过 visible=false 隐藏代理 mesh | instance_set_nanite 跳过 std cull | instance_set_nanite 跳过 std cull |
+| **阴影路径** | BEFORE_OPAQUE 内变通 | 钩子 _render_shadow_pass 前 | _render_shadow_pass 内嵌 |
+| **材质绑定** | 从 RenderDataExtension 提取 | 从 MaterialStorage 直接取 | StandardMaterial3D 直接 |
+| **着色器编译** | GDShader / SPIR-V | RDShaderFile | 与 Forward+ 共享 RDShaderFile |
+| **导入器** | EditorImportPlugin | 同左 | 内置 |
+| **编辑器集成** | EditorPlugin | EditorPlugin | 原生 Inspector |
+| **磁盘 IO** | FileAccess | FileAccess + WorkerThreadPool | 同左 + 可集成 ResourceSaver |
+| **API 暴露** | ClassDB(GDExt) | ClassDB(原生) | RenderingServer 原生方法 |
+| **核心代码改动同步** | 不需要 | 不需要 | 不需要(核心是静态库) |
+| **跟随上游升级** | 仅跟 API surface | 仅跟 module header | 需要 rebase patch |
+| **算法升级工作量** | 仅改核心 | 仅改核心 | 仅改核心 |
+| **分发** | 独立包 | 需重编引擎 | 维护 fork |
+| **适合阶段** | 原型 / 商业插件 | 生产部署 | 长期上游提案 |
+
+### 9.13 实施路径推荐
+
+```mermaid
+flowchart LR
+    subgraph Stage1[阶段一:核心 + BridgeGDExtension]
+        C1[nanite_core<br/>静态库 + 单元测试]
+        B1[bridge_gdext<br/>原型验证]
+        C1 --> B1
+    end
+
+    subgraph Stage2[阶段二:BridgeModule]
+        C2[nanite_core<br/>已稳定]
+        B2[bridge_module<br/>生产部署]
+        C2 --> B2
+    end
+
+    subgraph Stage3[阶段三:BridgeDeep + 上游]
+        C3[nanite_core<br/>已稳定]
+        B3[bridge_deep<br/>patch + GIP]
+        C3 --> B3
+    end
+
+    Stage1 --> Stage2 --> Stage3
+    B1 -. same core .-> B2
+    B2 -. same core .-> B3
+
+    Stage1 -. 可独立交付 .-> D1[商业插件]
+    Stage2 -. 可独立交付 .-> D2[企业 module]
+    Stage3 -. 上游合并 .-> D3[Godot 官方 Nanite]
+```
+
+### 9.14 与方案一二三的关系澄清
+
+第 9 节**不是第四套方案**,而是前三套方案的**重新组织**:
+- 第 3 节(方案一 GDExtension)的内容**完全不变**,但其实现现在归到 `bridge_gdext/`;
+- 第 4 节(方案二 Module)的内容**完全不变**,但其实现现在归到 `bridge_module/`;
+- 第 5 节(方案三 Deep)的内容**完全不变**,但其实现现在归到 `bridge_deep/`;
+- 第 8 节(离线 meshoptimizer 构建)现在归到 `nanite_core/src/builder.cpp`;
+- 第 7 节(阴影/Forward 搭配)的算法部分归到核心,接入部分归到桥接层。
+
+**核心好处**:算法实现只需一份代码,三种接入方式共享。当算法演进(如换 LOD 策略、换 page 调度),只改核心;当 Godot 升级,只改对应桥接层。
+
+### 9.15 演进路径与风险
+
+#### 9.15.1 演进路径
+
+| 阶段 | 核心成熟度 | 桥接层 | 风险 |
+|---|---|---|---|
+| 阶段一 | 算法验证 | BridgeGDExtension | API 边界开销、阴影变通 |
+| 阶段二 | 性能调优 | BridgeModule | 引擎私有头变化 |
+| 阶段三 | 接近最终 | BridgeDeep | 维护 fork + 上游 PR review |
+
+#### 9.15.2 风险与对策
+
+| 风险 | 影响 | 对策 |
+|---|---|---|
+| `INaniteGPUBackend` 抽象泄漏(如 readback 同步问题) | 核心需要感知异步 | 在接口层加 `FenceHandle`,核心通过 fence 等待 |
+| 三桥接层行为不一致(如材质翻译规则差异) | 测试矩阵爆炸 | 提供 `INaniteBridge` conformance test suite |
+| 核心升级破坏桥接层 ABI | 桥接层需重编 | 用 C ABI 边界 + semantic versioning |
+| 方案三 patch 与上游冲突 | rebase 痛苦 | patch 尽量集中、用 git-format-patch 管理 |
+| Godot RenderingDevice API 变更 | 三桥接层同时受影响 | 把 RD 调用全部封装在 `NaniteRDBackend` 内,改一处 |
+
+### 9.16 小结
+
+**核心 + 桥接**架构把"算法实现"与"引擎接入"正交分离:
+
+- **算法一份代码** → 维护成本最低;
+- **三种接入** → 覆盖从原型到上游提案的全场景;
+- **桥接层薄、核心厚** → 算法演进不需要碰引擎;
+- **接口稳定** → 核心可独立单测,不依赖 Godot 运行时。
+
+推荐实施顺序:阶段一(BridgeGDExtension)→ 阶段二(BridgeModule)→ 阶段三(BridgeDeep)。每个阶段都可独立交付,且共享同一份 `nanite_core`。
 
 ---
 
