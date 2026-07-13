@@ -17,6 +17,7 @@
 5. [方案三:深度引擎改造](#5-方案三深度引擎改造)
 6. [三方案横向对比与推荐实施路径](#6-三方案横向对比与推荐实施路径)
 7. [Nanite 与 Godot 阴影/Forward 渲染的搭配](#7-nanite-与-godot-阴影forward-渲染的搭配)
+8. [离线构建模块:基于 meshoptimizer 的层次化 Meshlet + BVH](#8-离线构建模块基于-meshoptimizer-的层次化-meshlet--bvh)
 
 ---
 
@@ -167,20 +168,32 @@ public:
 ### 2.3 核心算法伪代码
 
 ```
-// === 离线 BuildPipeline ===
+// === 离线 BuildPipeline(基于 meshoptimizer,详见第 8 节)===
 function build_nanite(mesh):
-    clusters = initial_cluster(mesh, max_tris=128)   # 图划分,最小化跨簇边
+    # 第 0 层:用 meshopt_buildMeshletsFlex(max_vertices=64, max_triangles=128) 切叶子簇
+    clusters_l0 = meshopt_buildMeshletsFlex(indices, verts, 64, 32, 128, cone_weight=0.5)
+    for c in clusters_l0:
+        c.bounds = meshopt_computeMeshletBounds(...)         # 含法线锥
+        c.error  = 0                                          # 叶子无简化误差
+
+    clusters = clusters_l0
     tree = []
     while len(clusters) > 1:
-        groups = group(clusters, group_size=4)         # 图划分
+        # 用 meshopt_partitionClusters(target_partition_size=4) 把 4 个簇聚成一组
+        groups = meshopt_partitionClusters(clusters, target_partition_size=4)
         new_clusters = []
         for g in groups:
-            simplified = simplify(g, target=0.5)       # QEM 简化
-            children = split(simplified, max_tris=128)  # 再聚类
-            parent_node.bounds = union(children.bounds)
-            parent_node.error = max(children.error, simplification_error)
-            parent_node.children = children
-            tree.append(parent_node)
+            # 合并 g 的所有三角形 → 用 meshopt_simplifyWithAttributes(target=0.5)
+            # vertex_lock 锁住组边界顶点防止跨组裂缝
+            simplified = meshopt_simplifyWithAttributes(merged_indices, ...)
+            # 再用 meshopt_buildMeshletsFlex 切成 2 个新簇
+            children = meshopt_buildMeshletsFlex(simplified, ...)
+            for c in children:
+                c.bounds = meshopt_computeMeshletBounds(...)
+                c.error  = max(child.error, simplification_error)  # 距叶子最远误差
+            tree.append(parent_node{bounds=union(children.bounds),
+                                    error=max(children.error),
+                                    children=children})
             new_clusters.append(parent_node)
         clusters = new_clusters
     return tree, vertex_pool, cluster_meta
@@ -190,6 +203,8 @@ function build_nanite(mesh):
 for node in tree.traverse_iterative():
     if not frustum_cull(node.bounds): continue
     if hzb_occlusion_cull(node.bounds, prev_frame_hzb): continue
+    # 背面剔除可用 cluster 自带的 meshopt_Bounds 法线锥
+    if dot(view_dir, node.cone_axis) >= node.cone_cutoff: continue
     proj_err = node.error * projected_screen_scale(node.bounds)
     if proj_err <= threshold:
         emit_to_visible(node.first_cluster, node.cluster_count)
