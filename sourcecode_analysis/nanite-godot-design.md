@@ -837,7 +837,7 @@ classDiagram
     }
     class Mesh {
         <<改动:新增 SURFACE_NANITE>>
-        +enum SurfaceType { SURFACE_STANDARD, SURFACE_NANITE }
+        +SurfaceType: STANDARD / NANITE
     }
     class NaniteMesh {
         <<新资源>>
@@ -1119,9 +1119,9 @@ flowchart LR
     P3[阶段三:深度改造 / 上游提案<br/>Forward+ 内置 Nanite pass<br/>StandardMaterial3D 直接消费<br/>提交 godot-proposals]
 
     P1 --> P2 --> P3
-    P1 -. 可独立交付 .→ D1[商业插件分发]
-    P2 -. 可独立交付 .→ D2[企业 fork + module]
-    P3 -. 上游合并 .→ D3[Godot 官方 Nanite]
+    P1 -. 可独立交付 .-> D1[商业插件分发]
+    P2 -. 可独立交付 .-> D2[企业 fork + module]
+    P3 -. 上游合并 .-> D3[Godot 官方 Nanite]
 ```
 
 **实施建议**:
@@ -1271,7 +1271,7 @@ flowchart TD
     S1 --> S2[For standard instances:<br/>_fill_render_list SECONDARY]
     S2 --> S3[For nanite instances:<br/>_nanite_render_shadow_pass per light]
     S3 --> S3a[Compute: BVH cull vs light frustum<br/>use light_transform as camera]
-    S3a --> S3b[Compute: shadow LOD select<br/>higher error threshold (coarser)]
+    S3a --> S3b[Compute: shadow LOD select<br/>higher error threshold - coarser]
     S3b --> S3c[Compute: page-request for shadow-visible clusters]
     S3c --> S3d[Draw indirect: depth-only pipeline<br/>write into SAME shadow atlas rect]
     S3d --> S4[_render_shadow_process / _render_shadow_end]
@@ -1752,7 +1752,7 @@ flowchart TD
     Loop -- Yes --> Part[2a. meshopt_partitionClusters<br/>target_partition_size=4]
     Part --> Merge[2b. 合并 partition 的 4 簇<br/>index + vertex 子集]
     Merge --> Lock[2c. 计算 vertex_lock<br/>标记跨组共享边顶点<br/>meshopt_SimplifyVertex_Lock]
-    Lock --> Simp[2d. meshopt_simplifyWithAttributes<br/>target=原/2<br/>target_error=0.5<br/>options=LockBorder|Regularize<br/>取得 result_error]
+    Lock --> Simp[2d. meshopt_simplifyWithAttributes<br/>target=原/2<br/>target_error=0.5<br/>options=LockBorder plus Regularize<br/>取得 result_error]
     Simp --> Recluster[2e. meshopt_buildMeshletsFlex<br/>把简化结果再切 2 簇]
     Recluster --> Bounds2[2f. for child:<br/>computeMeshletBounds<br/>parent.error = max child error,<br/>parent.bounds = union]
     Bounds2 --> Append[2g. tree.append parent]
@@ -1816,7 +1816,7 @@ sequenceDiagram
         loop each partition
             B->>B: merge 4 clusters' index/vertex subset
             B->>B: compute vertex_lock for partition border
-            B->>MO: meshopt_simplifyWithAttributes(target=原/2,<br/>target_error=0.5,<br/>options=LockBorder|Regularize,<br/>vertex_lock=...)
+            B->>MO: meshopt_simplifyWithAttributes(target=原/2,<br/>target_error=0.5,<br/>options=LockBorder+Regularize,<br/>vertex_lock=...)
             MO-->>B: simplified_indices, result_error
             B->>MO: meshopt_buildMeshletsFlex(simplified, ...)
             MO-->>B: child meshlets
@@ -2756,9 +2756,9 @@ classDiagram
     Node <|-- NaniteMeshInstance3D
     NaniteMeshInstance3D --> NaniteMeshResource : holds
     NaniteGDExtCompositor --> NaniteRDBackend : owns
-    NaniteGDExtCompositor --> nanite::Scene : owns
-    NaniteMeshInstance3D ..> nanite::Scene : registers instance via singleton
-    NaniteGDExtImporter ..> nanite::build_mesh : calls
+    NaniteGDExtCompositor --> "nanite::Scene" : owns
+    NaniteMeshInstance3D ..> "nanite::Scene" : registers instance via singleton
+    NaniteGDExtImporter ..> "nanite::build_mesh" : calls
 ```
 
 #### 9.4.3 关键代码
@@ -2872,10 +2872,10 @@ classDiagram
     }
 
     NaniteServer --> NaniteRDBackend : owns
-    NaniteServer --> nanite::Scene : owns
+    NaniteServer --> "nanite::Scene" : owns
     NaniteMeshInstance3D --> NaniteServer : registers via
     NaniteMeshInstance3D --> NaniteMeshResource : holds
-    NaniteImporter ..> nanite::build_mesh : calls
+    NaniteImporter ..> "nanite::build_mesh" : calls
     NaniteEditorPlugin ..> NaniteMeshInstance3D : adds inspector
     RendererSceneCull ..> NaniteServer : queries for nanite instances
     RenderingServerDefault --> NaniteServer : registers
@@ -2974,7 +2974,7 @@ classDiagram
 
     RenderingServerDefault --> NaniteServer : owns
     NaniteServer --> NaniteRDBackend : owns
-    NaniteServer --> nanite::Scene : owns
+    NaniteServer --> "nanite::Scene" : owns
     RenderForwardClustered --> NaniteServer : invokes _nanite_*_pass
     RendererSceneCull --> NaniteServer : queries + sets nanite flag
     MeshInstance3D ..> NaniteServer : creates instance via
@@ -3010,26 +3010,26 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_rd, ...) {
 classDiagram
     class BridgeBase {
         <<interface>>
-        +NaniteRDBackend* backend
-        +nanite::Scene* scene
-        +translate_camera(rd)  CameraData
-        +translate_materials(rd)  Vector~MaterialBinding~
-        +translate_light(light)  LightData
-        +on_import_mesh(file)  MeshResource
-        +on_instance_created(node)
-        +on_instance_destroyed(node)
+        +NaniteRDBackend backend
+        +Scene scene
+        +translate_camera rd CameraData
+        +translate_materials rd MaterialBinding list
+        +translate_light light LightData
+        +on_import_mesh file MeshResource
+        +on_instance_created node
+        +on_instance_destroyed node
     }
     class BridgeGDExtension {
         +CompositorEffect hook
         +EditorImportPlugin importer
         +NaniteMeshInstance3D node_type
-        +no shadow callback (变通)
-        +cannot skip std _render_list
+        +no shadow callback workaround
+        +cannot skip std render_list
     }
     class BridgeModule {
         +NaniteServer singleton
         +access to RendererSceneCull private
-        +instance_set_nanite() skip std cull
+        +instance_set_nanite skip std cull
         +hook before shadow pass via friend
         +WorkerThreadPool build
     }
@@ -3142,13 +3142,10 @@ sequenceDiagram
     participant App as Application
     participant Cull as RendererSceneCull
     participant FC as RenderForwardClustered
-    participant Srv as NaniteServer (Bridge)
-    class NSrv
-    participant Scene as nanite::Scene (Core)
-    class NScene
-    participant GPU as NaniteRDBackend (Bridge)
-    class NGPU
-    participant RD as RenderingDevice (Godot)
+    participant Srv as NaniteServer Bridge
+    participant Scene as nanite Scene Core
+    participant GPU as NaniteRDBackend Bridge
+    participant RD as RenderingDevice Godot
     participant MO as meshoptimizer
 
     Note over App,MO: === 导入阶段(离线)===
