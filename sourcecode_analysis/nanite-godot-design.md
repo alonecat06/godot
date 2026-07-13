@@ -3086,6 +3086,338 @@ flowchart LR
 
 推荐实施顺序:阶段一(GDExtension 桥接)→ 阶段二(Module 桥接)→ 阶段三(Deep 桥接 + 上游提案)。每个阶段独立交付,共享同一份 `nanite/` 核心库。
 
+### 9.16 桥接层的阴影支持方案
+
+**核心问题**:Nanite 实例的几何在核心的 GPU pipeline 内,引擎的标准 shadow pass 看不到它们,必须由 Nanite 自己往 shadow atlas 写深度。三套桥接层获取 shadow atlas framebuffer RID 的能力不同。
+
+#### 9.16.1 Godot 阴影管线现状(源码依据)
+
+`_render_shadow_pass`(`render_forward_clustered.cpp:2605`)的关键流程:
+
+1. 从 `LightStorage` 取光实例的 `shadow_camera`/`shadow_transform`/`directional_rect`;
+2. 对 Spot/Omni 光:从 `shadow_atlas_get_fb(p_shadow_atlas)` 取 atlas framebuffer RID;
+3. 对 Directional 光:从 `directional_shadow_get_fb()` 取专用 atlas framebuffer;
+4. 调 `_render_shadow_begin()` → `_render_shadow_append()` → `_render_shadow_process()` → `_render_shadow_end()` 标准流程写入深度。
+
+**`RenderDataRD`**(`renderer_scene_render_rd.h:252`)包含:
+- `RID shadow_atlas` — shadow atlas RID;
+- `RenderShadowData *render_shadows` — 每个光的 shadow pass 数据(含 light RID、pass 索引、instances 列表)。
+
+**`RenderDataExtension`**(`render_data_extension.h:87`)暴露给 GDExtension 的接口**只有**:
+- `get_render_scene_buffers()` → RenderSceneBuffers
+- `get_render_scene_data()` → RenderSceneData
+- `get_environment()` → RID
+- `get_camera_attributes()` → RID
+
+**没有暴露 `shadow_atlas`、`render_shadows` 或任何阴影相关的 RID**。
+
+**`CompositorEffectCallbackType`**(`rendering_server_enums.h:628`):
+```
+PRE_OPAQUE, POST_OPAQUE, POST_SKY, PRE_TRANSPARENT, POST_TRANSPARENT
+```
+**没有 `PRE_SHADOW` / `POST_SHADOW` 回调类型**。
+
+#### 9.16.2 方案一(GDExtension)的阴影支持
+
+**困难**:CompositorEffect 没有 shadow callback;RenderDataExtension 不暴露 shadow_atlas RID。
+
+**可行方案(3 种,递进)**:
+
+| 方案 | 原理 | 可行性 | 限制 |
+|---|---|---|---|
+| **A. 独立 Shadow Map** | Nanite 自己创建一张 shadow texture,在 `BEFORE_OPAQUE` 中用 Nanite 的光视图 BVH cull + 写深度;然后通过自定义材质/Uniform 把这张 shadow texture 传给 Nanite 材质 eval shader | 完全可行 | 标准 forward 的阴影只含标准 mesh;Nanite 材质需额外 shadow 采样;不与引擎 shadow atlas 共享 |
+| **B. 获取 Shadow Atlas FB** | 通过 `RenderingServer::get_singleton()->get_rendering_device()` 枚举已有 framebuffer,或通过内部类名反射拿到 `LightStorage::get_singleton()` 的 `shadow_atlas_get_fb()` | 技术上可行但不稳定 | 依赖引擎内部 RID 分配顺序,跨版本可能断;GDExtension 不应访问单例内部 |
+| **C. 只对 Nanite 用独立阴影** | 在 `BEFORE_OPAQUE` 中:① 遍历 `RenderDataExtension` 可访问的灯光信息;② 对每个有阴影的光,用 Nanite 自己的 cull + depth-only pipeline 渲染到独立的 shadow texture;③ 在 material eval 阶段采样这张独立 shadow texture | **推荐方案 A 的增强版** | 需要自己管理 shadow atlas 布局;光照 uniform 需复制一份 |
+
+**推荐:方案 A+C(独立 Shadow Atlas + Nanite 材质内采样)**
+
+```mermaid
+flowchart TD
+    BOP[CompositorEffect<br/>BEFORE_OPAQUE callback] --> S1[遍历场景灯光<br/>过滤 cast_shadow 的光]
+    S1 --> S2[对每个光:<br/>构建 light_view_proj]
+    S2 --> S3[NaniteServer.render_shadow<br/>核心 BVH cull + shadow LOD + 写 depth]
+    S3 --> S4[写入 Nanite 独立 shadow texture]
+    S4 --> S5{还有下一个光?}
+    S5 -- Yes --> S2
+    S5 -- No --> S6[NaniteServer.render_camera<br/>cull + raster + HZB]
+    S6 --> AOP[CompositorEffect<br/>AFTER_OPAQUE callback]
+    AOP --> S7[NaniteServer.material_eval<br/>材质评估时同时采样<br/>Nanite shadow texture]
+```
+
+**关键代码(GDExtension 桥接)**:
+
+```cpp
+void NaniteGDExtBridge::_render_callback(const Ref<RenderDataExtension> &p_rd) {
+    NaniteServer *srv = NaniteServer::get_singleton();
+    RenderingDevice *rd = RenderingServer::get_singleton()->get_rendering_device();
+
+    if (cb == RS::COMPOSITOR_EFFECT_CALLBACK_BEFORE_OPAQUE_PASS) {
+        srv->update_gpu_buffers(rd);
+
+        // 阴影:遍历场景灯光,独立渲染 Nanite shadow
+        Array lights = get_shadow_casting_lights();  // 辅助函数
+        for (int i = 0; i < lights.size(); i++) {
+            Dictionary light_info = lights[i];
+            srv->render_shadow(rd,
+                light_info["view_proj"],    // 光的 view_proj
+                light_info["type"],         // directional/spot/omni
+                light_info["shadow_rect"],  // shadow atlas 区域
+                light_info["shadow_fb"]);   // Nanite 自己的 shadow FB
+        }
+
+        srv->render_camera(rd, p_rd);
+    } else {  // AFTER_OPAQUE_PASS
+        srv->material_eval(rd, p_rd);
+        // material_eval 内部同时采样 Nanite shadow texture
+    }
+}
+```
+
+**NaniteGPUPipeline 的 shadow 渲染**:
+
+核心的 `NaniteGPUPipeline` 需要支持两种 shadow 输出目标:
+
+```cpp
+class NaniteGPUPipeline {
+    // ...
+    // 方案一:写入独立 shadow texture(GDExtension 用)
+    void shadow_cull_and_depth_pass(RenderingDevice *p_rd,
+                                     const LightData &p_light,
+                                     RID p_shadow_fb,         // Nanite 自己的 FB
+                                     const Rect2i &p_atlas_rect);
+    // 方案二/三:写入引擎 shadow atlas(Module/Deep 用)
+    void shadow_cull_and_depth_pass(RenderingDevice *p_rd,
+                                     const LightData &p_light,
+                                     RID p_shadow_atlas_fb,   // 引擎的 shadow atlas FB
+                                     const Rect2i &p_atlas_rect);
+};
+```
+
+**独立 Shadow Atlas 的布局**:
+
+Nanite 自己维护一个 shadow atlas,布局方式与引擎类似:
+
+```
+NaniteShadowAtlas (默认 4096×4096)
+├── Quadrant 0 (2048×2048) → Directional Light PSSM splits
+├── Quadrant 1 (2048×2048) → 4 个 Spot Lights (各 1024×1024)
+├── Quadrant 2 (1024×1024) → 16 个 Spot/Omni Lights
+└── Quadrant 3 (1024×1024) → 64 个 Spot/Omni Lights
+```
+
+Nanite shadow atlas 作为 `NaniteCore` 的成员,在 `init` 时通过 `RenderingDevice` 创建:
+
+```cpp
+// nanite/runtime/nanite_core.cpp
+void NaniteCore::init(RenderingDevice *p_rd) {
+    // 创建独立 shadow atlas texture + framebuffer
+    shadow_atlas_texture = p_rd->texture_create(...)
+    shadow_atlas_fb = p_rd->framebuffer_create({shadow_atlas_texture})
+    // ...
+}
+```
+
+#### 9.16.3 方案二(Module)的阴影支持
+
+**优势**:Module 可以访问 `LightStorage` 的公开方法,直接拿到 shadow atlas framebuffer RID。
+
+```cpp
+// Module 桥接可以直接访问:
+RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
+
+// 获取 shadow atlas framebuffer RID
+RID shadow_fb = light_storage->shadow_atlas_get_fb(p_shadow_atlas);
+
+// 获取方向光 shadow 信息
+float directional_shadow_size = light_storage->directional_shadow_get_size();
+light_storage->light_instance_get_shadow_camera(p_light, p_pass);
+light_storage->light_instance_get_shadow_transform(p_light, p_pass);
+light_storage->light_instance_get_directional_rect(p_light);
+```
+
+**两种策略**:
+
+| 策略 | 原理 | 优点 | 缺点 |
+|---|---|---|---|
+| **A. 写入引擎 shadow atlas** | 在标准 shadow pass 前,调 NaniteServer::render_shadow,写入引擎的 shadow_atlas_fb | 标准 forward 的阴影自然包含 Nanite;无需独立 shadow atlas | 需要在 shadow pass 前注入;与标准 shadow pass 共享 atlas 区域 |
+| **B. 独立 shadow atlas** | 同方案一的独立 shadow atlas | 与标准 shadow 完全解耦 | Nanite 材质需额外采样 |
+
+**推荐:策略 A — 写入引擎 shadow atlas**
+
+这是 Module 相对于 GDExtension 的**核心优势** — 可以直接把 Nanite 的深度写入引擎的 shadow atlas,标准材质的光照计算自动看到 Nanite 的阴影。
+
+```mermaid
+flowchart TD
+    Cull[RendererSceneCull<br/>render_camera] --> Split[分流 std / nanite 实例]
+    Split --> Bridge[NaniteModuleBridge<br/>on_pre_shadow_pass]
+    Bridge --> NS[NaniteServer.render_shadow<br/>写入引擎 shadow_atlas_fb]
+    NS --> LightLoop[对每个光:<br/>light_storage 取 shadow_camera/transform<br/>核心 BVH cull + shadow LOD<br/>draw_list 写 depth 到 atlas_fb]
+    LightLoop --> StdShadow[标准 shadow pass<br/>只渲染 std 实例<br/>Nanite 已写完,atlas 复用]
+    StdShadow --> Opaque[_render_scene 继续<br/>opaque / sky / transparent]
+```
+
+**关键代码(Module 桥接)**:
+
+```cpp
+void NaniteModuleBridge::on_pre_shadow_pass(RenderData *p_rd, RID p_shadow_atlas, int p_shadow_count) {
+    NaniteServer *srv = NaniteServer::get_singleton();
+    RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
+    RenderingDevice *rd = RenderingServer::get_singleton()->get_rendering_device();
+
+    // 获取 shadow atlas framebuffer — Module 有权限
+    RID shadow_atlas_fb = light_storage->shadow_atlas_get_fb(p_shadow_atlas);
+    uint32_t atlas_size = light_storage->shadow_atlas_get_size(p_shadow_atlas);
+
+    // 遍历每个 shadow pass
+    for (int i = 0; i < p_shadow_count; i++) {
+        RID light = p_rd->render_shadows[i].light;
+        int pass = p_rd->render_shadows[i].pass;
+
+        // 从 LightStorage 获取光的视图信息
+        RID base = light_storage->light_instance_get_base_light(light);
+        Projection light_proj = light_storage->light_instance_get_shadow_camera(light, pass);
+        Transform3D light_xform = light_storage->light_instance_get_shadow_transform(light, pass);
+
+        // 确定 atlas 区域
+        Rect2i atlas_rect;
+        if (light_storage->light_get_type(base) == RSE::LIGHT_DIRECTIONAL) {
+            atlas_rect = light_storage->light_instance_get_directional_rect(light);
+            // PSSM split 处理
+            if (light_storage->light_directional_get_shadow_mode(base) == RSE::LIGHT_DIRECTIONAL_SHADOW_PARALLEL_4_SPLITS) {
+                atlas_rect.size.width /= 2;
+                atlas_rect.size.height /= 2;
+                if (pass == 1) atlas_rect.position.x += atlas_rect.size.width;
+                else if (pass == 2) atlas_rect.position.y += atlas_rect.size.height;
+                else if (pass == 3) { atlas_rect.position.x += atlas_rect.size.width; atlas_rect.position.y += atlas_rect.size.height; }
+            }
+        } else {
+            // Spot/Omni:从 shadow_atlas 获取 quadrant/region
+            // ... (与 _render_shadow_pass 相同的逻辑)
+        }
+
+        // 调用核心写入引擎 shadow atlas
+        srv->render_shadow_to_atlas(rd, light_proj, light_xform,
+                                     shadow_atlas_fb, atlas_rect, atlas_size,
+                                     light_storage->light_get_type(base) == RSE::LIGHT_DIRECTIONAL);
+    }
+}
+```
+
+**注意**:在标准 shadow pass 执行时,Nanite 实例已被 `instance_filter_nanite` 从实例列表中排除,所以不会重复绘制。
+
+#### 9.16.4 方案三(Deep)的阴影支持
+
+最简单 — 直接在 `_render_shadow_pass` 内部插入 Nanite shadow 调用,与标准 mesh 共享同一个 draw pass:
+
+```cpp
+// render_forward_clustered.cpp 改动
+void RenderForwardClustered::_render_shadow_pass(RID p_light, RID p_shadow_atlas, int p_pass, ...) {
+    // ... 原有 setup atlas_rect / render_fb / light_transform ...
+
+    // 新增:在标准 shadow append 之前,先让 Nanite 写深度
+    if (NaniteServer::get_singleton()->has_shadow_instances(p_light, p_pass)) {
+        NaniteServer::get_singleton()->render_shadow_in_atlas(
+            p_light, p_shadow_atlas, p_pass,
+            light_projection, light_transform,
+            atlas_rect, render_fb  // 引擎的 shadow atlas FB
+        );
+    }
+
+    // 原有:标准 mesh shadow(不含 Nanite 实例)
+    _render_shadow_append(render_fb, p_instances, ...);
+    _render_shadow_process();
+    _render_shadow_end();
+}
+```
+
+#### 9.16.5 三方案阴影能力对比
+
+| 能力 | GDExtension 桥接 | Module 桥接 | Deep 桥接 |
+|---|---|---|---|
+| Shadow atlas 访问 | ❌ 无 API | ✅ LightStorage 公开方法 | ✅ 直接内部访问 |
+| Shadow callback | ❌ 无 | ⚠️ 需 hook(通过 friend) | ✅ 在 _render_shadow_pass 内 |
+| 写入引擎 shadow atlas | ❌ 不可能 | ✅ 可行 | ✅ 可行 |
+| 独立 shadow atlas | ✅ 必须 | ⚠️ 可选 | ⚠️ 可选(不推荐) |
+| 标准 mesh 看 Nanite 阴影 | ❌ 否(独立 atlas) | ✅ 是(同一 atlas) | ✅ 是(同一 atlas) |
+| Nanite 看标准 mesh 阴影 | ⚠️ 需额外采样引擎 shadow texture | ✅ 是 | ✅ 是 |
+| 方向光 PSSM | ✅ 自己实现 | ✅ 从 LightStorage 取 | ✅ 直接复用 |
+| Spot/Omni shadow | ✅ 自己实现 | ✅ 从 LightStorage 取 | ✅ 直接复用 |
+| 阴影质量 | 略差(独立 atlas 分辨率可能更低) | 与标准一致 | 与标准一致 |
+
+#### 9.16.6 NaniteCore 的 shadow 接口统一
+
+核心的 `NaniteGPUPipeline` 提供统一接口,桥接层选择输出目标:
+
+```cpp
+// nanite/runtime/nanite_gpu_pipeline.h
+class NaniteGPUPipeline {
+public:
+    // 统一 shadow 渲染接口
+    // 桥接层提供 shadow framebuffer 和 atlas 区域
+    void shadow_pass(RenderingDevice *p_rd,
+                     const NaniteShadowParams &p_params);
+
+    // Nanite 独立 shadow atlas(方案一用)
+    void ensure_shadow_atlas(RenderingDevice *p_rd, uint32_t p_size);
+    RID get_shadow_atlas_texture() const;
+};
+
+struct NaniteShadowParams {
+    // 光视图(所有方案都需要)
+    Projection light_projection;
+    Transform3D light_transform;
+    int light_type;  // 0=directional, 1=spot, 2=omni
+
+    // 输出目标(桥接层提供)
+    RID shadow_fb;           // framebuffer RID(引擎的或独立的)
+    Rect2i atlas_rect;       // 在 atlas 中的区域
+    uint32_t atlas_size;     // atlas 总尺寸
+
+    // Shadow 特定参数
+    float error_threshold_scale = 4.0f;  // 阴影 LOD 放大系数
+    bool use_pancake = false;
+    float zfar = 0.0f;
+};
+```
+
+**桥接层各自构造 `NaniteShadowParams`**:
+
+| 方案 | shadow_fb 来源 | atlas_rect 来源 |
+|---|---|---|
+| GDExtension | `NaniteGPUPipeline::ensure_shadow_atlas()` 创建的独立 FB | Nanite 自己管理 shadow atlas 布局 |
+| Module | `LightStorage::shadow_atlas_get_fb()` | `LightStorage::light_instance_get_directional_rect()` 等 |
+| Deep | 直接传 `_render_shadow_pass` 内的 `render_fb` 和 `atlas_rect` |
+
+#### 9.16.7 方案一阴影的材质采样
+
+GDExtension 桥接使用独立 shadow atlas 时,Nanite 的 material eval shader 需要同时采样:
+1. **引擎的 shadow atlas** — 用于标准 mesh 投射到 Nanite 表面的阴影;
+2. **Nanite 自己的 shadow atlas** — 用于 Nanite mesh 自身阴影。
+
+```glsl
+// nanite_material_eval.glsl (方案一增强版)
+layout(set=2, binding=0) uniform texture2D engine_shadow_atlas;  // 引擎的
+layout(set=2, binding=1) uniform texture2D nanite_shadow_atlas;  // Nanite 自己的
+layout(set=2, binding=2) uniform sampler shadow_sampler;
+
+// 在计算光照时:
+float engine_shadow = texture(sampler2D(engine_shadow_atlas, shadow_sampler), shadow_uv);
+float nanite_shadow = texture(sampler2D(nanite_shadow_atlas, shadow_sampler), shadow_uv);
+float shadow = min(engine_shadow, nanite_shadow);  // 取最暗
+```
+
+对于方案二/三,因为写入同一份 shadow atlas,material eval 只需采样引擎的 shadow atlas 即可,无需额外逻辑。
+
+#### 9.16.8 阴影支持的实施建议
+
+| 阶段 | 阴影方案 | 说明 |
+|---|---|---|
+| 阶段一(GDExtension) | 独立 shadow atlas | 功能完整但视觉质量略低(标准 mesh 不投射阴影到 Nanite) |
+| 阶段二(Module) | 写入引擎 shadow atlas | **推荐**:标准 mesh 与 Nanite 共享阴影,视觉一致 |
+| 阶段三(Deep) | 直接嵌入 _render_shadow_pass | 最干净,零额外开销 |
+
+**方案一的优化路径**:如果后续 Godot 在 `RenderDataExtension` 中暴露 `shadow_atlas` RID 和 shadow callback,则方案一也可以写入引擎 shadow atlas,消除独立 shadow atlas 的需求。这是值得向上游提 Feature Request 的点。
+
 ---
 
 ## 附录 B:资源文件格式(序列化)
