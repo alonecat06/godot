@@ -2696,58 +2696,58 @@ public:
 classDiagram
     class RenderingDevice {
         <<Godot>>
-        +compute_list_begin()
-        +draw_list_begin()
-        +buffer_create()
-        +texture_create()
+        +compute_list_begin
+        +draw_list_begin
+        +buffer_create
+        +texture_create
     }
     class CompositorEffect {
         <<Godot>>
-        +set_callback(type, callable)
+        +set_callback type, callable
     }
     class EditorImportPlugin {
         <<Godot>>
-        +import(file, options)
+        +import file, options
     }
     class Node {
         <<Godot>>
     }
     class NaniteRDBackend {
         <<implements INaniteGPUBackend>>
-        -RenderingDevice* rd
-        +create_buffer(size, usage)  BufferHandle
-        +begin_compute_pass()  ComputeListHandle
-        +begin_draw_pass(colors, depth)  DrawListHandle
-        +submit()
+        -RenderingDevice rd
+        +create_buffer BufferHandle
+        +begin_compute_pass ComputeListHandle
+        +begin_draw_pass DrawListHandle
+        +submit
     }
     class NaniteGDExtCompositor {
-        -nanite::Scene* scene
-        -NaniteRDBackend* backend
-        -NaniteCoreShaderCache* shaders
-        -NaniteCorePageCache* page_cache
-        +_render_callback(Ref~RenderDataExtension~)
-        -dispatch_camera_pass(RenderData*)
-        -dispatch_shadow_pass(RenderData*)
-        -dispatch_material_eval_pass(RenderData*)
+        -Scene scene
+        -NaniteRDBackend backend
+        -NaniteCoreShaderCache shaders
+        -NaniteCorePageCache page_cache
+        +render_callback RenderDataExtension
+        -dispatch_camera_pass RenderData
+        -dispatch_shadow_pass RenderData
+        -dispatch_material_eval_pass RenderData
     }
     class NaniteGDExtImporter {
-        +import(source_file, options)
-        -build_nanite_resource(PackedArrays)
+        +import source_file, options
+        -build_nanite_resource PackedArrays
     }
     class NaniteMeshInstance3D {
-        -Ref~NaniteMeshResource~ resource
-        -nanite::InstanceId instance_id
-        +set_nanite_mesh(Ref~NaniteMeshResource~)
-        +_ready()
-        +_notification(NOTIFICATION_INTERNAL_PROCESS)
-        +_get_property_list()
+        -NaniteMeshResource resource
+        -InstanceId instance_id
+        +set_nanite_mesh NaniteMeshResource
+        +ready
+        +notification INTERNAL_PROCESS
+        +get_property_list
     }
     class NaniteMeshResource {
         -String nanite_file_path
-        -nanite::MeshResource core_resource
-        +build_from_arrays(PackedArrays)
-        +save(path)
-        +load(path)
+        -MeshResource core_resource
+        +build_from_arrays PackedArrays
+        +save path
+        +load path
     }
 
     RenderingDevice <.. NaniteRDBackend : wraps
@@ -2756,9 +2756,9 @@ classDiagram
     Node <|-- NaniteMeshInstance3D
     NaniteMeshInstance3D --> NaniteMeshResource : holds
     NaniteGDExtCompositor --> NaniteRDBackend : owns
-    NaniteGDExtCompositor --> "nanite::Scene" : owns
-    NaniteMeshInstance3D ..> "nanite::Scene" : registers instance via singleton
-    NaniteGDExtImporter ..> "nanite::build_mesh" : calls
+    NaniteGDExtCompositor --> Scene : owns
+    NaniteMeshInstance3D ..> Scene : registers instance via singleton
+    NaniteGDExtImporter ..> Scene : calls build_mesh
 ```
 
 #### 9.4.3 关键代码
@@ -2834,7 +2834,7 @@ void NaniteGDExtCompositor::_render_callback(const Ref<RenderDataExtension> &p_r
 classDiagram
     class RendererSceneCull {
         <<Godot, friend access>>
-        +_instance_filter_nanite(...)
+        +instance_filter_nanite
     }
     class RenderingServerDefault {
         <<Godot, friend access>>
@@ -2844,38 +2844,38 @@ classDiagram
         <<Godot>>
     }
     class NaniteServer {
-        +Object* singleton
-        +NaniteRDBackend* backend
-        +nanite::Scene* scene
-        +update_instances()
-        +render_camera(render_data)
-        +render_shadow(render_data, light, pass)
+        +Object singleton
+        +NaniteRDBackend backend
+        +Scene scene
+        +update_instances
+        +render_camera render_data
+        +render_shadow render_data, light, pass
     }
     class NaniteRDBackend {
         <<implements INaniteGPUBackend>>
-        -RenderingDevice* rd
+        -RenderingDevice rd
     }
     class NaniteMeshInstance3D {
-        -Ref~NaniteMeshResource~ resource
+        -NaniteMeshResource resource
         -RID nanite_instance_rid
-        +set_nanite_mesh(...)
+        +set_nanite_mesh resource
     }
     class NaniteMeshResource {
-        -nanite::MeshResource core
-        +build_from_arrays(...)
+        -MeshResource core
+        +build_from_arrays
     }
     class NaniteImporter {
-        +import(...)
+        +import
     }
     class NaniteEditorPlugin {
         +EditorInspectorPlugin
     }
 
     NaniteServer --> NaniteRDBackend : owns
-    NaniteServer --> "nanite::Scene" : owns
+    NaniteServer --> Scene : owns
     NaniteMeshInstance3D --> NaniteServer : registers via
     NaniteMeshInstance3D --> NaniteMeshResource : holds
-    NaniteImporter ..> "nanite::build_mesh" : calls
+    NaniteImporter ..> Scene : calls build_mesh
     NaniteEditorPlugin ..> NaniteMeshInstance3D : adds inspector
     RendererSceneCull ..> NaniteServer : queries for nanite instances
     RenderingServerDefault --> NaniteServer : registers
@@ -2940,42 +2940,42 @@ void NaniteServer::render_camera_render_data(RenderData *p_rd) {
 classDiagram
     class RenderingServer {
         <<改动:nanite_* 方法>>
-        +nanite_mesh_create()
-        +nanite_instance_create()
+        +nanite_mesh_create
+        +nanite_instance_create
     }
     class RenderingServerDefault {
-        +NaniteServer* nanite_server
+        +NaniteServer nanite_server
     }
     class RendererSceneCull {
         <<改动:Nanite 实例分流>>
-        +instance_set_nanite(RID, bool)
-        -_instance_filter_nanite(...)
+        +instance_set_nanite RID, bool
+        -instance_filter_nanite
     }
     class RenderForwardClustered {
-        <<改动:新增 _nanite_*_pass>>
-        -_nanite_cull_pass(...)
-        -_nanite_raster_pass(...)
-        -_nanite_material_eval_pass(...)
-        -_nanite_render_shadow_pass(...)
+        <<改动:新增 nanite pass>>
+        -nanite_cull_pass
+        -nanite_raster_pass
+        -nanite_material_eval_pass
+        -nanite_render_shadow_pass
     }
     class MeshInstance3D {
         <<改动>>
-        +set_nanite_mesh(Ref~NaniteMesh~)
+        +set_nanite_mesh NaniteMesh
     }
     class NaniteServer {
         <<同方案二,但 engine-internal>>
-        +NaniteRDBackend* backend
-        +nanite::Scene* scene
+        +NaniteRDBackend backend
+        +Scene scene
     }
     class NaniteRDBackend {
         <<implements INaniteGPUBackend>>
-        -RenderingDevice* rd
+        -RenderingDevice rd
     }
 
     RenderingServerDefault --> NaniteServer : owns
     NaniteServer --> NaniteRDBackend : owns
-    NaniteServer --> "nanite::Scene" : owns
-    RenderForwardClustered --> NaniteServer : invokes _nanite_*_pass
+    NaniteServer --> Scene : owns
+    RenderForwardClustered --> NaniteServer : invokes nanite pass
     RendererSceneCull --> NaniteServer : queries + sets nanite flag
     MeshInstance3D ..> NaniteServer : creates instance via
 ```
