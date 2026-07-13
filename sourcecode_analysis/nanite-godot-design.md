@@ -2487,6 +2487,8 @@ classDiagram
         -NaniteGPUPipeline gpu_pipeline
         -NanitePageCache page_cache
         -NaniteCore core_logic
+        -NaniteDebug debug
+        -ShadowMode shadow_mode
         +nanite_mesh_allocate RID
         +nanite_mesh_initialize RID, NaniteMeshResource
         +nanite_mesh_free RID
@@ -2498,6 +2500,8 @@ classDiagram
         +render_camera RenderData
         +render_shadow RenderData, RID light, int pass
         +material_eval RenderData
+        +set_debug_mode NaniteDebugMode
+        +set_shadow_mode ShadowMode
     }
 ```
 
@@ -2635,6 +2639,114 @@ classDiagram
     }
 ```
 
+#### 9.4.8 NaniteDebug — 调试可视化
+
+核心库内置调试模块,通过 `NaniteServer` 的调试开关控制,无需桥接层额外代码:
+
+```mermaid
+classDiagram
+    class NaniteDebug {
+        +NaniteDebugMode mode
+        +bool wireframe_overlay
+        +bool show_bounds
+        +float cluster_color_seed
+        +set_mode NaniteDebugMode
+        +get_cluster_color uint cluster_id Color
+        +get_lod_color uint depth Color
+        +build_debug_uniforms RenderingDevice RID
+    }
+    class NaniteDebugMode {
+        <<enum>>
+        NONE
+        CLUSTER_SOLID_COLOR
+        LOD_SOLID_COLOR
+        OVERDRAW_HEATMAP
+        PAGE_RESIDENCY
+    }
+    NaniteDebug --> NaniteDebugMode : reads
+```
+
+**调试模式说明**:
+
+| 模式 | 效果 | 实现方式 |
+|---|---|---|
+| `NONE` | 正常渲染(默认) | — |
+| `CLUSTER_SOLID_COLOR` | 每个 cluster 以不同纯色渲染,可直观看到 meshlet 切分边界 | material_eval 阶段用 `cluster_id` 哈希生成颜色,替换材质颜色 |
+| `LOD_SOLID_COLOR` | 不同 BVH 深度的 cluster 以不同颜色渲染,可直观看到 LOD 分布 | 按 `node.depth` 映射到色带(蓝→绿→黄→红) |
+| `OVERDRAW_HEATMAP` | 像素覆盖次数热力图,蓝(1次)→绿→黄→红(高频覆盖) | raster 阶段 atomic counter 累加,material_eval 读回并映射颜色 |
+| `PAGE_RESIDENCY` | 已加载 page 绿色/未加载红色,可观察流式加载状态 | cluster 的 page_id 查 page_cache 状态映射颜色 |
+
+**开关方式**:通过 `NaniteServer::set_debug_mode()` 或引擎控制台命令:
+
+```
+# 控制台命令
+nanite_debug cluster    # CLUSTER_SOLID_COLOR
+nanite_debug lod        # LOD_SOLID_COLOR
+nanite_debug overdraw   # OVERDRAW_HEATMAP
+nanite_debug page       # PAGE_RESIDENCY
+nanite_debug off        # NONE
+nanite_debug wireframe on   # 叠加线框
+nanite_debug bounds on      # 显示 AABB
+```
+
+**GPU 实现**:调试不改变 cull/raster 流程,只在 `material_eval.glsl` 的最后阶段替换输出颜色:
+
+```glsl
+// material_eval.glsl — 调试分支(编译时 #define 或 push_constant 开关)
+if (debug_mode == DEBUG_CLUSTER_SOLID_COLOR) {
+    // 基于 cluster_id 哈希生成伪随机纯色
+    uint hash = cluster_id * 2654435761u;  // Knuth multiplicative hash
+    albedo = vec3(
+        float((hash >>  0) & 0xFF) / 255.0,
+        float((hash >>  8) & 0xFF) / 255.0,
+        float((hash >> 16) & 0xFF) / 255.0);
+}
+else if (debug_mode == DEBUG_LOD_SOLID_COLOR) {
+    // 按 depth 映射色带:0=蓝, 1=青, 2=绿, 3=黄, 4+=红
+    float t = clamp(float(lod_depth) / 4.0, 0.0, 1.0);
+    albedo = mix(vec3(0.0, 0.0, 1.0), vec3(1.0, 0.0, 0.0), t);
+    albedo = mix(albedo, vec3(0.0, 1.0, 0.0), step(0.25, t) * (1.0 - step(0.75, t)));
+}
+```
+
+**NaniteCore 中的集成**:
+
+```cpp
+// nanite/runtime/nanite_core.h — 新增调试相关成员
+class NaniteCore {
+    // ... 原有成员 ...
+    NaniteDebug debug;
+
+public:
+    void set_debug_mode(NaniteDebugMode p_mode) { debug.set_mode(p_mode); }
+    NaniteDebugMode get_debug_mode() const { return debug.mode; }
+
+    // 在 render_camera_pass 末尾构建调试 push constants
+    void _build_debug_push_constants(RenderingDevice *p_rd, RID p_cmd_buf) {
+        if (debug.mode != NANITE_DEBUG_NONE) {
+            debug.build_debug_uniforms(p_rd, p_cmd_buf);
+        }
+    }
+};
+```
+
+**NaniteServer 调试 API**:
+
+```cpp
+// nanite/runtime/nanite_server.h — 新增调试接口
+class NaniteServer : public Object {
+    // ... 原有成员 ...
+public:
+    // 调试控制(所有桥接层通用)
+    void set_debug_mode(int p_mode);  // NaniteDebugMode 枚举值
+    int get_debug_mode() const;
+    void set_debug_wireframe(bool p_enabled);
+    bool is_debug_wireframe() const;
+    void set_debug_show_bounds(bool p_enabled);
+    bool is_debug_show_bounds() const;
+};
+```
+
 ### 9.5 编辑器模块:离线构建
 
 离线构建与运行时整合完全无关,放在核心的 `editor/` 子目录。所有三方案共用同一套构建代码(基于 meshoptimizer,详见第 8 节):
@@ -2682,7 +2794,8 @@ classDiagram
 - 桥接层无需关心构建细节,只需调用 `NaniteImporter` 或手动触发 `NaniteBuilder::build()`。
 
 **粗 LOD Shadow Mesh 的用途**:
-- **GDExtension / Module 桥接**:运行时通过 `mesh_set_shadow_mesh` 把粗 LOD 设为 shadow_mesh,引擎 shadow pass 自动使用;
+- **GDExtension 桥接**:运行时通过 `mesh_set_shadow_mesh` 把粗 LOD 设为 shadow_mesh,引擎 shadow pass 自动使用;
+- **Module 桥接**:不使用粗 LOD Shadow Mesh(使用动态 per-light GPU shadow,写入引擎 shadow atlas),但构建的 `shadow_mesh` 仍可作为备用降级方案;
 - **Deep 桥接**:不使用粗 LOD Shadow Mesh(直接在 `_render_shadow_pass` 内做动态 GPU shadow cull),但 `shadow_mesh` 仍可作为 SDFGI/VoxelGI 烘焙用的低 LOD 代表几何。
 
 ### 9.6 三桥接层设计
@@ -2766,11 +2879,14 @@ GDExtension 无法访问 shadow atlas framebuffer,也没有 shadow callback。�
 void NaniteMeshInstance3D::_ready() {
     if (nanite_resource.is_valid()) {
         NaniteServer::get_singleton()->nanite_instance_create(...);
-        // 阴影:把粗 LOD 设为 shadow_mesh
-        RID base_mesh_rid = get_mesh();
-        if (base_mesh_rid.is_valid() && nanite_resource->shadow_mesh.is_valid()) {
-            RenderingServer::get_singleton()->mesh_set_shadow_mesh(
-                base_mesh_rid, nanite_resource->shadow_mesh->get_rid());
+        // 阴影(GDExtension 桥接):把粗 LOD 设为 shadow_mesh
+        // Module/Deep 桥接:不调用此方法,使用动态 GPU shadow
+        if (NaniteServer::get_singleton()->get_shadow_mode() == NANITE_SHADOW_COARSE_LOD) {
+            RID base_mesh_rid = get_mesh();
+            if (base_mesh_rid.is_valid() && nanite_resource->shadow_mesh.is_valid()) {
+                RenderingServer::get_singleton()->mesh_set_shadow_mesh(
+                    base_mesh_rid, nanite_resource->shadow_mesh->get_rid());
+            }
         }
     }
 }
@@ -3066,8 +3182,8 @@ Ref<ArrayMesh> NaniteBuilder::build_shadow_mesh(
 | **桥接代码量** | ~200 行 | ~150 行 | ~150 行 |
 | **核心调用入口** | CompositorEffect callback | SceneCull + NaniteServer 直调 | _render_scene 内嵌 |
 | **实例分流** | visible=false 隐藏代理 mesh | instance_set_nanite 跳过 std cull | _fill_render_list 排除 |
-| **阴影方案** | 粗 LOD Shadow Mesh(公开 API) | 粗 LOD Shadow Mesh(公开 API) | 动态 per-light GPU shadow(源码内嵌) |
-| **阴影精度** | 固定粗 LOD | 固定粗 LOD | 动态 LOD |
+| **阴影方案** | 粗 LOD Shadow Mesh(公开 API) | 动态 per-light GPU shadow(hook + LightStorage 内部 RID) | 动态 per-light GPU shadow(源码内嵌) |
+| **阴影精度** | 固定粗 LOD | 动态 LOD | 动态 LOD |
 | **GI/SDFGI 集成** | 不参与烘焙 | 不参与烘焙 | ✅ 低 LOD 代表几何参与 |
 | **材质绑定** | RenderDataExtension 提取 | MaterialStorage 直接取 | StandardMaterial3D 直接 |
 | **NaniteServer 注册** | ClassDB GDExtension | ClassDB 原生 | RenderingServer 原生 |
@@ -3089,22 +3205,29 @@ sequenceDiagram
     Note over App,RD: === 导入阶段 - 核心编辑器模块 ===
     App->>Server: nanite_mesh_initialize via NaniteImporter
     Server->>Server: NaniteBuilder.build via meshoptimizer
-    Server->>Server: NaniteBuilder.build_shadow_mesh 粗LOD
     Server->>RD: create_buffer for vertex/index/node/cluster
 
     Note over App,RD: === 运行时实例注册 - 核心运行时 ===
     App->>Server: nanite_instance_create mesh_id
-    App->>RD: mesh_set_shadow_mesh 原始mesh, 粗LOD ArrayMesh
 
     Note over App,RD: === 每帧渲染 - 桥接层协调 ===
     App->>Cull: render_camera
     Cull->>Bridge: on_cull_collect_instances
     Bridge->>Server: query nanite instance list
     Server->>Core: update_instance_buffer
+
+    Note over Cull,Bridge: 阴影阶段 - Module 桥接 on_pre_shadow_pass
+    loop 每个 shadow pass
+        Cull->>Bridge: on_pre_shadow_pass render_data, light, pass_index
+        Bridge->>Server: has_shadow_instances light, pass_index
+        Bridge->>Server: render_shadow_in_atlas light, pass_index, rd
+        Server->>Core: render_shadow_pass rd, light, pass_index
+        Core->>GPU: shadow_cull + shadow_depth
+        GPU->>RD: compute + draw_list - 写入引擎shadow atlas
+        Cull->>FC: _render_shadow_pass - 标准mesh + Nanite阴影已在atlas中
+    end
+
     Cull->>FC: _render_scene
-
-    Note over FC: 阴影由 mesh_set_shadow_mesh 处理<br/>引擎自动用粗LOD渲染Nanite阴影
-
     FC->>Bridge: on_pre_opaque_pass rd
     Bridge->>Server: render_camera rd
     Server->>Core: render_camera_pass
@@ -3135,13 +3258,15 @@ nanite/                                 # 核心库(依赖 Godot, 不改 Godot)
 │   ├── nanite_mesh_instance_3d.h/.cpp  # NaniteMeshInstance3D 节点
 │   ├── nanite_gpu_pipeline.h/.cpp      # NaniteGPUPipeline shader/pass
 │   ├── nanite_page_cache.h/.cpp        # NanitePageCache 流式加载
+│   ├── nanite_debug.h/.cpp             # NaniteDebug 调试可视化
 │   └── shaders/                        # GLSL 源码
 │       ├── cull.glsl
 │       ├── raster.vert / .frag
 │       ├── soft_raster.glsl
 │       ├── material_eval.glsl
 │       ├── hzb_build.glsl
-│       └── shadow_cull.glsl
+│       ├── shadow_cull.glsl
+│       └── debug_overlay.glsl          # 调试可视化(wireframe/bounds)
 ├── editor/                             # 编辑器模块(离线构建)
 │   ├── nanite_builder.h/.cpp           # NaniteBuilder (meshopt)
 │   ├── nanite_builder_config.h         # NaniteBuilderConfig
@@ -3203,11 +3328,25 @@ public:
     void render_camera(RenderData *p_render_data);
     void material_eval(RenderData *p_render_data);
 
-    // —— Shadow(仅 Deep 桥接使用)——
+    // —— Shadow(Module + Deep 桥接使用)——
     bool has_shadow_instances(RID p_light, int p_pass);
+    void render_shadow_in_atlas(RID p_light, int p_pass,
+                                 RenderData *p_render_data);
+    // —— Deep 桥接额外重载(直接传 shadow atlas 参数)——
     void render_shadow_in_atlas(RID p_light, RID p_shadow_atlas, int p_pass,
                                  const Projection &p_light_proj, const Transform3D &p_light_xform,
                                  const Rect2i &p_atlas_rect, RID p_shadow_fb);
+
+    // —— 调试(所有桥接层通用)——
+    void set_debug_mode(int p_mode);
+    int get_debug_mode() const;
+    void set_debug_wireframe(bool p_enabled);
+    void set_debug_show_bounds(bool p_enabled);
+
+    // —— 阴影模式(由桥接层初始化时设置)——
+    enum ShadowMode { SHADOW_COARSE_LOD, SHADOW_DYNAMIC_GPU };
+    void set_shadow_mode(ShadowMode p_mode);
+    ShadowMode get_shadow_mode() const;
 };
 ```
 
@@ -3216,11 +3355,12 @@ public:
 | API | GDExtension 桥接 | Module 桥接 | Deep 桥接 |
 |---|---|---|---|
 | `nanite_instance_create` | `NaniteMeshInstance3D::_ready()` | 同左 | `MeshInstance3D::_notification()` |
-| `mesh_set_shadow_mesh` | ✅ `_ready()` 中调用(公开 API) | ✅ 同左 | ❌ 不使用(动态 GPU shadow) |
+| `mesh_set_shadow_mesh` | ✅ `_ready()` 中调用(公开 API) | ❌ 不使用(动态 GPU shadow) | ❌ 不使用(动态 GPU shadow) |
 | `render_camera` | `BEFORE_OPAQUE` callback | opaque 前 hook | `_render_scene` 内直接调 |
-| `render_shadow_in_atlas` | ❌ 不使用 | ❌ 不使用 | ✅ `_render_shadow_pass` 内调 |
+| `render_shadow_in_atlas` | ❌ 不使用 | ✅ `on_pre_shadow_pass` 内调 | ✅ `_render_shadow_pass` 内调 |
 | `material_eval` | `AFTER_OPAQUE` callback | opaque 后 hook | `_render_scene` 内调 |
 | `update_gpu_buffers` | `BEFORE_OPAQUE` callback 内 | opaque 前 | `_render_scene` 前 |
+| `set_debug_mode` | ✅ 所有桥接层通用 | ✅ | ✅ |
 
 ### 9.11 桥接层代码示例
 
@@ -3257,7 +3397,7 @@ private:
 };
 ```
 
-#### Module 桥接(~150 行)
+#### Module 桥接(~200 行)
 
 ```cpp
 // bridge_module/nanite_module_bridge.h
@@ -3269,11 +3409,17 @@ public:
     void on_cull_collect_instances(RendererSceneCull *p_cull) {
         p_cull->_instance_filter_nanite();
     }
+    void on_pre_shadow_pass(RenderData *p_rd, RID p_light, int p_pass_index) {
+        NaniteServer *srv = NaniteServer::get_singleton();
+        if (srv->has_shadow_instances(p_light, p_pass_index)) {
+            // 动态 per-light GPU shadow:BVH cull + 写入引擎 shadow atlas
+            srv->render_shadow_in_atlas(p_light, p_pass_index, p_rd);
+        }
+    }
     void on_pre_opaque_pass(RenderData *p_rd) {
         NaniteServer::get_singleton()->update_gpu_buffers(
             RenderingServer::get_singleton()->get_rendering_device());
         NaniteServer::get_singleton()->render_camera(p_rd);
-        // 阴影由 mesh_set_shadow_mesh 处理,无需额外操作
     }
     void on_post_opaque_pass(RenderData *p_rd) {
         NaniteServer::get_singleton()->material_eval(p_rd);
