@@ -2680,9 +2680,49 @@ classDiagram
 
 ### 9.6 三桥接层设计
 
-桥接层**只负责"如何把核心注入 Godot 渲染管线"**,不包含任何数据结构或算法逻辑。每个桥接层的目标是 < 500 行代码。
+桥接层**只负责"如何把核心注入 Godot 渲染管线"**,不包含任何数据结构或算法逻辑。
 
-#### 9.6.1 桥接层 1:GDExtension
+**阴影策略的核心差异**:
+- **GDExtension / Module 桥接**:无法深度介入引擎 shadow pass,使用**粗 LOD Shadow Mesh**方案——利用 Godot 已有的 `mesh_set_shadow_mesh` 公开 API,把 Nanite 粗 LOD 几何设为 shadow_mesh,引擎 shadow pass 自动使用;
+- **Deep 桥接**:直接改引擎源码,在 `_render_shadow_pass` 内插入 Nanite GPU shadow cull,实现**动态 per-light LOD 阴影**,与引擎 shadow atlas/GI/SDFGI 完全打通。
+
+#### 9.6.1 阴影方案前置:Godot 已有的 Shadow Mesh 机制
+
+GDExtension 和 Module 桥接利用 Godot 内置的"替代阴影几何"机制:
+
+**`mesh_set_shadow_mesh` — RenderingServer 公开 API**(已绑定到 ClassDB,GDExtension 可调用):
+
+```cpp
+// rendering_server.h:239
+virtual void mesh_set_shadow_mesh(RID p_mesh, RID p_shadow_mesh) = 0;
+
+// rendering_server.cpp:2389 — 已绑定 ClassDB
+ClassDB::bind_method(D_METHOD("mesh_set_shadow_mesh", "mesh", "shadow_mesh"),
+                      &RenderingServer::mesh_set_shadow_mesh);
+```
+
+**Shadow pass 自动使用 `surface_shadow`**(`render_forward_clustered.cpp:360-363`):
+
+```cpp
+if (shadow_pass || p_pass_mode == PASS_MODE_DEPTH) {
+    mesh_surface = surf->surface_shadow;  // 阴影用替代几何
+} else {
+    mesh_surface = surf->surface;         // 正常用原始几何
+}
+```
+
+**`surface_shadow` 来源**(`render_forward_clustered.cpp:4228-4255`):
+
+```cpp
+RID shadow_mesh = mesh_storage->mesh_get_shadow_mesh(p_mesh);
+if (shadow_mesh.is_valid()) {
+    surface_shadow = mesh_storage->mesh_get_surface(shadow_mesh, p_surface);
+}
+sdcache->surface_shadow = surface_shadow ? surface_shadow : sdcache->surface;
+// 没有 shadow_mesh 时 fallback 到原始 surface
+```
+
+#### 9.6.2 桥接层 1:GDExtension
 
 ```mermaid
 classDiagram
@@ -2699,16 +2739,54 @@ classDiagram
     CompositorEffect <|-- NaniteGDExtBridge
 ```
 
-**桥接职责**(唯一代码):
+**桥接职责**:
 1. 继承 `CompositorEffect`,在 `_render_callback` 中调用 `NaniteServer::render_camera()`;
 2. 在 `BEFORE_OPAQUE_PASS` 做 cull + raster + HZB;
 3. 在 `AFTER_OPAQUE_PASS` 做 material eval + composite;
-4. 阴影变通:在 `BEFORE_OPAQUE_PASS` 中遍历可见灯光,调 `NaniteServer::render_shadow()`;
-5. 实例注册:在 `NaniteMeshInstance3D::_ready()` 时调 `NaniteServer::nanite_instance_create()`。
+4. 实例注册:在 `NaniteMeshInstance3D::_ready()` 时调 `NaniteServer::nanite_instance_create()`。
 
-**核心不关心的**:桥接如何被引擎回调、CompositorEffect 的生命周期、RenderDataExtension 如何取到。
+**阴影方案:粗 LOD Shadow Mesh(利用 `mesh_set_shadow_mesh`)**
 
-#### 9.6.2 桥接层 2:Module
+GDExtension 无法访问 shadow atlas framebuffer,也没有 shadow callback。但 `mesh_set_shadow_mesh` 是公开 API,直接可用:
+
+1. **离线**:NaniteBuilder 从 cluster 层次树提取粗 LOD 代表几何(如 depth=2),构建为标准 `ArrayMesh`;
+2. **运行时**:`mesh_set_shadow_mesh(base_mesh, coarse_lod_mesh)`,引擎 shadow pass 自动使用;
+3. **无需任何 shadow 专用代码**。
+
+```cpp
+// nanite/runtime/nanite_mesh_instance_3d.cpp (核心运行时)
+void NaniteMeshInstance3D::_ready() {
+    if (nanite_resource.is_valid()) {
+        NaniteServer::get_singleton()->nanite_instance_create(...);
+        // 阴影:把粗 LOD 设为 shadow_mesh
+        RID base_mesh_rid = get_mesh();
+        if (base_mesh_rid.is_valid() && nanite_resource->shadow_mesh.is_valid()) {
+            RenderingServer::get_singleton()->mesh_set_shadow_mesh(
+                base_mesh_rid, nanite_resource->shadow_mesh->get_rid());
+        }
+    }
+}
+```
+
+**GDExtension 桥接渲染代码**:
+
+```cpp
+void NaniteGDExtBridge::_render_callback(const Ref<RenderDataExtension> &p_rd) {
+    auto cb = get_active_callback_type();
+    NaniteServer *srv = NaniteServer::get_singleton();
+    RenderingDevice *rd = RenderingServer::get_singleton()->get_rendering_device();
+
+    if (cb == RS::COMPOSITOR_EFFECT_CALLBACK_BEFORE_OPAQUE_PASS) {
+        srv->update_gpu_buffers(rd);
+        // 阴影由 mesh_set_shadow_mesh 处理,无需额外操作
+        srv->render_camera(p_rd->get_render_data());
+    } else {  // AFTER_OPAQUE_PASS
+        srv->material_eval(p_rd->get_render_data());
+    }
+}
+```
+
+#### 9.6.3 桥接层 2:Module
 
 ```mermaid
 classDiagram
@@ -2718,23 +2796,43 @@ classDiagram
     class NaniteModuleBridge {
         -NaniteServer server
         +on_cull_collect_instances RendererSceneCull
-        +on_pre_shadow_pass RenderData, RID light, int pass
         +on_pre_opaque_pass RenderData
         +on_post_opaque_pass RenderData
     }
     RendererSceneCull ..> NaniteModuleBridge : queries nanite instances
 ```
 
-**桥接职责**(唯一代码):
+**桥接职责**:
 1. 在 `RendererSceneCull` 收集实例时,标记 `nanite` 实例并从标准列表排除;
-2. 在 shadow pass 前调 `NaniteServer::render_shadow()`;
-3. 在 `_render_scene` 的 opaque pass 前调 `NaniteServer::render_camera()`,后调 `NaniteServer::material_eval()`;
-4. 注册 `NaniteServer` 为 ClassDB 单例;
-5. 注册 `NaniteMeshResource`、`NaniteMeshInstance3D` 到 ClassDB。
+2. 在 `_render_scene` 的 opaque pass 前调 `NaniteServer::render_camera()`,后调 `NaniteServer::material_eval()`;
+3. 注册 `NaniteServer` 为 ClassDB 单例;
+4. 注册 `NaniteMeshResource`、`NaniteMeshInstance3D` 到 ClassDB。
 
-**核心不关心的**:实例如何被 SceneCull 分流、shadow pass 的调用时机、ClassDB 注册流程。
+**阴影方案:同 GDExtension,使用粗 LOD Shadow Mesh**
 
-#### 9.6.3 桥接层 3:Deep
+Module 桥接虽然可以访问 `LightStorage` 内部方法(如 `shadow_atlas_get_fb`),但 `mesh_set_shadow_mesh` 方案更简洁可靠,**无需 shadow 专用代码**:
+
+```cpp
+// bridge_module/nanite_module_bridge.h
+class NaniteModuleBridge {
+    static NaniteModuleBridge *singleton;
+public:
+    void on_cull_collect_instances(RendererSceneCull *p_cull) {
+        p_cull->_instance_filter_nanite();
+    }
+    void on_pre_opaque_pass(RenderData *p_rd) {
+        NaniteServer::get_singleton()->update_gpu_buffers(
+            RenderingServer::get_singleton()->get_rendering_device());
+        NaniteServer::get_singleton()->render_camera(p_rd);
+        // 阴影由 mesh_set_shadow_mesh 处理,无需额外操作
+    }
+    void on_post_opaque_pass(RenderData *p_rd) {
+        NaniteServer::get_singleton()->material_eval(p_rd);
+    }
+};
+```
+
+#### 9.6.4 桥接层 3:Deep
 
 ```mermaid
 classDiagram
@@ -2750,14 +2848,157 @@ classDiagram
     RenderForwardClustered ..> NaniteDeepBridge : calls
 ```
 
-**桥接职责**(唯一代码):
+**桥接职责**:
 1. 在 `_render_scene` 中插入 `_nanite_*_pass` 调用点;
 2. 在 `_render_shadow_pass` 中插入 Nanite shadow 调用;
 3. 在 `_fill_render_list` 中排除 nanite 实例;
 4. 在 `RenderingServer` 接口中新增 `nanite_*` 方法;
-5. 在 `MeshInstance3D` 中新增 `set_nanite_mesh` 属性(可选,或直接用 `NaniteMeshInstance3D`)。
+5. 在 `MeshInstance3D` 中新增 `set_nanite_mesh` 属性(可选)。
 
-**核心不关心的**:`_render_scene` 的调用顺序、`_fill_render_list` 的实现、`RenderingServer` 的 API 边界。
+**阴影方案:直接打通 Godot shadow/GI**
+
+Deep 桥接直接改引擎源码,Nanite 的 shadow 完全融入引擎管线:
+
+- **Shadow**:在 `_render_shadow_pass` 内插入 Nanite GPU shadow cull + depth write,写入引擎的 shadow atlas,Nanite 实例使用动态 per-light LOD(粗于相机 LOD 4-8 倍);
+- **SDFGI/VoxelGI**:Nanite mesh 用低 LOD 代表几何参与 SDF/体素烘焙;
+- **Decal/SSS/FogVolume**:Nanite 已写主 depth buffer,这些基于 depth 的效果自动生效。
+
+```cpp
+// 在 RenderForwardClustered::_render_shadow_pass 中插入:
+void RenderForwardClustered::_render_shadow_pass(RID p_light, RID p_shadow_atlas, int p_pass, ...) {
+    // ... 原有 setup atlas_rect / render_fb / light_transform ...
+
+    // 新增:Nanite shadow — 写入同一个 shadow atlas
+    if (NaniteServer::get_singleton()->has_shadow_instances(p_light, p_pass)) {
+        NaniteServer::get_singleton()->render_shadow_in_atlas(
+            p_light, p_shadow_atlas, p_pass,
+            light_projection, light_transform,
+            atlas_rect, render_fb);
+    }
+
+    // 原有:标准 mesh shadow(不含 Nanite 实例)
+    _render_shadow_append(render_fb, p_instances, ...);
+    _render_shadow_process();
+    _render_shadow_end();
+}
+
+// 在 _render_scene 中的完整插入:
+void RenderForwardClustered::_render_scene(RenderDataRD *p_rd, ...) {
+    // ... 原有 shadow passes (已含 Nanite shadow) ...
+    // ... 原有 GI / SSAO / SSR ...
+    // ... 原有 cluster_builder ...
+
+    if (p_rd->has_nanite_instances) {
+        NaniteServer::get_singleton()->update_gpu_buffers(rendering_device);
+        NaniteServer::get_singleton()->render_camera(p_rd);   // cull + raster + HZB
+    }
+
+    // 原有 _renderOpaqueForward (Nanite 实例已排除)
+
+    if (p_rd->has_nanite_instances) {
+        NaniteServer::get_singleton()->material_eval(p_rd);
+    }
+
+    // ... sky / transparent / post ...
+}
+```
+
+**Deep 桥接阴影的关键优势**:
+
+| 能力 | 说明 |
+|---|---|
+| 动态 per-light LOD | 每个 shadow pass 独立 BVH cull,阴影精度远高于固定粗 LOD |
+| 写入引擎 shadow atlas | 标准 mesh 和 Nanite 共享同一份 shadow atlas,互相投射阴影 |
+| Nanite 看 std 阴影 | ✅ 同一 shadow atlas |
+| std 看 Nanite 阴影 | ✅ 同一 shadow atlas |
+| PSSM 多 split | 每个 split 独立 BVH cull,但共用 page cache |
+| SDFGI 烘焙 | Nanite 用低 LOD 代表几何参与 |
+| VoxelGI 烘焙 | 同上 |
+
+#### 9.6.5 三桥接层阴影策略对比
+
+| 能力 | GDExtension 桥接 | Module 桥接 | Deep 桥接 |
+|---|---|---|---|
+| **阴影方案** | 粗 LOD Shadow Mesh | 粗 LOD Shadow Mesh | 动态 per-light GPU shadow |
+| **阴影 API** | `mesh_set_shadow_mesh`(公开) | `mesh_set_shadow_mesh`(公开) | `_render_shadow_pass` 内嵌 |
+| **阴影精度** | 固定粗 LOD(depth=2) | 固定粗 LOD(depth=2) | 动态 per-light LOD(4-8x 粗于相机) |
+| **引擎 shadow atlas** | 不直接写入 | 不直接写入 | ✅ 直接写入 |
+| std 看 Nanite 阴影 | ✅(通过 shadow_mesh) | ✅(通过 shadow_mesh) | ✅(同一 atlas) |
+| Nanite 看 std 阴影 | ✅(同一 shadow pass) | ✅(同一 shadow pass) | ✅(同一 atlas) |
+| 方向光 PSSM | 引擎自动处理 | 引擎自动处理 | 每个 split 独立 BVH cull |
+| SDFGI/VoxelGI | 不参与烘焙 | 不参与烘焙 | ✅ 低 LOD 代表几何参与 |
+| 桥接层阴影代码 | **零** | **零** | ~50 行(在 shadow_pass 内) |
+| 额外内存 | 粗 LOD ArrayMesh(~100KB-1MB) | 同左 | 零(复用 GPU cluster buffer) |
+
+**粗 LOD Shadow Mesh 的 LOD 精度选择**:
+
+| shadow_lod_depth | 三角形数(100 万 tri 原始 mesh) | 阴影质量 | 适用场景 |
+|---|---|---|---|
+| 1 | ~8000 tri | 低(轮廓粗糙) | 移动端 / 远距离物体 |
+| 2 | ~32000 tri | 中 | 默认推荐 |
+| 3 | ~128000 tri | 高 | PC 端 / 近距离主角 |
+
+用户可通过 `NaniteBuilderConfig::shadow_lod_depth` 控制,默认值为 2。
+
+**粗 LOD Shadow Mesh 的构建**(在核心编辑器模块 `NaniteBuilder` 中):
+
+```cpp
+Ref<ArrayMesh> NaniteBuilder::build_shadow_mesh(
+        const LocalVector<NaniteCluster> &p_clusters,
+        const LocalVector<NaniteClusterNode> &p_nodes,
+        const LocalVector<float> &p_verts,
+        const LocalVector<unsigned int> &p_meshlet_vertices,
+        const LocalVector<unsigned char> &p_meshlet_triangles,
+        int p_shadow_lod_depth) {
+    // 找到指定深度的节点,合并 cluster 三角形为连续 index buffer
+    LocalVector<uint32_t> shadow_cluster_ids;
+    for (uint32_t i = 0; i < p_nodes.size(); i++) {
+        const NaniteClusterNode &node = p_nodes[i];
+        if (node.depth <= p_shadow_lod_depth && node.cluster_count > 0) {
+            for (uint32_t c = node.first_cluster; c < node.first_cluster + node.cluster_count; c++) {
+                shadow_cluster_ids.push_back(c);
+            }
+        }
+    }
+    // 展开 meshlet micro-index 为标准 triangle list
+    LocalVector<Vector3> shadow_positions;
+    LocalVector<int> shadow_indices;
+    uint32_t vertex_offset = 0;
+    for (uint32_t cid : shadow_cluster_ids) {
+        const NaniteCluster &cluster = p_clusters[cid];
+        for (uint32_t t = 0; t < cluster.triangle_count; t++) {
+            uint32_t v0 = p_meshlet_vertices[cluster.vertex_offset +
+                         p_meshlet_triangles[cluster.triangle_offset + t * 3 + 0]];
+            uint32_t v1 = p_meshlet_vertices[cluster.vertex_offset +
+                         p_meshlet_triangles[cluster.triangle_offset + t * 3 + 1]];
+            uint32_t v2 = p_meshlet_vertices[cluster.vertex_offset +
+                         p_meshlet_triangles[cluster.triangle_offset + t * 3 + 2]];
+            shadow_indices.push_back(vertex_offset + v0);
+            shadow_indices.push_back(vertex_offset + v1);
+            shadow_indices.push_back(vertex_offset + v2);
+        }
+        for (uint32_t v = 0; v < cluster.vertex_count; v++) {
+            uint32_t vid = p_meshlet_vertices[cluster.vertex_offset + v];
+            shadow_positions.push_back(Vector3(
+                p_verts[vid * 3 + 0], p_verts[vid * 3 + 1], p_verts[vid * 3 + 2]));
+        }
+        vertex_offset += cluster.vertex_count;
+    }
+    // 构建标准 ArrayMesh
+    Ref<ArrayMesh> shadow_mesh;
+    shadow_mesh.instantiate();
+    Array arrays;
+    arrays.resize(Mesh::ARRAY_MAX);
+    PackedVector3Array pos_array;
+    PackedInt32Array idx_array;
+    for (const Vector3 &p : shadow_positions) pos_array.push_back(p);
+    for (int idx : shadow_indices) idx_array.push_back(idx);
+    arrays[Mesh::ARRAY_VERTEX] = pos_array;
+    arrays[Mesh::ARRAY_INDEX] = idx_array;
+    shadow_mesh->add_surface_from_arrays(Mesh::PRIMITIVE_TRIANGLES, arrays);
+    return shadow_mesh;
+}
+```
 
 ### 9.7 三桥接层对照矩阵
 
@@ -2765,10 +3006,12 @@ classDiagram
 |---|---|---|---|
 | **接入方式** | 外部插件 | 编译进 modules/ | 改引擎源码 |
 | **引擎源码改动** | 0 | 仅新增 | 多处修改 |
-| **桥接代码量** | ~300 行 | ~200 行 | ~150 行 |
+| **桥接代码量** | ~200 行 | ~150 行 | ~150 行 |
 | **核心调用入口** | CompositorEffect callback | SceneCull + NaniteServer 直调 | _render_scene 内嵌 |
 | **实例分流** | visible=false 隐藏代理 mesh | instance_set_nanite 跳过 std cull | _fill_render_list 排除 |
-| **阴影路径** | BEFORE_OPAQUE 内变通 | hook shadow pass 前 | _render_shadow_pass 内嵌 |
+| **阴影方案** | 粗 LOD Shadow Mesh(公开 API) | 粗 LOD Shadow Mesh(公开 API) | 动态 per-light GPU shadow(源码内嵌) |
+| **阴影精度** | 固定粗 LOD | 固定粗 LOD | 动态 LOD |
+| **GI/SDFGI 集成** | 不参与烘焙 | 不参与烘焙 | ✅ 低 LOD 代表几何参与 |
 | **材质绑定** | RenderDataExtension 提取 | MaterialStorage 直接取 | StandardMaterial3D 直接 |
 | **NaniteServer 注册** | ClassDB GDExtension | ClassDB 原生 | RenderingServer 原生 |
 | **跟随上游升级** | 仅跟 API surface | 仅跟 module header | 需要 rebase patch |
