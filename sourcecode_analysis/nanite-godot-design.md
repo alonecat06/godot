@@ -2523,6 +2523,7 @@ classDiagram
         +PackedByteArray clusters_data
         +PackedByteArray page_table_data
         +TypedArray Material materials
+        +Ref ArrayMesh shadow_mesh
         +build_from_surface_arrays PackedArrays
         +save path
         +load path
