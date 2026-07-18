@@ -81,17 +81,150 @@
 
 ### 1.3 Nanite 核心原理速览
 
-1. **离线 Cluster + BVH 构建**:
-   - 三角形 → 切成 128 tri 的 cluster(最小化簇间共享边以减少 crack)
-   - 自底向上:每 4 个 cluster 合并成一组 → simplify 到 50% → 再切成 2 个新 cluster → 形成父节点
-   - 每个内部节点存储简化误差(几何误差),用于运行时计算屏幕投影误差
-   - 形成 DAG(有向无环图,共享 cluster),但简化实现常用树
-2. **运行时 GPU 流水线**:
-   - `Culling Pass`:GPU 遍历 BVH,视锥剔除 + HZB 遮挡剔除(两遍:第一遍用上一帧 HZB + 上一帧可见集合,第二遍用本帧刚生成的 HZB 补漏)
-   - `LOD Selection`:`error_proj = error * screen_scale`,`error_proj <= threshold` 则该节点处于"cut"上(其父节点误差过大,需要它)
-   - `Page-in`:可见 cluster 若不在 GPU page cache,通过原子计数器把 page request 写入回读 buffer,CPU 异步从磁盘加载到 staging buffer,下一帧 `buffer_copy` 到 GPU resident buffer
-   - `Rasterize`:大三角走硬件光栅,小三角(< 16px)走 compute shader 软光栅,输出 Visibility Buffer(每像素 8 字节:cluster id + triangle id + depth)
-   - `Material Eval`:从 VisBuffer 加载 3 个顶点,执行材质着色,写入 G-Buffer/颜色 buffer,与 deferred shading 集成
+#### 1.3.1 核心数据对象及其作用
+
+Nanite 围绕以下四个核心数据对象组织整个系统:
+
+**Cluster（簇）**:
+- 最小的渲染与剔除单元,每个 Cluster 包含一组三角形(默认 128 tri)及其引用的顶点;
+- Cluster 是 LOD 选择的基本粒度——运行时以 Cluster 为单位决定"保留"还是"用更粗的父节点替代";
+- 每个 Cluster 存储自己的包围盒(cone + AABB)和简化误差(bound_error),用于剔除和 LOD 判断;
+- Cluster 之间通过共享边邻接,但 Cluster 内部的三角形拓扑是自包含的——这种设计使得 Cluster 可以独立替换而不产生内部裂缝。
+
+**Cluster Group（簇组）**:
+- 若干 Cluster 的集合,是 BVH 树的中间节点;
+- 离线构建时,每 4 个 Cluster 组成一个 Group,对其中的三角形做 simplify(简化到约 50%),然后重新 partition 成 2 个新的更粗的 Cluster;
+- Group 存储子 Cluster 列表和合并后的简化误差,形成从叶子到根的层次结构;
+- Group 本身不直接参与渲染,只是 BVH 的内部节点。
+
+**BVH Node（层次化包围体节点）**:
+- 组织 Cluster Group 的树形结构,每个节点存储:
+  - 包围盒(AABB):用于视锥剔除和遮挡剔除;
+  - 简化误差(geometric_error):该节点代表的简化几何与原始几何的最大偏差;
+  - 子节点指针:指向更精细的子 Group;
+- BVH 的"cut"(切面):在某一误差阈值下,从根到叶遍历,当某节点的误差足够小(投影后 ≤ 像素阈值)时,该节点就是"cut"上的节点,其子节点不再需要;
+- 不同的 cut 对应不同的 LOD 层级——距离近时 cut 更深(更精细),距离远时 cut 更浅(更粗略)。
+
+**Page（页面）**:
+- 磁盘与 GPU 之间的数据传输单元,每个 Page 包含若干 Cluster 的顶点和索引数据;
+- Page 的设计使得磁盘加载以"批量"为单位,而非逐 Cluster,减少 I/O 次数;
+- 运行时维护一个 Page Cache(GPU buffer),仅将当前可见的 Page 驻留 GPU,不可见的 Page 可以被驱逐;
+- Page 驻留状态由 GPU cull pass 输出请求,CPU 侧异步从磁盘读取并上传。
+
+四个对象的层次关系:
+
+```
+BVH Tree
+├── BVH Node (root, 最粗 LOD, error 最大)
+│   ├── BVH Node (中间 LOD)
+│   │   ├── Cluster Group → [Cluster A, Cluster B]  ← 叶子,最精细 LOD
+│   │   └── Cluster Group → [Cluster C, Cluster D]
+│   └── BVH Node (中间 LOD)
+│       └── ...
+└── ...
+
+Page 1: [Cluster A 顶点+索引, Cluster B 顶点+索引]
+Page 2: [Cluster C 顶点+索引, Cluster D 顶点+索引]
+```
+
+#### 1.3.2 离线构建流程
+
+离线构建将原始 Mesh 转化为 Cluster 层次结构 + Page 划分,存入资源文件:
+
+```
+原始 Mesh (三角形列表)
+    │
+    ▼
+Step 1: 切分 Cluster (buildMeshlets)
+    │  将三角形按空间局部性分组,每组 ≤128 tri
+    │  输出: L0 Cluster 集合 + 每簇包围盒/误差
+    ▼
+Step 2: 层次化简化 (自底向上)
+    │  循环:
+    │    a. 每 4 个 Cluster → 合并为一个 Group
+    │    b. Group 内三角形 simplifyWithAttributes (QEM 简化, ~50%)
+    │    c. 简化后重新 partitionClusters → 2 个新 Cluster
+    │    d. 新 Cluster 成为上一层 BVH 节点的子节点
+    │  直到只剩 1 个根 Cluster(最粗 LOD)
+    │  输出: 完整 BVH 树 + 每层 Cluster 集合
+    ▼
+Step 3: Page 划分
+    │  将所有 Cluster 按空间局部性排序
+    │  按固定大小(如 64KB)切割为 Page
+    │  输出: Page Table (cluster_id → page_id 映射)
+    ▼
+Step 4: 序列化
+    │  将顶点/索引/Cluster 元数据/BVH 节点/Page Table
+    │  打包为二进制资源文件 (.nanite)
+    ▼
+NaniteMeshResource (磁盘文件)
+```
+
+**关键原则**:
+- 简化是保守的——每个父节点存储的简化误差,保证运行时按误差阈值选择时不会出现明显的 popping;
+- Cluster 的包围锥(cone)用于背面剔除——如果 Cluster 的法线锥完全背对相机,整个 Cluster 可跳过;
+- 不同 LOD 层级的 Cluster 之间没有共享顶点,每个 Cluster 是自包含的,这保证了任意 cut 的 Cluster 组合都能正确渲染而无裂缝。
+
+#### 1.3.3 运行时 GPU 流水线
+
+运行时在 GPU 上逐帧执行以下 Pass:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    运行时 GPU 流水线                          │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  1. Culling Pass (Compute Shader)                           │
+│     │  输入: BVH 节点 buffer + 上一帧 HZB + 实例 transform  │
+│     │  遍历 BVH:                                            │
+│     │    - 视锥剔除: 节点 AABB 在视锥外 → 丢弃              │
+│     │    - 背面剔除: 法线锥背对相机 → 丢弃                  │
+│     │    - 遮挡剔除: 节点 AABB 在 HZB 后面 → 丢弃           │
+│     │    - LOD 选择: error_proj = error × screen_scale       │
+│     │      error_proj ≤ threshold → 该节点在"cut"上,输出    │
+│     │  两遍剔除:                                             │
+│     │    Pass 1: 用上一帧 HZB + 上一帧可见集,粗筛           │
+│     │    Pass 2: 用本帧刚生成的 HZB,补漏                    │
+│     │  输出: 可见 Cluster 列表 + Page Request 列表           │
+│     ▼                                                       │
+│  2. Page-in (CPU + GPU 协作)                                │
+│     │  GPU 写 page_request → 回读 buffer                    │
+│     │  CPU 读取请求 → 从磁盘加载 Page → staging buffer      │
+│     │  下一帧: buffer_copy staging → GPU resident buffer     │
+│     ▼                                                       │
+│  3. Rasterize Pass                                          │
+│     │  可见 Cluster 的三角形:                                │
+│     │    大三角 (≥16px): 硬件光栅 (draw_list indirect)       │
+│     │    小三角 (<16px): Compute 软光栅 (1 thread/tri)      │
+│     │  输出: Visibility Buffer                               │
+│     │    每像素 8B: cluster_id + triangle_id + depth         │
+│     ▼                                                       │
+│  4. HZB Build Pass (Compute Shader)                         │
+│     │  从深度 buffer 生成层次化深度缓冲(Hierarchical Z)      │
+│     │  用于下一帧的遮挡剔除                                  │
+│     ▼                                                       │
+│  5. Material Eval Pass (Compute Shader)                     │
+│     │  从 VisBuffer 解码:                                    │
+│     │    cluster_id → 找到顶点索引 → 加载 3 个顶点           │
+│     │    triangle_id → 重心坐标 → 插值属性                   │
+│     │  执行材质着色 → 写入 G-Buffer / 颜色 buffer            │
+│     │  与引擎的 deferred / forward+ 管线集成                  │
+│     ▼                                                       │
+│  最终输出: G-Buffer (法线/反照率/深度/材质)                   │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Visibility Buffer 的核心意义**:
+- 传统渲染每个像素存储完整属性(法线/UV/切线等),带宽消耗大;
+- VisBuffer 仅存 cluster_id + triangle_id + depth,每像素 8 字节;
+- 材质评估延迟到最后一步,从 VisBuffer 反查顶点并插值——大幅减少带宽,且与材质解耦;
+- 同一个 VisBuffer 可被多个材质 pass 共享(如阴影 pass 只需 depth,材质 pass 需完整属性)。
+
+**两遍剔除的必要性**:
+- 第一遍用上一帧 HZB,能剔除大部分不可见物体,但存在一帧延迟;
+- 第二遍用本帧刚光栅化的深度生成的 HZB,捕捉到本帧新暴露的区域(如角色移动后露出的背景);
+- 两遍剔除确保遮挡剔除的准确性接近 100%,仅第一帧可能有少量漏剔。
 
 ---
 
