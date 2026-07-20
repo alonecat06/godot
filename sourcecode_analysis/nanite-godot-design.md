@@ -2916,9 +2916,29 @@ classDiagram
         +uint page_size_bytes = 65536
         +int shadow_lod_depth = 2
     }
+    class NaniteMeshEditor {
+        +edit Ref NaniteMeshResource
+        -_on_debug_mode_selected int
+        -_on_wireframe_toggled bool
+        -_on_bounds_toggled bool
+    }
+    class EditorInspectorPluginNanite {
+        +can_handle Object bool
+        +parse_begin Object
+    }
+    class NaniteEditorPlugin {
+        +get_plugin_name String
+    }
+    class NaniteResourcePreviewGenerator {
+        +handles String bool
+        +generate Ref Resource Size2 Dict Ref Texture2D
+    }
     EditorImportPlugin <|-- NaniteImporter
     NaniteImporter --> NaniteBuilder : calls build
     NaniteBuilder --> NaniteBuilderConfig : reads
+    NaniteEditorPlugin --> EditorInspectorPluginNanite : registers
+    EditorInspectorPluginNanite --> NaniteMeshEditor : creates
+    NaniteEditorPlugin --> NaniteResourcePreviewGenerator : registers
 ```
 
 **要点**:
@@ -2926,6 +2946,259 @@ classDiagram
 - 输出 `Ref<NaniteMeshResource>`,所有序列化逻辑在 `NaniteMeshResource::save()` 中;
 - **粗 LOD Shadow Mesh 生成**:在层次化构建完成后,`build_shadow_mesh` 从 cluster 层次树提取指定深度(`shadow_lod_depth`)的 cluster,展开为标准 `ArrayMesh`,存入 `NaniteMeshResource::shadow_mesh`;
 - 桥接层无需关心构建细节,只需调用 `NaniteImporter` 或手动触发 `NaniteBuilder::build()`。
+
+#### 9.5.1 预览界面:NaniteMeshEditor
+
+导入/构建完成后,用户需要在 Inspector 中预览 Nanite mesh,并能切换调试可视化模式验证构建质量。参照 Godot 内置的 `MeshEditor`(`editor/scene/3d/mesh_editor_plugin.h`)设计 `NaniteMeshEditor`:
+
+```mermaid
+classDiagram
+    class SubViewportContainer {
+        <<Godot built-in>>
+    }
+    class NaniteMeshEditor {
+        -SubViewport viewport
+        -NaniteMeshInstance3D preview_instance
+        -Node3D rotation_node
+        -Camera3D camera
+        -DirectionalLight3D light1
+        -DirectionalLight3D light2
+        -HBoxContainer toolbar
+        -OptionButton debug_mode_btn
+        -Button wireframe_btn
+        -Button bounds_btn
+        -Label stats_label
+        +edit Ref NaniteMeshResource
+        -_on_debug_mode_selected int
+        -_on_wireframe_toggled bool
+        -_on_bounds_toggled bool
+        -_update_rotation
+    }
+    class EditorInspectorPluginNanite {
+        +can_handle Object bool
+        +parse_begin Object
+    }
+    class NaniteEditorPlugin {
+        +get_plugin_name String
+    }
+    class EditorInspectorPlugin {
+        <<Godot built-in>>
+    }
+    class EditorPlugin {
+        <<Godot built-in>>
+    }
+
+    SubViewportContainer <|-- NaniteMeshEditor
+    EditorInspectorPlugin <|-- EditorInspectorPluginNanite
+    EditorPlugin <|-- NaniteEditorPlugin
+    EditorInspectorPluginNanite --> NaniteMeshEditor : creates in parse_begin
+```
+
+**预览界面功能**:
+
+| 功能 | 实现方式 |
+|---|---|
+| 3D 旋转预览 | 继承 `SubViewportContainer`,鼠标拖拽旋转 `rotation_node`,与 `MeshEditor` 一致 |
+| Nanite 渲染 | 预览视口内放置 `NaniteMeshInstance3D`,Nanite GPUPipeline 正常工作 |
+| 调试模式切换 | `OptionButton` 下拉选择:NONE / Cluster 纯色 / LOD 着色 / Overdraw / Page |
+| 线框叠加 | `Button` toggle,调 `NaniteServer::set_debug_wireframe()` |
+| 包围盒显示 | `Button` toggle,调 `NaniteServer::set_debug_show_bounds()` |
+| 构建统计 | `Label` 显示:cluster 数 / node 数 / page 数 / 粗 LOD tri 数 / 内存估算 |
+
+**预览界面的关键代码骨架**:
+
+```cpp
+// nanite/editor/nanite_mesh_editor.h
+#pragma once
+#include "scene/gui/subviewport_container.h"
+#include "scene/3d/camera_3d.h"
+#include "scene/3d/light_3d.h"
+
+class SubViewport;
+class OptionButton;
+class Button;
+class Label;
+class NaniteMeshInstance3D;
+
+class NaniteMeshEditor : public SubViewportContainer {
+    GDCLASS(NaniteMeshEditor, SubViewportContainer);
+
+    float rot_x = 0.0f;
+    float rot_y = 0.0f;
+
+    SubViewport *viewport = nullptr;
+    NaniteMeshInstance3D *preview_instance = nullptr;
+    Node3D *rotation_node = nullptr;
+    DirectionalLight3D *light1 = nullptr;
+    DirectionalLight3D *light2 = nullptr;
+    Camera3D *camera = nullptr;
+
+    // 调试可视化工具栏
+    OptionButton *debug_mode_btn = nullptr;
+    Button *wireframe_btn = nullptr;
+    Button *bounds_btn = nullptr;
+    Label *stats_label = nullptr;
+
+    void _on_debug_mode_selected(int p_index);
+    void _on_wireframe_toggled(bool p_pressed);
+    void _on_bounds_toggled(bool p_pressed);
+    void _update_rotation();
+
+protected:
+    void _notification(int p_what);
+    void gui_input(const Ref<InputEvent> &p_event) override;
+
+public:
+    void edit(const Ref<NaniteMeshResource> &p_resource);
+    NaniteMeshEditor();
+};
+```
+
+```cpp
+// nanite/editor/nanite_mesh_editor.cpp
+void NaniteMeshEditor::edit(const Ref<NaniteMeshResource> &p_resource) {
+    if (p_resource.is_null()) return;
+
+    preview_instance->set_nanite_mesh(p_resource);
+
+    // 填充调试模式下拉
+    debug_mode_btn->clear();
+    debug_mode_btn->add_item("Normal", NaniteDebugMode::NONE);
+    debug_mode_btn->add_item("Cluster Solid Color", NaniteDebugMode::CLUSTER_SOLID_COLOR);
+    debug_mode_btn->add_item("LOD Color", NaniteDebugMode::LOD_SOLID_COLOR);
+    debug_mode_btn->add_item("Overdraw Heatmap", NaniteDebugMode::OVERDRAW_HEATMAP);
+    debug_mode_btn->add_item("Page Residency", NaniteDebugMode::PAGE_RESIDENCY);
+
+    // 填充构建统计
+    String stats = vformat(
+        "Clusters: %d  |  Nodes: %d  |  Pages: %d\n"
+        "Shadow mesh tris: %d  |  Est. GPU: ~%.1f MB",
+        p_resource->cluster_count,
+        p_resource->node_count,
+        p_resource->page_count,
+        p_resource->shadow_mesh.is_valid()
+            ? p_resource->shadow_mesh->get_faces() : 0,
+        (p_resource->vertex_data.size() +
+         p_resource->clusters_data.size() +
+         p_resource->nodes_data.size()) / (1024.0 * 1024.0));
+    stats_label->set_text(stats);
+
+    // 自动缩放相机适配 mesh bounds
+    if (camera && p_resource->mesh_bounds.has_surface()) {
+        float radius = p_resource->mesh_bounds.get_longest_axis_size();
+        camera->set_position(Vector3(0, 0, radius * 1.8));
+    }
+}
+
+void NaniteMeshEditor::_on_debug_mode_selected(int p_index) {
+    int mode = debug_mode_btn->get_item_id(p_index);
+    NaniteServer::get_singleton()->set_debug_mode(mode);
+}
+
+void NaniteMeshEditor::_on_wireframe_toggled(bool p_pressed) {
+    NaniteServer::get_singleton()->set_debug_wireframe(p_pressed);
+}
+
+void NaniteMeshEditor::_on_bounds_toggled(bool p_pressed) {
+    NaniteServer::get_singleton()->set_debug_show_bounds(p_pressed);
+}
+```
+
+**InspectorPlugin 注册**:
+
+```cpp
+// nanite/editor/nanite_editor_plugin.h
+class EditorInspectorPluginNanite : public EditorInspectorPlugin {
+    GDCLASS(EditorInspectorPluginNanite, EditorInspectorPlugin);
+public:
+    virtual bool can_handle(Object *p_object) override {
+        return Object::cast_to<NaniteMeshResource>(p_object) != nullptr;
+    }
+    virtual void parse_begin(Object *p_object) override {
+        NaniteMeshResource *res = Object::cast_to<NaniteMeshResource>(p_object);
+        NaniteMeshEditor *editor = memnew(NaniteMeshEditor);
+        editor->edit(Ref<NaniteMeshResource>(res));
+        add_custom_control(editor);
+    }
+};
+
+class NaniteEditorPlugin : public EditorPlugin {
+    GDCLASS(NaniteEditorPlugin, EditorPlugin);
+public:
+    virtual String get_plugin_name() const override { return "Nanite"; }
+    NaniteEditorPlugin() {
+        Ref<EditorInspectorPluginNanite> plugin;
+        plugin.instantiate();
+        add_inspector_plugin(plugin);
+    }
+};
+```
+
+**预览界面调试可视化的工作原理**:
+
+预览视口(`SubViewport`)内的 `NaniteMeshInstance3D` 与场景中的实例完全一致——走 Nanite GPUPipeline 渲染。因此 `NaniteServer::set_debug_mode()` 设置的调试模式对预览视口同样生效。但需要注意:
+
+1. **调试模式是全局的**:切换预览界面的调试模式会影响所有 Nanite 实例(包括场景中的);
+2. **解决方案**:预览界面仅在获得焦点时应用调试模式,失焦时恢复为 NONE。实现方式:
+
+```cpp
+void NaniteMeshEditor::_notification(int p_what) {
+    switch (p_what) {
+        case NOTIFICATION_FOCUS_ENTER:
+            // 恢复用户在预览中选择的调试模式
+            if (debug_mode_btn) {
+                _on_debug_mode_selected(debug_mode_btn->get_selected_id());
+            }
+            break;
+        case NOTIFICATION_FOCUS_EXIT:
+            // 离开预览时关闭调试,避免影响场景渲染
+            NaniteServer::get_singleton()->set_debug_mode(NANITE_DEBUG_NONE);
+            break;
+    }
+}
+```
+
+**离线构建预览的特殊处理**:
+
+构建完成后的即时预览不需要经过磁盘,直接用内存中的 `NaniteMeshResource`:
+
+```cpp
+// nanite/editor/nanite_importer.cpp
+void NaniteImporter::_on_build_completed(Ref<NaniteMeshResource> p_resource) {
+    // 构建完成,立即在预览界面显示
+    if (preview_editor) {
+        preview_editor->edit(p_resource);
+    }
+    // 同时自动切换到 Cluster Solid Color 模式,方便验证构建质量
+    NaniteServer::get_singleton()->set_debug_mode(
+        NaniteDebugMode::CLUSTER_SOLID_COLOR);
+}
+```
+
+**资源预览缩略图**(FileSystem 面板中的小图标):
+
+```cpp
+// nanite/editor/nanite_resource_preview.h
+class NaniteResourcePreviewGenerator : public EditorResourcePreviewGenerator {
+    GDCLASS(NaniteResourcePreviewGenerator, EditorResourcePreviewGenerator);
+public:
+    virtual bool handles(const String &p_type) const override {
+        return p_type == "NaniteMeshResource";
+    }
+    virtual Ref<Texture2D> generate(const Ref<Resource> &p_from,
+                                     const Size2 &p_size,
+                                     Dictionary &p_metadata) const override {
+        // 用 shadow_mesh(粗 LOD ArrayMesh)生成缩略图
+        // 无需启动 Nanite GPUPipeline,直接用标准 Mesh 渲染
+        Ref<NaniteMeshResource> res = p_from;
+        if (res.is_valid() && res->shadow_mesh.is_valid()) {
+            return StandardResourcePreview::get_singleton()
+                ->generate(res->shadow_mesh, p_size, p_metadata);
+        }
+        return Ref<Texture2D>();
+    }
+};
+```
 
 **粗 LOD Shadow Mesh 的用途**:
 - **GDExtension 桥接**:运行时通过 `mesh_set_shadow_mesh` 把粗 LOD 设为 shadow_mesh,引擎 shadow pass 自动使用;
