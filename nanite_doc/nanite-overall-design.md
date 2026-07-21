@@ -12,14 +12,15 @@
 4. [桥接切换机制](#4-桥接切换机制)
 5. [核心类设计](#5-核心类设计)
 6. [三阶段实施路径](#6-三阶段实施路径)
-7. [离线构建模块：基于 meshoptimizer 的层次化 Meshlet + BVH](#7-离线构建模块基于-meshoptimizer-的层次化-meshlet-+-bvh)
-8. [编辑器模块：预览界面与调试可视化](#8-编辑器模块预览界面与调试可视化)
-9. [阶段一：GDExtension 桥接](#9-阶段一gdextension-桥接)
-10. [阶段二：Module 桥接](#10-阶段二module-桥接)
-11. [阶段三：Deep 桥接](#11-阶段三deep-桥接)
-12. [关键 API 对照表](#12-关键-api-对照表)
-13. [验证与测试矩阵](#13-验证与测试矩阵)
-14. [与调研文档差异说明](#14-与调研文档差异说明)
+7. [GPU HZB 模块：层次化深度缓冲](#7-gpu-hzb-模块层次化深度缓冲)
+8. [离线构建模块：基于 meshoptimizer 的层次化 Meshlet + BVH](#8-离线构建模块基于-meshoptimizer-的层次化-meshlet-+-bvh)
+9. [编辑器模块：预览界面与调试可视化](#9-编辑器模块预览界面与调试可视化)
+10. [阶段一：GDExtension 桥接](#10-阶段一gdextension-桥接)
+11. [阶段二：Module 桥接](#11-阶段二module-桥接)
+12. [阶段三：Deep 桥接](#12-阶段三deep-桥接)
+13. [关键 API 对照表](#13-关键-api-对照表)
+14. [验证与测试矩阵](#14-验证与测试矩阵)
+15. [与调研文档差异说明](#15-与调研文档差异说明)
 附录：实施检查清单
 
 ---
@@ -136,6 +137,7 @@ godot/
 │   ├── nanite_mesh_data.h/.cpp
 │   ├── nanite_mesh_instance_3d.h/.cpp
 │   ├── nanite_gpu_pipeline.h/.cpp
+│   ├── nanite_hzb.h/.cpp
 │   ├── nanite_page_cache.h/.cpp
 │   ├── nanite_debug.h/.cpp
 │   ├── nanite_builder.h/.cpp
@@ -149,6 +151,7 @@ godot/
 │   │   ├── nanite_cull.glsl
 │   │   ├── nanite_rasterize.glsl
 │   │   ├── nanite_shadow_rasterize.glsl
+│   │   ├── hzb_downsample.glsl
 │   │   └── nanite_material_resolve.glsl
 │   └── include/
 │       └── nanite_bridge_types.h    # 枚举/结构体定义
@@ -400,15 +403,20 @@ classDiagram
         -RID rasterize_shader
         -RID shadow_rasterize_shader
         -RID material_resolve_shader
+        -RID hzb_downsample_shader
         -RID cull_pipeline
         -RID rasterize_pipeline
         -RID shadow_pipeline
         -RID material_pipeline
+        -RID hzb_downsample_pipeline
+        -NaniteHZB hzb
         +init(rd: RenderingDevice*) void
         +dispatch_cull(rd: RenderingDevice*, params: CullParams) RID
         +dispatch_rasterize(rd: RenderingDevice*, vis_buffer: RID) void
+        +dispatch_hzb_build(rd: RenderingDevice*, depth_texture: RID) void
         +dispatch_shadow_rasterize(rd: RenderingDevice*, shadow_fb: RID, params: ShadowParams) void
         +dispatch_material_resolve(rd: RenderingDevice*, vis_buffer: RID) void
+        +get_hzb() NaniteHZB*
     }
 
     class NanitePageCache {
@@ -545,10 +553,12 @@ flowchart TB
         direction TB
         P1A["CompositorEffect 子类<br/>_render_callback(int, RenderData*)"]
         P1B["PRE_OPAQUE 时机：<br/>BVH 遍历 + 可见性缓冲"]
+        P1B2["HZB Build (Compute)<br/>深度降采样构建遮挡层级"]
         P1C["POST_OPAQUE 时机：<br/>材质解析"]
         P1D["阴影：mesh_set_shadow_mesh<br/>粗 LOD 方案"]
         P1A --> P1B
-        P1B --> P1C
+        P1B --> P1B2
+        P1B2 --> P1C
         P1C --> P1D
     end
 
@@ -556,10 +566,12 @@ flowchart TB
         direction TB
         P2A["RendererSceneCull hook<br/>render_camera 插入"]
         P2B["Pre-Opaque：<br/>BVH 遍历 + 可见性缓冲"]
+        P2B2["HZB Build (Compute)<br/>深度降采样构建遮挡层级"]
         P2C["Post-Opaque：<br/>材质解析"]
         P2D["阴影：动态 per-light GPU<br/>写入引擎 shadow atlas"]
         P2A --> P2B
-        P2B --> P2C
+        P2B --> P2B2
+        P2B2 --> P2C
         P2C --> P2D
     end
 
@@ -567,10 +579,12 @@ flowchart TB
         direction TB
         P3A["源码 Patch<br/>直接修改渲染管线"]
         P3B["集成到 _render_scene<br/>完全替换实例渲染"]
+        P3B2["HZB Build (Compute)<br/>深度降采样构建遮挡层级"]
         P3C["阴影：同 Module +<br/>GI/SDFGI 打通"]
         P3D["完整 Nanite 管线"]
         P3A --> P3B
-        P3B --> P3C
+        P3B --> P3B2
+        P3B2 --> P3C
         P3C --> P3D
     end
 
@@ -585,6 +599,7 @@ flowchart TB
 | 维度 | 阶段一 (GDExtension) | 阶段二 (Module) | 阶段三 (Deep) |
 |------|----------------------|-----------------|---------------|
 | 接入方式 | CompositorEffect | RendererSceneCull hook | 源码 patch |
+| GPU HZB | ✅ 自建 RD Texture | ✅ 自建 RD Texture | ✅ 可复用引擎深度纹理 |
 | 阴影 | 粗 LOD shadow mesh | 动态 GPU shadow | 动态 GPU shadow + GI |
 | GI 支持 | 无 | 无 | SDFGI/VoxelGI 打通 |
 | 修改引擎 | 否 | 是(模块) | 是(patch) |
@@ -594,9 +609,299 @@ flowchart TB
 
 ---
 
-## 7. 离线构建模块：基于 meshoptimizer 的层次化 Meshlet + BVH
+## 7. GPU HZB 模块：层次化深度缓冲
 
-### 7.1 为什么用 meshoptimizer
+> Godot 4.7.1 仅有 CPU 侧 HZB（`RendererSceneOcclusionCull::HZBuffer`），无 GPU 侧 depth pyramid。
+> Nanite 的 GPU Cull Shader 必须采样 GPU 纹理形式的 HZB，因此需要自建 GPU HZB 模块。
+> 详细原理分析见调研文档 1.3.4 节。
+
+### 7.1 问题陈述
+
+| 维度 | Godot 现有（CPU HZB） | Nanite 需要（GPU HZB） |
+|------|----------------------|----------------------|
+| 数据存储 | `LocalVector<float>` 主存 | `RD::Texture` GPU 显存 |
+| 降采样方式 | CPU 逐像素循环 | Compute Shader 并行 |
+| 查询方式 | CPU 侧 `_is_occluded()` | GPU Cull Shader 纹理采样 |
+| 查询粒度 | 实例级 | Cluster 级 |
+| 吞吐量 | ~数百到数千实例/帧 | ~数十万 Cluster/帧 |
+
+核心矛盾：GPU Cull Shader 无法访问 CPU 主存数据，CPU 也无法以 Cluster 粒度逐个查询遮挡。Nanite **必须**使用 GPU HZB。
+
+### 7.2 GPU HZB 在渲染管线中的位置
+
+```
+Cull Pass 1 (用上帧 HZB)
+    → Rasterize (输出 VisBuffer + Depth)
+    → HZB Build (Compute Shader 从 Depth 降采样)   ← 本模块
+    → Cull Pass 2 (用本帧 HZB，补漏)
+    → Material Eval
+```
+
+关键特征：
+- HZB 输入来源是 Nanite 自己光栅化的深度缓冲，与引擎深度缓冲解耦
+- 两遍剔除确保遮挡准确性接近 100%，仅第一帧可能有少量漏剔
+- 与 Godot 现有 CPU HZB 互不干扰：CPU HZB 剔除传统实例，GPU HZB 剔除 Nanite Cluster
+
+### 7.3 NaniteHZB 类设计
+
+```mermaid
+classDiagram
+    class NaniteHZB {
+        -RID hzb_texture
+        -RID hzb_mip_views[MAX_MIPS]
+        -RID downsample_shader
+        -RID downsample_pipeline
+        -int mip_count
+        -Size2i screen_size
+        -bool needs_rebuild
+        +init(rd: RenderingDevice*) void
+        +cleanup(rd: RenderingDevice*) void
+        +resize(rd: RenderingDevice*, p_size: Size2i) void
+        +build(rd: RenderingDevice*, p_depth_texture: RID) void
+        +get_hzb_texture() RID
+        +get_mip_count() int
+    }
+
+    class NaniteGPUPipeline {
+        -RID cull_shader
+        -RID rasterize_shader
+        -RID shadow_rasterize_shader
+        -RID material_resolve_shader
+        -RID hzb_downsample_shader
+        -RID cull_pipeline
+        -RID rasterize_pipeline
+        -RID shadow_pipeline
+        -RID material_pipeline
+        -RID hzb_downsample_pipeline
+        -NaniteHZB hzb
+        +init(rd: RenderingDevice*) void
+        +dispatch_cull(rd: RenderingDevice*, params: CullParams) RID
+        +dispatch_rasterize(rd: RenderingDevice*, vis_buffer: RID) void
+        +dispatch_hzb_build(rd: RenderingDevice*, depth_texture: RID) void
+        +dispatch_shadow_rasterize(rd: RenderingDevice*, shadow_fb: RID, params: ShadowParams) void
+        +dispatch_material_resolve(rd: RenderingDevice*, vis_buffer: RID) void
+        +get_hzb() NaniteHZB*
+    }
+
+    NaniteGPUPipeline *-- NaniteHZB : hzb
+```
+
+**NaniteHZB 关键设计决策**：
+
+- **纹理格式**：使用 `RD::DATA_FORMAT_R32_SFLOAT`，每纹素 4 字节存储单个浮点深度值
+- **Mip 视图**：为每级 mip 创建独立 image view，供 Compute Shader 逐级绑定
+- **纹理分配**：`RD::texture_create()` + `RD::texture_create_shared_from_layer()` 或逐级 view
+- **Resize 策略**：检测 `RenderSceneBuffers` 尺寸变化，触发 `resize()` 重新分配
+
+### 7.4 HZB 降采样 Compute Shader
+
+```glsl
+#[compute]
+#version 450
+
+layout(set = 0, binding = 0) uniform sampler2D src_depth;
+layout(set = 0, binding = 1) uniform image2D dst_mip;
+layout(set = 0, binding = 2) uniform Params {
+    ivec2 src_size;
+    int mip_level;
+    int _pad;
+} params;
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dst_size = imageSize(dst_mip);
+    if (coord.x >= dst_size.x || coord.y >= dst_size.y) return;
+
+    // 2x2 采样取 MAX（保守遮挡——不会误剔）
+    vec4 depths = vec4(
+        texelFetch(src_depth, coord * 2 + ivec2(0, 0), 0).r,
+        texelFetch(src_depth, coord * 2 + ivec2(1, 0), 0).r,
+        texelFetch(src_depth, coord * 2 + ivec2(0, 1), 0).r,
+        texelFetch(src_depth, coord * 2 + ivec2(1, 1), 0).r
+    );
+    float max_depth = max(max(depths.x, depths.y), max(depths.z, depths.w));
+    imageStore(dst_mip, coord, vec4(max_depth, 0.0, 0.0, 1.0));
+}
+```
+
+### 7.5 HZB 构建流程
+
+```mermaid
+flowchart TD
+    A[Nanite 光栅化完成] --> B{screen_size 变化?}
+    B -- 是 --> C[NaniteHZB::resize]
+    C --> D[释放旧纹理]
+    D --> E[计算 mip_count]
+    E --> F[创建 RD Texture R32_SFLOAT + 全 mip]
+    F --> G[创建每级 mip image view]
+    G --> H[dispatch 降采样]
+    B -- 否 --> H
+    H --> I[for mip 1..mip_count-1]
+    I --> J[绑定 src=mip_i-1, dst=mip_i]
+    J --> K[dispatch compute 8x8 workgroup]
+    K --> L[RD barrier]
+    L --> I
+    I --> M[HZB 构建完成<br/>返回 hzb_texture]
+```
+
+**C++ 调度伪代码**：
+```cpp
+void NaniteHZB::build(RenderingDevice *rd, RID p_depth_texture) {
+    if (needs_rebuild) {
+        resize(rd, current_size);
+        needs_rebuild = false;
+    }
+
+    // 第 0 级：从 Nanite depth buffer 复制到 HZB mip 0
+    // （如果格式不同需要 blit，相同格式可直接作为 mip 0 输入）
+    RID prev_mip = p_depth_texture;
+
+    for (int i = 1; i < mip_count; i++) {
+        // 创建 uniform set：绑定 prev_mip 为 src，hzb_mip_views[i] 为 dst
+        RD::UniformSetID set = create_downsample_set(rd, prev_mip, hzb_mip_views[i]);
+        Size2i mip_size = sizes[i];
+        rd->compute_list_begin();
+        rd->compute_list_bind_compute_pipeline(compute_list, downsample_pipeline);
+        rd->compute_list_bind_uniform_set(compute_list, set, 0);
+        // push constants: src_size, mip_level
+        rd->compute_list_set_push_constant(compute_list, ...);
+        rd->compute_list_dispatch(compute_list,
+            (mip_size.width + 7) / 8,
+            (mip_size.height + 7) / 8, 1);
+        rd->compute_list_end();
+        rd->barrier(RD::BARRIER_COMPUTE_TO_COMPUTE);
+
+        prev_mip = hzb_mip_views[i]; // 下一级的输入是当前级
+    }
+}
+```
+
+### 7.6 HZB 在 Cull Shader 中的使用
+
+GPU Cull Shader 中的遮挡查询伪代码：
+```glsl
+// 在 BVH 节点/Cluster 剔除中
+bool is_occluded = hzb_occlusion_test(
+    hzb_texture,           // GPU HZB 纹理
+    node_aabb,             // BVH 节点 AABB
+    view_matrix,           // 相机 view
+    projection_matrix,     // 相机 projection
+    screen_size            // 屏幕尺寸
+);
+
+bool hzb_occlusion_test(
+    sampler2D hzb,
+    AABB aabb,
+    mat4 view,
+    mat4 proj,
+    vec2 screen_size
+) {
+    // 1. 投影 AABB 8 角到屏幕空间
+    vec3 corners[8] = get_aabb_corners(aabb);
+    vec2 rect_min = vec2(1e9);
+    vec2 rect_max = vec2(-1e9);
+    float z_near = 1e9;
+    for (int i = 0; i < 8; i++) {
+        vec4 clip = proj * view * vec4(corners[i], 1.0);
+        vec2 ndc = clip.xy / clip.w;
+        vec2 uv = ndc * 0.5 + 0.5;
+        rect_min = min(rect_min, uv);
+        rect_max = max(rect_max, uv);
+        z_near = min(z_near, clip.w > 0 ? clip.z / clip.w : 1.0);
+    }
+
+    // 2. 选择 mip 层级（使包围矩形约覆盖 1 个纹素）
+    vec2 rect_size = (rect_max - rect_min) * screen_size;
+    float mip_level = ceil(log2(max(rect_size.x, rect_size.y)));
+
+    // 3. 从粗到细遍历
+    for (int mip = int(mip_level); mip >= 0; mip--) {
+        vec2 mip_size = screen_size / exp2(float(mip));
+        vec2 uv = clamp((rect_min + rect_max) * 0.5, vec2(0.0), vec2(1.0));
+        float z_far = textureLod(hzb, uv, float(mip)).r;
+        if (z_near > z_far) return true;  // 被遮挡
+    }
+    return false;  // 可见
+}
+```
+
+### 7.7 三桥接方案下 GPU HZB 的差异
+
+| 维度 | GDExtension | Module | Deep |
+|------|------------|--------|------|
+| HZB 纹理分配 | CompositorEffect 回调内 `RenderingDevice::get_singleton()` | 同左，但可直接 include 引擎头文件 | 可复用引擎内部 depth texture，减少拷贝 |
+| 深度来源 | 自行维护 Nanite depth buffer，或通过 `RenderSceneBuffers` 获取 | 同左 | 可直接访问 `RenderForwardClustered` 内部深度纹理 |
+| 纹理格式转换 | 需确认 Nanite depth 与 HZB 格式兼容（均 R32_SFLOAT 则直接复用） | 同左 | 可利用引擎 depth buffer 的现有 format conversion |
+| 调试可视化 | 在 NaniteDebug 中添加 HZB mip 可视化模式 | 同左 | 同左 |
+| 长期优化 | — | — | 可将 GPU HZB 提升为引擎通用基础设施，SSAO/SSR 等后处理也可复用 |
+
+### 7.8 HZB 调试可视化
+
+在 `NaniteDebug` 中新增 HZB 可视化模式：
+
+```cpp
+// NaniteDebug 扩展
+enum class DebugMode {
+    NONE = 0,
+    CLUSTER_COLORS,    // 现有：Cluster 纯色
+    BVH_WIREFRAME,     // 现有：BVH 线框
+    BOUNDS,            // 现有：包围盒
+    LOD_HEATMAP,       // 现有：LOD 热力图
+    OVERDRAW,          // 现有：过度绘制
+    HZB_MIP_LEVELS,    // 新增：显示各级 mip 深度图
+    HZB_OCCLUSION,     // 新增：显示遮挡查询结果（绿=可见，红=被剔除）
+};
+```
+
+HZB mip 可视化实现：在 Material Eval 阶段，用 fullscreen quad 将各级 HZB mip 绘制到屏幕四角（类似 UE5 的 HZB 调试视图）。
+
+### 7.9 与 Godot CPU HZB 的共存策略
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                     帧渲染管线                                     │
+├──────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  CPU 侧 (Godot 原有)                                             │
+│  ┌─────────────────────────────────────┐                        │
+│  │ RendererSceneCull::render_camera()   │                        │
+│  │   → HZBuffer::update() (CPU 降采样) │                        │
+│  │   → OCCLUSION_CULLED 宏              │                        │
+│  │   → 剔除传统实例                     │                        │
+│  └─────────────────────────────────────┘                        │
+│                                                                  │
+│  GPU 侧 (Nanite 自建)                                            │
+│  ┌─────────────────────────────────────┐                        │
+│  │ NaniteGPUPipeline::dispatch_cull()   │                        │
+│  │   → 采样 NaniteHZB 纹理 (GPU)       │                        │
+│  │   → 剔除 Nanite Cluster              │                        │
+│  │   → NaniteHZB::build() (Compute)    │                        │
+│  └─────────────────────────────────────┘                        │
+│                                                                  │
+│  两套 HZB 互不干扰，数据流完全独立                                 │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### 7.10 实现清单
+
+- [ ] `NaniteHZB` 类实现（init/cleanup/resize/build）
+- [ ] HZB 降采样 Compute Shader 编写（`hzb_downsample.glsl`）
+- [ ] `NaniteGPUPipeline` 中添加 HZB shader/pipeline 管理
+- [ ] `NaniteGPUPipeline::dispatch_hzb_build()` 实现
+- [ ] Cull Shader 中集成 HZB 遮挡查询逻辑
+- [ ] 深度缓冲格式兼容性验证（Nanite depth → HZB mip 0）
+- [ ] 三桥接方案各自的纹理分配策略实现
+- [ ] HZB 调试可视化（mip levels + occlusion result）
+- [ ] 性能基准：1080p HZB 构建耗时 < 0.1ms
+
+---
+
+## 8. 离线构建模块：基于 meshoptimizer 的层次化 Meshlet + BVH
+
+### 8.1 为什么用 meshoptimizer
 
 Godot 在 `thirdparty/meshoptimizer/`(版本 1.1)和 `modules/meshoptimizer/` 中已携带 meshoptimizer 库，是业界事实标准，**已包含 Nanite 离线阶段所需的全部基础算法**：
 
@@ -618,7 +923,7 @@ Godot 在 `thirdparty/meshoptimizer/`(版本 1.1)和 `modules/meshoptimizer/` �
 - ✅ 三套方案都可 `#include <thirdparty/meshoptimizer/meshoptimizer.h>` 直接调用；
 - ⚠️ 需在自己的代码里直接调用 meshoptimizer C API，不要通过 `SurfaceTool` 间接触发。
 
-### 7.2 离线构建管线总览
+### 8.2 离线构建管线总览
 
 ```
 ArrayMesh / SurfaceTool 顶点数组
@@ -672,7 +977,7 @@ ArrayMesh / SurfaceTool 顶点数组
    └─ 输出: NaniteMeshResource(可挂到 NaniteMeshInstance3D)
 ```
 
-### 7.3 类图
+### 8.3 类图
 
 ```mermaid
 classDiagram
@@ -765,7 +1070,7 @@ classDiagram
     NaniteBuilder ..> ArrayMesh : consumes input
 ```
 
-### 7.4 流程图 — 离线构建主流程
+### 8.4 流程图 — 离线构建主流程
 
 ```mermaid
 flowchart TD
@@ -802,7 +1107,7 @@ flowchart TD
     style Shadow fill:#fce4ec,stroke:#c62828
 ```
 
-### 7.5 时序图 — 层次化构建(单个 mesh)
+### 8.5 时序图 — 层次化构建(单个 mesh)
 
 ```mermaid
 sequenceDiagram
@@ -848,9 +1153,9 @@ sequenceDiagram
     B-->>ST: Ref~NaniteMeshResource~
 ```
 
-### 7.6 关键代码骨架
+### 8.6 关键代码骨架
 
-#### 7.6.1 预处理 + 叶子层聚类
+#### 8.6.1 预处理 + 叶子层聚类
 
 ```cpp
 // nanite/offline/nanite_builder.cpp
@@ -952,7 +1257,7 @@ Ref<NaniteMeshResource> NaniteBuilder::build(const Ref<ArrayMesh> &p_mesh) {
 }
 ```
 
-#### 7.6.2 层次化构建(自底向上)
+#### 8.6.2 层次化构建(自底向上)
 
 ```cpp
 void NaniteBuilder::build_hierarchy(LocalVector<NaniteCluster> &p_clusters,
@@ -1034,7 +1339,7 @@ void NaniteBuilder::build_hierarchy(LocalVector<NaniteCluster> &p_clusters,
 }
 ```
 
-#### 7.6.3 粗 LOD Shadow Mesh 生成
+#### 8.6.3 粗 LOD Shadow Mesh 生成
 
 构建完成后，从层次结构中提取指定深度的 cluster，展开为标准 `ArrayMesh`，供 GDExtension 桥接通过 `mesh_set_shadow_mesh` 使用：
 
@@ -1101,7 +1406,7 @@ Ref<ArrayMesh> NaniteBuilder::build_shadow_mesh(
 }
 ```
 
-### 7.7 构建参数与可调性
+### 8.7 构建参数与可调性
 
 构建参数通过 `BuilderConfig` 暴露，支持在编辑器预览界面中实时调整并重新构建：
 
@@ -1120,7 +1425,7 @@ Ref<ArrayMesh> NaniteBuilder::build_shadow_mesh(
 
 **参数调整流程**：用户在 Inspector 中修改 `BuilderConfig` → 触发 `NaniteBuilder::build()` 重新构建 → 自动更新 `NaniteMeshResource` → 预览界面即时刷新 → 调试可视化验证效果。
 
-### 7.8 与预览界面和调试可视化的集成
+### 8.8 与预览界面和调试可视化的集成
 
 离线构建完成后，通过编辑器模块（下一章）实现预览和调试：
 
@@ -1130,7 +1435,7 @@ Ref<ArrayMesh> NaniteBuilder::build_shadow_mesh(
 4. **参数迭代**：修改 `BuilderConfig` 后自动重新构建，构建统计（cluster 数 / node 数 / page 数 / 粗 LOD tri 数）在 `stats_label` 中实时更新；
 5. **资源预览缩略图**：`NaniteResourcePreviewGenerator` 用粗 LOD `shadow_mesh` 渲染缩略图，不启动 Nanite GPUPipeline，避免性能开销。
 
-### 7.9 序列化
+### 8.9 序列化
 
 每个 cluster 用 `meshopt_encodeMeshlet` 单独编码，运行时按 page 加载并 `meshopt_decodeMeshlet` 解码：
 
@@ -1180,7 +1485,7 @@ void PageCache::decode_page(uint32_t p_page_id) {
 }
 ```
 
-### 7.10 辅助数据汇总
+### 8.10 辅助数据汇总
 
 | 字段 | 类型 | 来源(meshoptimizer API) | 运行时用途 |
 |---|---|---|---|
@@ -1193,7 +1498,7 @@ void PageCache::decode_page(uint32_t p_page_id) {
 | `left_child/right_child` | uint32 | 构建时层次结构展开 | GPU 栈式 BVH 遍历 |
 | `provoking_vertex` | — | `meshopt_generateProvokingIndexBuffer` | VisBuffer flat 取 triangle_id |
 
-### 7.11 三桥接下离线构建的差异
+### 8.11 三桥接下离线构建的差异
 
 | 维度 | GDExtension | Module | Deep |
 |---|---|---|---|
@@ -1204,7 +1509,7 @@ void PageCache::decode_page(uint32_t p_page_id) {
 | 序列化 | 自定义二进制 + `.res` 元数据 | 同左 | 可扩展 `.scn`/`.res` 原生格式 |
 | 用户体验 | 导入后手动挂 NaniteMeshResource | 同左但 Inspector 自动建议 | 自动：导入高面数 mesh 自动生成 Nanite |
 
-### 7.12 边界情况与限制
+### 8.12 边界情况与限制
 
 1. **三角形数过少的 mesh**(< 128 tri)：不构建 Nanite，直接走标准 mesh；
 2. **多 surface mesh**：每个 surface 独立构建 BVH，vertex pool 共享，`material_index` 区分；
@@ -1215,13 +1520,13 @@ void PageCache::decode_page(uint32_t p_page_id) {
 
 ---
 
-## 8. 编辑器模块：预览界面与调试可视化
+## 9. 编辑器模块：预览界面与调试可视化
 
-### 8.1 概述
+### 9.1 概述
 
 离线构建完成后，用户需要在 Inspector 中预览 Nanite mesh 并能切换调试可视化模式验证构建质量。参照 Godot 内置的 `MeshEditor`(`editor/scene/3d/mesh_editor_plugin.h`)，设计 `NaniteMeshEditor`。
 
-### 8.2 类图
+### 9.2 类图
 
 ```mermaid
 classDiagram
@@ -1271,7 +1576,7 @@ classDiagram
     NaniteEditorPlugin --> NaniteResourcePreviewGenerator : registers
 ```
 
-### 8.3 预览界面功能
+### 9.3 预览界面功能
 
 | 功能 | 实现方式 |
 |------|----------|
@@ -1282,7 +1587,7 @@ classDiagram
 | 包围盒显示 | `Button` toggle，调 `NaniteServer::set_debug_show_bounds()` |
 | 构建统计 | `Label` 显示：cluster 数 / node 数 / page 数 / 粗 LOD tri 数 / 内存估算 |
 
-### 8.4 代码骨架
+### 9.4 代码骨架
 
 ```cpp
 // nanite/editor/nanite_mesh_editor.h
@@ -1381,7 +1686,7 @@ void NaniteMeshEditor::_on_bounds_toggled(bool p_pressed) {
 }
 ```
 
-### 8.5 InspectorPlugin 注册
+### 9.5 InspectorPlugin 注册
 
 ```cpp
 // nanite/editor/nanite_editor_plugin.h
@@ -1411,7 +1716,7 @@ public:
 };
 ```
 
-### 8.6 焦点管理（调试模式隔离）
+### 9.6 焦点管理（调试模式隔离）
 
 预览视口内的 `NaniteMeshInstance3D` 与场景中的实例走同一 Nanite GPUPipeline，因此 `NaniteServer::set_debug_mode()` 设置的调试模式对预览视口同样生效。调试模式是全局的，切换预览界面的调试模式会影响所有 Nanite 实例。
 
@@ -1434,7 +1739,7 @@ void NaniteMeshEditor::_notification(int p_what) {
 }
 ```
 
-### 8.7 构建后即时预览
+### 9.7 构建后即时预览
 
 构建完成后不需要经过磁盘，直接用内存中的 `NaniteMeshResource`：
 
@@ -1451,7 +1756,7 @@ void NaniteImporter::_on_build_completed(Ref<NaniteMeshResource> p_resource) {
 }
 ```
 
-### 8.8 资源预览缩略图
+### 9.8 资源预览缩略图
 
 FileSystem 面板中的小图标，使用 `shadow_mesh`（粗 LOD ArrayMesh）生成，无需启动 Nanite GPUPipeline：
 
@@ -1480,9 +1785,9 @@ public:
 
 ---
 
-## 9. 阶段一：GDExtension 桥接
+## 10. 阶段一：GDExtension 桥接
 
-### 9.1 渲染管线流程图
+### 10.1 渲染管线流程图
 
 ```mermaid
 flowchart TB
@@ -1504,7 +1809,7 @@ flowchart TB
     style NANITE_MAT fill:#c8e6c9,stroke:#2e7d32
 ```
 
-### 9.2 时序图
+### 10.2 时序图
 
 ```mermaid
 sequenceDiagram
@@ -1541,7 +1846,7 @@ sequenceDiagram
     NS-->>CE: 返回
 ```
 
-### 9.3 代码骨架
+### 10.3 代码骨架
 
 ```cpp
 // nanite_bridge_gdext/nanite_gdext_bridge.h
@@ -1625,7 +1930,7 @@ void NaniteGDExtBridge::on_post_opaque_pass(const RenderData *p_render_data) {
 }
 ```
 
-### 9.4 阴影方案：粗 LOD
+### 10.4 阴影方案：粗 LOD
 
 ```cpp
 // nanite/nanite_mesh_resource.cpp
@@ -1645,9 +1950,9 @@ void NaniteMeshResource::setup_shadow_mesh() {
 
 ---
 
-## 10. 阶段二：Module 桥接
+## 11. 阶段二：Module 桥接
 
-### 10.1 渲染管线流程图
+### 11.1 渲染管线流程图
 
 ```mermaid
 flowchart TB
@@ -1675,7 +1980,7 @@ flowchart TB
     style NANITE_MAT fill:#c8e6c9,stroke:#2e7d32
 ```
 
-### 10.2 时序图
+### 11.2 时序图
 
 ```mermaid
 sequenceDiagram
@@ -1721,7 +2026,7 @@ sequenceDiagram
     GPU-->>NS: 完成
 ```
 
-### 10.3 代码骨架
+### 11.3 代码骨架
 
 ```cpp
 // modules/nanite_bridge_module/nanite_module_bridge.h
@@ -1780,7 +2085,7 @@ void NaniteModuleBridge::on_shadow_pass(
 }
 ```
 
-### 10.4 Hook 安装策略
+### 11.4 Hook 安装策略
 
 ```cpp
 // modules/nanite_bridge_module/nanite_scene_cull_hook.h
@@ -1890,9 +2195,9 @@ sequenceDiagram
 
 ---
 
-## 11. 阶段三：Deep 桥接
+## 12. 阶段三：Deep 桥接
 
-### 11.1 渲染管线流程图
+### 12.1 渲染管线流程图
 
 ```mermaid
 flowchart TB
@@ -1918,7 +2223,7 @@ flowchart TB
     style GI fill:#fff3e0,stroke:#e65100
 ```
 
-### 11.2 时序图
+### 12.2 时序图
 
 ```mermaid
 sequenceDiagram
@@ -1962,7 +2267,7 @@ sequenceDiagram
     NS->>NS: 生成 SDFGI 体素/Nanite 几何信息
 ```
 
-### 11.3 Patch 骨架
+### 12.3 Patch 骨架
 
 **Patch 1: renderer_scene_cull.h/.cpp — 跳过 Nanite 实例的 CPU 剔除**
 
@@ -2047,7 +2352,7 @@ sequenceDiagram
 +	}
 ```
 
-### 11.4 Deep 桥接代码
+### 12.4 Deep 桥接代码
 
 ```cpp
 // nanite_bridge_deep/nanite_deep_bridge.h
@@ -2082,11 +2387,11 @@ public:
 
 ---
 
-## 12. 关键 API 对照表
+## 13. 关键 API 对照表
 
 > 本节基于 Godot 4.7.1 源码精确验证，是编码的直接依据。
 
-### 12.1 CompositorEffect
+### 13.1 CompositorEffect
 
 | 项目 | API | 源码位置 | 备注 |
 |------|-----|----------|------|
@@ -2096,20 +2401,20 @@ public:
 | PRE_OPAQUE 枚举 | `EFFECT_CALLBACK_TYPE_PRE_OPAQUE = 0` | `compositor_effect.h` | ✅ 不是 `BEFORE_OPAQUE_PASS` |
 | POST_OPAQUE 枚举 | `EFFECT_CALLBACK_TYPE_POST_OPAQUE = 1` | `compositor_effect.h` | ✅ 不是 `AFTER_OPAQUE_PASS` |
 
-### 12.2 RenderDataExtension
+### 13.2 RenderDataExtension
 
 | 项目 | API | 源码位置 | 备注 |
 |------|-----|----------|------|
 | 获取场景数据 | `RenderSceneData *get_render_scene_data() const` | `servers/rendering/storage/render_data_extension.h` | ✅ 返回 `RenderSceneData*`，不是 `get_render_data()` |
 | 获取渲染 buffer | `Ref<RenderSceneBuffers> get_render_scene_buffers() const` | `render_data_extension.h` | 获取 color/depth FB |
 
-### 12.3 RenderingServer — 阴影网格
+### 13.3 RenderingServer — 阴影网格
 
 | 项目 | API | 源码位置 | 备注 |
 |------|-----|----------|------|
 | 设置阴影网格 | `void mesh_set_shadow_mesh(RID p_mesh, RID p_shadow_mesh)` | `rendering_server.h:239` | ✅ ClassDB 绑定在 `.cpp:2389` |
 
-### 12.4 LightStorage RD — 阴影 Atlas
+### 13.4 LightStorage RD — 阴影 Atlas
 
 | 项目 | API | 源码位置 | 备注 |
 |------|-----|----------|------|
@@ -2117,28 +2422,40 @@ public:
 | 方向光阴影 FB | `RID direction_shadow_get_fb()` | `light_storage.h:1183` | 方向光专用 shadow FB |
 | 阴影 Rect | `bool light_instance_get_shadow_atlas_rect(RID p_light_instance, RID p_atlas, Vector2i &r_rect)` | `light_storage.h:684` | ✅ 不是 `shadow_atlas_get_quadrant_rect` |
 
-### 12.5 RendererSceneCull
+### 13.5 RendererSceneCull
 
 | 项目 | API | 源码位置 | 备注 |
 |------|-----|----------|------|
 | 渲染相机 | `void render_camera(Ref<RendererSceneCamera> p_camera, const CameraData &p_camera_data)` | `renderer_scene_cull.h` | ✅ 是 `render_camera`，不是 `_render_camera` |
 
-### 12.6 RenderForwardClustered
+### 13.6 RenderForwardClustered
 
 | 项目 | API | 源码位置 | 备注 |
 |------|-----|----------|------|
 | 阴影 Pass | `void _render_shadow_pass(RenderData *p_render_data, RID p_light, ...)` | `render_forward_clustered.h` | 阶段二/三 hook 目标 |
 | 渲染场景 | `void _render_scene(RenderData *p_render_data, ...)` | `render_forward_clustered.h` | 阶段三 patch 目标 |
 
+### 13.7 RenderingDevice — HZB 相关 API
+
+| 项目 | API | 源码位置 | 备注 |
+|------|-----|----------|------|
+| 创建纹理 | `RID texture_create(const TextureFormat &p_format, const TextureView &p_view, const Vector<uint8_t> &p_data = Vector<uint8_t>())` | `rendering_device.h` | HZB R32_SFLOAT 纹理创建 |
+| 创建共享纹理视图 | `RID texture_create_shared_from_layer(const TextureView &p_view, RID p_texture, uint32_t p_layer = 0, uint32_t p_mipmap = 0)` | `rendering_device.h` | 为 HZB 每级 mip 创建独立 view |
+| 计算管线创建 | `RID compute_pipeline_create(RID p_shader)` | `rendering_device.h` | HZB 降采样 Compute Pipeline |
+| Compute 分发 | `void compute_list_dispatch(ComputeListID p_list, uint32_t p_x_groups, uint32_t p_y_groups, uint32_t p_z_groups)` | `rendering_device.h` | HZB 降采样 dispatch |
+| Barrier | `void barrier(BarrierMask p_from, BarrierMask p_to = BARRIER_NO_BARRIER)` | `rendering_device.h` | mip 级间 compute→compute barrier |
+| 纹理格式 | `DATA_FORMAT_R32_SFLOAT` | `rendering_device_enum.h` | HZB 深度值存储格式 |
+
 ---
 
-## 13. 验证与测试矩阵
+## 14. 验证与测试矩阵
 
-### 13.1 三桥接能力对照
+### 14.1 三桥接能力对照
 
 | 能力 | GDExtension | Module | Deep |
 |------|:-----------:|:------:|:----:|
 | BVH 遍历 + 剔除 | ✅ | ✅ | ✅ |
+| GPU HZB 构建 | ✅ | ✅ | ✅ |
 | 可见性缓冲渲染 | ✅ | ✅ | ✅ |
 | 材质解析 | ✅ | ✅ | ✅ |
 | 粗 LOD 阴影 | ✅ | ✅ | ✅ |
@@ -2152,7 +2469,7 @@ public:
 | Nanite 调试可视化 | ✅ | ✅ | ✅ |
 | 流式加载(PageCache) | ✅ | ✅ | ✅ |
 
-### 13.2 测试场景
+### 14.2 测试场景
 
 | 编号 | 场景 | 测试重点 | 适用阶段 |
 |------|------|----------|-----------|
@@ -2170,8 +2487,12 @@ public:
 | T12 | 桥接切换 | 编译+运行时切换 | 全部 |
 | T13 | SDFGI 集成 | Nanite 几何参与 GI | 阶段三 |
 | T14 | VoxelGI 集成 | Nanite 几何参与 GI | 阶段三 |
+| T15 | GPU HZB 构建 | HZB 降采样正确性 | 全部 |
+| T16 | HZB 遮挡剔除 | Cluster 级遮挡准确性 | 全部 |
+| T17 | HZB 调试可视化 | Mip 级别 / 遮挡结果可视化 | 全部 |
+| T18 | HZB 性能基准 | 1080p 构建耗时 < 0.1ms | 全部 |
 
-### 13.3 阶段验收标准
+### 14.3 阶段验收标准
 
 **阶段一(GDExtension)验收标准**：
 
@@ -2208,7 +2529,7 @@ public:
 
 ---
 
-## 14. 与调研文档差异说明
+## 15. 与调研文档差异说明
 
 > 本节纠正 `nanite-godot-design.md` 调研文档中的 API 命名错误，确保编码使用正确名称。
 
@@ -2235,6 +2556,10 @@ public:
 - [ ] `NaniteMeshData` GPU Buffer 管理实现
 - [ ] `NaniteMeshInstance3D` 场景节点实现
 - [ ] `NaniteGPUPipeline` Compute/Raster shader 加载
+- [ ] `NaniteHZB` 类实现（init/cleanup/resize/build）
+- [ ] `hzb_downsample.glsl` Compute Shader 编写
+- [ ] `NaniteGPUPipeline::dispatch_hzb_build()` 实现
+- [ ] Cull Shader 中 HZB 遮挡查询逻辑集成
 - [ ] `NanitePageCache` 流式加载实现
 - [ ] `NaniteDebug` 调试可视化实现
 - [ ] `NaniteGDExtBridge` CompositorEffect 子类实现
@@ -2258,6 +2583,8 @@ public:
 - [ ] `light_instance_get_shadow_atlas_rect(RID, RID, Vector2i&)` 正确调用
 - [ ] `direction_shadow_get_fb()` 方向光阴影实现
 - [ ] Nanite GPU shadow 写入引擎 shadow atlas 验证
+- [ ] HZB 纹理通过 `RenderingDevice::get_singleton()` 正确分配
+- [ ] NaniteHZB::build() 在 Module 桥接下正确调度 Compute Shader
 - [ ] Module SConscript + config.py 配置
 - [ ] SCons `nanite_bridge=module` 开关测试
 - [ ] 阶段二验收测试全部通过
@@ -2271,6 +2598,8 @@ public:
 - [ ] `render_forward_clustered.patch` — 插入 Nanite 回调
 - [ ] `light_storage.patch` — 暴露阴影 API
 - [ ] `NaniteDeepBridge` 实现
+- [ ] HZB 可复用引擎内部深度纹理验证（减少拷贝）
+- [ ] GPU HZB 与 Godot CPU HZB 共存无冲突
 - [ ] SDFGI 集成：Nanite 几何参与体素化
 - [ ] VoxelGI 集成：Nanite 几何参与 GI 计算
 - [ ] Patch 应用与编译验证
@@ -2290,6 +2619,8 @@ public:
 - [ ] `nanite/` 核心库无桥接特定代码
 - [ ] NaniteMeshEditor 预览界面可用
 - [ ] 调试可视化 5 种模式在预览中可切换
+- [ ] HZB 调试可视化（mip levels + occlusion result）在预览中可切换
+- [ ] GPU HZB 构建性能：1080p < 0.1ms
 - [ ] 构建后自动切换 Cluster 纯色模式
 - [ ] shadow_lod_depth 调整后粗 LOD 预览可刷新
 - [ ] NaniteResourcePreviewGenerator 缩略图生成
