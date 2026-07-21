@@ -885,18 +885,6 @@ HZB mip 可视化实现：在 Material Eval 阶段，用 fullscreen quad 将各�
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-### 7.10 实现清单
-
-- [ ] `NaniteHZB` 类实现（init/cleanup/resize/build）
-- [ ] HZB 降采样 Compute Shader 编写（`hzb_downsample.glsl`）
-- [ ] `NaniteGPUPipeline` 中添加 HZB shader/pipeline 管理
-- [ ] `NaniteGPUPipeline::dispatch_hzb_build()` 实现
-- [ ] Cull Shader 中集成 HZB 遮挡查询逻辑
-- [ ] 深度缓冲格式兼容性验证（Nanite depth → HZB mip 0）
-- [ ] 三桥接方案各自的纹理分配策略实现
-- [ ] HZB 调试可视化（mip levels + occlusion result）
-- [ ] 性能基准：1080p HZB 构建耗时 < 0.1ms
-
 ---
 
 ## 8. 离线构建模块：基于 meshoptimizer 的层次化 Meshlet + BVH
