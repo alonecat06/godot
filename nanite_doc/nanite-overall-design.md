@@ -21,7 +21,6 @@
 13. [关键 API 对照表](#13-关键-api-对照表)
 14. [验证与测试矩阵](#14-验证与测试矩阵)
 15. [与调研文档差异说明](#15-与调研文档差异说明)
-附录：实施检查清单
 
 ---
 
@@ -2529,87 +2528,3 @@ public:
 | D04 | `_render_camera` | `render_camera` | `renderer_scene_cull.h` | 阶段二 hook 目标函数名 |
 | D05 | (未提及) `direction_shadow_get_fb()` | `direction_shadow_get_fb()` | `light_storage.h:1183` | 阶段二/三方向光阴影 |
 | D06 | (混淆) `RenderData*` vs `RenderDataExtension*` | GDExtension 中使用 `RenderDataExtension*`；Module 中使用 `RenderData*` | 不同的桥接层上下文 | 全阶段回调签名 |
-
----
-
-## 附录：实施检查清单
-
-### A.1 阶段一检查清单
-
-- [ ] `nanite/` 核心库目录结构与 SConscript 创建
-- [ ] `INaniteBridge` 抽象接口定义
-- [ ] `NaniteServer` 单例实现（含 bridge 切换逻辑）
-- [ ] `NaniteCore` BVH 遍历/剔除实现
-- [ ] `NaniteMeshResource` 资源类实现
-- [ ] `NaniteMeshData` GPU Buffer 管理实现
-- [ ] `NaniteMeshInstance3D` 场景节点实现
-- [ ] `NaniteGPUPipeline` Compute/Raster shader 加载
-- [ ] `NaniteHZB` 类实现（init/cleanup/resize/build）
-- [ ] `hzb_downsample.glsl` Compute Shader 编写
-- [ ] `NaniteGPUPipeline::dispatch_hzb_build()` 实现
-- [ ] Cull Shader 中 HZB 遮挡查询逻辑集成
-- [ ] `NanitePageCache` 流式加载实现
-- [ ] `NaniteDebug` 调试可视化实现
-- [ ] `NaniteGDExtBridge` CompositorEffect 子类实现
-- [ ] CompositorEffect 回调类型使用 `EFFECT_CALLBACK_TYPE_PRE_OPAQUE` / `EFFECT_CALLBACK_TYPE_POST_OPAQUE`
-- [ ] `RenderDataExtension::get_render_scene_data()` 正确使用
-- [ ] `mesh_set_shadow_mesh(RID, RID)` 粗 LOD 阴影实现
-- [ ] ProjectSettings `nanite/bridge/active` 注册
-- [ ] SCons `nanite_bridge=gdext` 开关测试
-- [ ] .gdextension 插件加载测试
-- [ ] 阶段一验收测试全部通过
-- [ ] NaniteBuilder::build_shadow_mesh() 生成粗 LOD
-- [ ] BuilderConfig 参数可在 Inspector 中调整
-
-### A.2 阶段二检查清单
-
-- [ ] `modules/nanite_bridge_module/` 目录创建
-- [ ] `NaniteModuleBridge` 实现
-- [ ] `NaniteSceneCullHook` 实现
-- [ ] `render_camera` hook 安装（确认函数名不是 `_render_camera`）
-- [ ] `shadow_atlas_get_fb(RID)` 正确调用
-- [ ] `light_instance_get_shadow_atlas_rect(RID, RID, Vector2i&)` 正确调用
-- [ ] `direction_shadow_get_fb()` 方向光阴影实现
-- [ ] Nanite GPU shadow 写入引擎 shadow atlas 验证
-- [ ] HZB 纹理通过 `RenderingDevice::get_singleton()` 正确分配
-- [ ] NaniteHZB::build() 在 Module 桥接下正确调度 Compute Shader
-- [ ] Module SConscript + config.py 配置
-- [ ] SCons `nanite_bridge=module` 开关测试
-- [ ] 阶段二验收测试全部通过
-- [ ] NaniteBuilder::build() 通过 WorkerThreadPool 多线程构建
-- [ ] BuilderConfig 参数可在 Inspector 中调整
-
-### A.3 阶段三检查清单
-
-- [ ] `nanite_bridge_deep/patches/` 补丁文件创建
-- [ ] `renderer_scene_cull.patch` — Nanite 实例跳过 CPU 剔除
-- [ ] `render_forward_clustered.patch` — 插入 Nanite 回调
-- [ ] `light_storage.patch` — 暴露阴影 API
-- [ ] `NaniteDeepBridge` 实现
-- [ ] HZB 可复用引擎内部深度纹理验证（减少拷贝）
-- [ ] GPU HZB 与 Godot CPU HZB 共存无冲突
-- [ ] SDFGI 集成：Nanite 几何参与体素化
-- [ ] VoxelGI 集成：Nanite 几何参与 GI 计算
-- [ ] Patch 应用与编译验证
-- [ ] 非_nanite_场景无回归测试
-- [ ] SCons `nanite_bridge=deep` 开关测试
-- [ ] 阶段三验收测试全部通过
-- [ ] 导入高面数 mesh 自动触发 Nanite 构建
-- [ ] BuilderConfig 参数可在 Inspector 中调整
-
-### A.4 通用检查清单
-
-- [ ] 所有 Mermaid 图语法正确渲染
-- [ ] API 名称与 Godot 4.7.1 源码一致
-- [ ] 编译期宏 `NANITE_BRIDGE_GDEXT/MODULE/DEEP` 正确定义
-- [ ] 运行时桥接切换无崩溃
-- [ ] 三种桥接的核心渲染结果一致（排除阴影差异）
-- [ ] `nanite/` 核心库无桥接特定代码
-- [ ] NaniteMeshEditor 预览界面可用
-- [ ] 调试可视化 5 种模式在预览中可切换
-- [ ] HZB 调试可视化（mip levels + occlusion result）在预览中可切换
-- [ ] GPU HZB 构建性能：1080p < 0.1ms
-- [ ] 构建后自动切换 Cluster 纯色模式
-- [ ] shadow_lod_depth 调整后粗 LOD 预览可刷新
-- [ ] NaniteResourcePreviewGenerator 缩略图生成
-- [ ] 构建统计 (cluster/node/page/tri) 实时显示
