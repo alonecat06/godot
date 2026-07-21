@@ -226,6 +226,195 @@ NaniteMeshResource (磁盘文件)
 - 第二遍用本帧刚光栅化的深度生成的 HZB,捕捉到本帧新暴露的区域(如角色移动后露出的背景);
 - 两遍剔除确保遮挡剔除的准确性接近 100%,仅第一帧可能有少量漏剔。
 
+#### 1.3.4 HZB（层次化 Z 缓冲）原理与 Godot 现状
+
+HZB（Hierarchical Z-Buffer，又称 Hierarchical Depth Buffer / Depth Pyramid）是 Nanite 遮挡剔除的核心依赖。本节详述其原理、CPU 与 GPU 实现的本质差异、Godot 现有实现，以及对 Nanite 落地的影响。
+
+##### 1.3.4.1 HZB 原理
+
+**基本思想**：将深度缓冲逐级降采样，构建一个深度 mipmap 金字塔。每一级存储的是子区域深度的**最大值**（最远深度），而非传统 mipmap 的平均值。查询时从最粗 mip 开始：如果测试 AABB 在最粗 mip 下就被遮挡（AABB 最近深度 ≥ HZB 最远深度），则直接判定不可见；否则逐步细化到更精细的 mip 层级。这种"从粗到细"的查询方式使得大部分被遮挡物体只需访问 1-2 个 mip 层级即可判定，平均复杂度远低于逐像素比较。
+
+**降采样规则——取 MAX**：
+```
+mip[i+1][x,y] = max(
+    mip[i][2x,   2y  ],
+    mip[i][2x+1, 2y  ],
+    mip[i][2x,   2y+1],
+    mip[i][2x+1, 2y+1]
+)
+```
+取 MAX 而非 MIN 或 AVG 的原因：HZB 存储的是"该区域内最远的已知深度"，遮挡查询时用"测试物体的最近深度"与之比较。若 `nearest_depth_of_test > farthest_depth_in_HZB`，则物体一定被遮挡。取 MAX 保证了 HZB 中的深度值是保守的——不会误剔（假阴性），只可能漏剔（假阳性，即本应剔除但没剔除，下一帧或第二遍剔除可修正）。
+
+**遮挡查询流程**：
+1. 将被测试物体的 AABB 的 8 个角投影到屏幕空间，得到屏幕空间包围矩形 `(u_min, v_min, u_max, v_max)` 和对应的最近深度 `z_near`；
+2. 根据包围矩形的像素面积选择对应的 mip 层级：使得包围矩形在该 mip 下约覆盖 1 个纹素；
+3. 从该 mip 层级读取深度值 `z_far = HZB[mip](u, v)`；
+4. 若 `z_near > z_far`（物体最近点比 HZB 记录的最远深度还远），则物体被遮挡；
+5. 若需更精确判定，可向更精细的 mip 层级细化查询。
+
+**mip 层级选择**：越粗的 mip 查询越快（一次采样即可），但精度越低（可能漏剔）；越细的 mip 精度越高，但采样次数越多。Nanite 的做法是先在粗 mip 快速排除大部分物体，仅对"不确定"的节点细化到更精细 mip。
+
+##### 1.3.4.2 CPU 实现 vs GPU 实现——本质差异
+
+| 维度 | CPU HZB（Godot 现有） | GPU HZB（Nanite 需要） |
+|------|----------------------|----------------------|
+| **数据存储** | `LocalVector<float>` 主存 | `RD::Texture` / UAV GPU 显存 |
+| **降采样** | CPU 逐像素循环 `update_mips()` | Compute Shader 并行降采样 |
+| **查询方式** | CPU 侧遍历 mip 层级 `_is_occluded()` | GPU Cull Shader 内直接纹理采样 |
+| **查询粒度** | 实例级（整个 Object 遮挡测试） | Cluster 级（每个 Cluster 独立遮挡测试） |
+| **与渲染管线关系** | 独立于 GPU 渲染，CPU 预处理 | 紧耦合于 GPU 渲染 Pass 之间 |
+| **延迟** | CPU→GPU 回读或 CPU 预算限制 | 全 GPU，零回读延迟 |
+| **吞吐量** | ~数百到数千实例/帧 | ~数十万 Cluster/帧 |
+| **构建时机** | CPU 软光栅深度 → 降采样 | GPU 硬件光栅深度 → Compute 降采样 |
+| **深度来源** | CPU 软件光栅化（仅部分物体） | GPU 硬件光栅化（全场景深度） |
+| **帧间延迟** | 单帧内可用（但精度受限于软光栅） | 需用上一帧 HZB 做第一遍剔除，本帧 HZB 做第二遍 |
+
+**核心矛盾**：CPU HZB 的查询发生在 CPU 侧，而 Nanite 的遮挡剔除发生在 GPU Compute Shader 中。GPU Cull Shader 无法访问 CPU 主存中的 `LocalVector<float>`，反过来 CPU 也无法以 Cluster 粒度逐个查询遮挡——数量太大（数十万级）。这决定了 Nanite **必须**使用 GPU HZB。
+
+##### 1.3.4.3 Godot 现有 HZB 实现（CPU 侧）
+
+Godot 的 HZB 实现位于 `RendererSceneOcclusionCull::HZBuffer`（源码：[renderer_scene_occlusion_cull.h](file:///workspace/servers/rendering/renderer_scene_occlusion_cull.h)、[renderer_scene_occlusion_cull.cpp](file:///workspace/servers/rendering/renderer_scene_occlusion_cull.cpp)）。
+
+**数据结构**：
+```cpp
+class HZBuffer {
+    LocalVector<float> data;       // 所有 mip 层级的深度数据，连续存储
+    LocalVector<float*> mips;      // 指向每级 mip 的起始位置
+    LocalVector<Size2i> sizes;     // 每级 mip 的尺寸
+    Size2i camera_cell_size;       // 相机分辨率
+    // ...
+};
+```
+
+**关键方法**：
+
+1. **`resize()`** — 计算 mip 级数并分配内存：
+   ```
+   mip_count = 0
+   w, h = screen_width, screen_height
+   while true:
+       w >>= 1; h >>= 1; mip_count++
+       if w == 1 && h == 1: break
+   ```
+   所有 mip 数据连续存储在 `data` 中，`mips[i]` 指向第 i 级起始。
+
+2. **`update_mips()`** — CPU 逐级降采样，取 MAX：
+   ```
+   for mip_level in 1..mip_count:
+       for y in 0..sizes[mip_level].height:
+           for x in 0..sizes[mip_level].width:
+               mip[mip_level][x,y] = max(
+                   mip[mip_level-1][2x,   2y  ],
+                   mip[mip_level-1][2x+1, 2y  ],
+                   mip[mip_level-1][2x,   2y+1],
+                   mip[mip_level-1][2x+1, 2y+1]
+               )
+   ```
+   这是三重循环的纯 CPU 降采样，对 1080p 屏幕约需处理 ~2M 像素的多级降采样。
+
+3. **`_is_occluded()`** — 遮挡查询核心：
+   - 将 AABB 的 8 个角投影到屏幕空间；
+   - 计算包围矩形和最近深度 `z_near`；
+   - 从最粗 mip 开始，向精细 mip 遍历；
+   - 在每个 mip 层级，比较 `z_near` 与 HZB 存储的 `z_far`；
+   - 若 `z_near > z_far` 则返回 `true`（被遮挡）；
+   - 带 jitter 抖动防止边缘闪烁。
+
+4. **`is_occluded()`** — 带保护的公开接口，添加 jitter 防止物体在遮挡边界闪烁。
+
+**使用位置**：
+- `RendererSceneCull::render_camera()` 中调用 `buffer->update()` 更新 HZB（[renderer_scene_cull.cpp:2781](file:///workspace/servers/rendering/renderer_scene_cull.cpp)）；
+- `OCCLUSION_CULLED` 宏在实例级剔除中使用 `HZBuffer::is_occluded()`（[renderer_scene_cull.cpp:2927](file:///workspace/servers/rendering/renderer_scene_cull.cpp)）。
+
+**关键限制**：
+- **纯 CPU 执行**：降采样和查询都在 CPU 上，无法被 GPU Shader 直接访问；
+- **深度来源受限**：CPU 软光栅化仅处理部分大型遮挡体，非全场景深度；
+- **实例级粒度**：每个 `OccluderInstance` 对应一个物体，无法做 Cluster 级剔除；
+- **性能天花板**：CPU 逐像素降采样在高分辨率下开销显著，且查询数量受限于 CPU 吞吐。
+
+##### 1.3.4.4 Godot 无 GPU 侧 HZB 的确认
+
+通过源码搜索确认 Godot 4.7.1 在 `servers/rendering/renderer_rd/` 目录下**没有** GPU 侧 depth pyramid / HZB 实现：
+- 搜索 `depth_pyramid|depth_mipmap|hzb` 结果为空；
+- SSAO 使用独立的 `linear_depth` 方案，不依赖 GPU HZB；
+- 所有深度相关后处理（SSAO、SSR、Glow）各自维护自己的深度降采样，未抽象为通用 GPU HZB。
+
+此外，`modules/raycast/raycast_occlusion_cull.h` 提供了另一种遮挡剔除方案（基于射线追踪），但同样非 GPU HZB，且主要用于特定硬件加速场景。
+
+##### 1.3.4.5 对 Nanite 实现的影响分析
+
+Godot 只有 CPU 侧 HZB，没有 GPU 侧 HZB，这对 Nanite 的实现有**重大但可控**的影响：
+
+**1. 必须自建 GPU HZB——不可绕过**
+
+Nanite 的 GPU Cull Pass 在 Compute Shader 中对每个 BVH 节点/Cluster 做遮挡查询，必须采样 GPU 纹理形式的 HZB。Godot 的 CPU `LocalVector<float>` 数据对 GPU Shader 不可见，因此 Nanite 必须自行构建 GPU HZB。这不是可选优化，而是架构性需求。
+
+**2. 构建时机明确——Visibility Buffer 光栅化之后**
+
+Nanite 渲染管线中 HZB 的构建时机天然确定：
+```
+Cull Pass (用上帧 HZB)
+    → Rasterize (输出 VisBuffer + Depth)
+    → HZB Build (Compute Shader 从 Depth Buffer 降采样)   ← 此处自建
+    → Second Cull Pass (用本帧 HZB)
+    → Material Eval
+```
+HZB 输入来源是 Nanite 自己光栅化的深度缓冲，不需要依赖引擎的深度缓冲。这使得自建 HZB 与引擎现有管线完全解耦。
+
+**3. 对三套桥接方案的影响差异**
+
+| 桥接方案 | 影响 | 需要的额外工作 |
+|---------|------|--------------|
+| GDExtension | 中等 | 在 CompositorEffect 的 `_render_callback` 中自行分配 RD Texture 做 depth mipmap；需通过 `RenderData` 获取深度纹理引用（如果可获取），或自行维护 Nanite 的深度缓冲 |
+| Module | 中等 | 同上，但可直接调用 `RenderingDevice` API，权限更大；深度缓冲获取更方便 |
+| Deep | 低 | 可直接复用/扩展引擎内部的深度缓冲和 RD 纹理，甚至可以在引擎层添加通用 GPU HZB 基础设施供所有系统使用 |
+
+**4. GPU HZB 实现本身并不复杂**
+
+一个基础的 GPU HZB 只需一个 Compute Shader：
+```glsl
+// hzb_downsample.comp — 一级降采样
+layout(set = 0, binding = 0) uniform sampler2D src_depth;
+layout(set = 0, binding = 1) uniform image2D  dst_mip;
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    vec4 depths = vec4(
+        texelFetch(src_depth, coord * 2 + ivec2(0,0), 0).r,
+        texelFetch(src_depth, coord * 2 + ivec2(1,0), 0).r,
+        texelFetch(src_depth, coord * 2 + ivec2(0,1), 0).r,
+        texelFetch(src_depth, coord * 2 + ivec2(1,1), 0).r
+    );
+    float max_depth = max(max(depths.x, depths.y), max(depths.z, depths.w));
+    imageStore(dst_mip, coord, vec4(max_depth));
+}
+```
+每个 mip 级别 dispatch 一次，级间加 barrier。整个实现约 50-100 行 shader + 30 行 C++ 调度代码。
+
+**5. 与 Godot 现有 CPU HZB 的共存**
+
+Nanite 自建 GPU HZB 后，Godot 的 CPU HZB 仍然正常工作于非 Nanite 物体的实例级剔除。两套 HZB 互不干扰：
+- CPU HZB：`RendererSceneCull` 在 `render_camera()` 中使用，剔除传统渲染路径的实例；
+- GPU HZB：Nanite Cull Shader 使用，剔除 Nanite Cluster。
+
+**6. 潜在优化——未来统一 HZB**
+
+在 Deep 桥接方案中，长期可考虑将 GPU HZB 提升为引擎通用基础设施：
+- 引擎在 opaque pass 后自动构建 GPU HZB；
+- Nanite 直接复用，无需自建；
+- SSAO/SSR 等后处理也可复用，减少重复降采样；
+- 但这属于深度改造，非初期必需。
+
+##### 1.3.4.6 小结
+
+Godot 只有 CPU 侧 HZB 而没有 GPU 侧 HZB，对 Nanite 实现的影响总结如下：
+
+1. **架构性需求**：Nanite 的 GPU-driven 渲染管线必须使用 GPU HZB，无法借用 Godot 现有 CPU HZB；
+2. **必须自建**：在 Visibility Buffer 光栅化之后、第二遍 Cull 之前，用 Compute Shader 自行构建 GPU HZB；
+3. **实现量可控**：GPU HZB 核心实现仅需一个降采样 Compute Shader + 少量 C++ 调度代码，工程量不大；
+4. **三桥接差异**：GDExtension/Module 需自行分配 RD Texture；Deep 可复用引擎内部纹理，长期可提升为通用基础设施；
+5. **不影响核心可行性**：GPU HZB 是 Nanite 管线的标准组件，UE5 Nanite 本身也是自建的，Godot 缺失 GPU HZB 不构成阻断性障碍，只是增加了一项自建工作。
+
 ---
 
 ## 2. 共同的核心数据结构与算法
