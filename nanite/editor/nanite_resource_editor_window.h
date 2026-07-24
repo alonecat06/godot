@@ -1,5 +1,5 @@
 /**************************************************************************/
-/*  nanite_editor_plugin.h                                                */
+/*  nanite_resource_editor_window.h                                       */
 /**************************************************************************/
 /*                         This file is part of:                          */
 /*                             GODOT ENGINE                               */
@@ -21,8 +21,7 @@
 /*                                                                        */
 /* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,        */
 /* EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF     */
-/* MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. */
-/* IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY   */
+/* MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY   */
 /* CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,   */
 /* TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE      */
 /* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
@@ -32,56 +31,33 @@
 
 #ifdef TOOLS_ENABLED
 
-#include "editor/inspector/editor_inspector.h"
-#include "editor/plugins/editor_plugin.h"
-#include "./nanite_mesh_editor.h"
+#include "scene/gui/dialogs.h"
 
-#include "scene/3d/mesh_instance_3d.h"
-#include "scene/resources/mesh.h"
+class NaniteMeshEditor;
+class NaniteMeshResource;
 
-#include "scene/gui/button.h"
-#include "scene/gui/box_container.h"
-
-class NaniteMeshResourceEditorWindow;
-
-class EditorInspectorPluginNanite : public EditorInspectorPlugin {
-	GDCLASS(EditorInspectorPluginNanite, EditorInspectorPlugin);
+// NaniteMeshResourceEditorWindow is a standalone popup window that hosts a
+// NaniteMeshEditor for interactive 3D preview of a NaniteMeshResource. It is
+// shown by NaniteEditorPlugin::edit() when the user double-clicks a
+// .nanite.tres file in the FileSystem dock. The window is reused across
+// edits (hide() on close, never queue_free()) so subsequent edits are cheap.
+class NaniteMeshResourceEditorWindow : public AcceptDialog {
+	GDCLASS(NaniteMeshResourceEditorWindow, AcceptDialog);
 
 private:
-	// Shared save dialog used by the Convert button for ArrayMesh /
-	// MeshInstance3D inputs (Task 0.12.4).
-	class EditorFileDialog *convert_save_dialog = nullptr;
-	// Stash the object being converted between button click and save confirm.
-	ObjectID pending_object_id;
-	Ref<class Resource> pending_resource;
+	NaniteMeshEditor *viewer = nullptr;
 
-	void _on_convert_pressed(Object *p_object);
-	void _on_convert_save_confirmed(const String &p_path);
+protected:
+	static void _bind_methods();
 
 public:
-	virtual bool can_handle(Object *p_object) override;
-	virtual void parse_begin(Object *p_object) override;
-};
+	// Load p_resource into the embedded viewer, update the window title,
+	// and popup centered. Safe to call repeatedly; the window instance is
+	// reused across calls.
+	void edit(const Ref<NaniteMeshResource> &p_resource);
 
-class NaniteEditorPlugin : public EditorPlugin {
-	GDCLASS(NaniteEditorPlugin, EditorPlugin);
-
-private:
-	// Standalone popup window hosting a NaniteMeshEditor for previewing
-	// NaniteMeshResource on double-click (Task 0.13). Lazily created on
-	// first edit() call, reused across subsequent edits.
-	NaniteMeshResourceEditorWindow *viewer_window = nullptr;
-
-public:
-	// Main editor plugin hooks: when the user double-clicks a
-	// .nanite.tres file in the FileSystem, Godot calls handles() to find
-	// the plugin that accepts the resource, then edit() to open it.
-	virtual bool handles(Object *p_object) const override;
-	virtual void edit(Object *p_object) override;
-	virtual void make_visible(bool p_visible) override;
-
-	NaniteEditorPlugin();
-	~NaniteEditorPlugin();
+	NaniteMeshResourceEditorWindow();
+	~NaniteMeshResourceEditorWindow();
 };
 
 #endif // TOOLS_ENABLED

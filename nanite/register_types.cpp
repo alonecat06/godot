@@ -39,6 +39,7 @@
 #include "editor/nanite_conversion_menu.h"
 #include "editor/nanite_editor_plugin.h"
 #include "editor/nanite_mesh_editor.h"
+#include "editor/nanite_resource_editor_window.h" // Task 0.13.4
 #include "editor/nanite_resource_preview_gen.h"
 #include "editor/plugins/editor_plugin.h"
 #endif // TOOLS_ENABLED
@@ -53,6 +54,7 @@ void initialize_nanite_module(ModuleInitializationLevel p_level) {
 #ifdef TOOLS_ENABLED
 	if (p_level == MODULE_INITIALIZATION_LEVEL_EDITOR) {
 		ClassDB::register_class<NaniteMeshEditor>();
+		ClassDB::register_class<NaniteMeshResourceEditorWindow>(); // Task 0.13.4
 		ClassDB::register_class<EditorInspectorPluginNanite>();
 		ClassDB::register_class<NaniteResourcePreviewGenerator>();
 		ClassDB::register_class<NaniteEditorPlugin>();

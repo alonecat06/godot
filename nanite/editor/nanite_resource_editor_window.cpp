@@ -1,5 +1,5 @@
 /**************************************************************************/
-/*  nanite_editor_plugin.h                                                */
+/*  nanite_resource_editor_window.cpp                                     */
 /**************************************************************************/
 /*                         This file is part of:                          */
 /*                             GODOT ENGINE                               */
@@ -21,67 +21,63 @@
 /*                                                                        */
 /* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,        */
 /* EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF     */
-/* MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. */
-/* IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY   */
+/* MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY   */
 /* CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,   */
 /* TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE      */
 /* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
 /**************************************************************************/
 
-#pragma once
-
 #ifdef TOOLS_ENABLED
 
-#include "editor/inspector/editor_inspector.h"
-#include "editor/plugins/editor_plugin.h"
-#include "./nanite_mesh_editor.h"
+#include "nanite_resource_editor_window.h"
 
-#include "scene/3d/mesh_instance_3d.h"
-#include "scene/resources/mesh.h"
+#include "nanite_mesh_editor.h"
+#include "../core/nanite_resource.h"
 
-#include "scene/gui/button.h"
-#include "scene/gui/box_container.h"
+#include "scene/gui/dialogs.h"
 
-class NaniteMeshResourceEditorWindow;
+void NaniteMeshResourceEditorWindow::_bind_methods() {
+}
 
-class EditorInspectorPluginNanite : public EditorInspectorPlugin {
-	GDCLASS(EditorInspectorPluginNanite, EditorInspectorPlugin);
+void NaniteMeshResourceEditorWindow::edit(const Ref<NaniteMeshResource> &p_resource) {
+	if (p_resource.is_null()) {
+		return;
+	}
 
-private:
-	// Shared save dialog used by the Convert button for ArrayMesh /
-	// MeshInstance3D inputs (Task 0.12.4).
-	class EditorFileDialog *convert_save_dialog = nullptr;
-	// Stash the object being converted between button click and save confirm.
-	ObjectID pending_object_id;
-	Ref<class Resource> pending_resource;
+	// Window title: prefer the resource path's file name; fall back to a
+	// generic label for in-memory resources (no path assigned yet).
+	String window_title = "Nanite Mesh Viewer";
+	const String res_path = p_resource->get_path();
+	if (!res_path.is_empty()) {
+		window_title += " - " + res_path.get_file();
+	}
+	set_title(window_title);
 
-	void _on_convert_pressed(Object *p_object);
-	void _on_convert_save_confirmed(const String &p_path);
+	// Delegate 3D preview + stats rendering to the embedded viewer.
+	viewer->edit(p_resource);
 
-public:
-	virtual bool can_handle(Object *p_object) override;
-	virtual void parse_begin(Object *p_object) override;
-};
+	// Popup centered, clamped to viewport, with a sane default size. The
+	// window is reused across edits (hide_on_ok is true by default, so the
+	// OK button hides rather than destroying the window).
+	popup_centered_clamped(Size2(800, 600));
+}
 
-class NaniteEditorPlugin : public EditorPlugin {
-	GDCLASS(NaniteEditorPlugin, EditorPlugin);
+NaniteMeshResourceEditorWindow::NaniteMeshResourceEditorWindow() {
+	set_title("Nanite Mesh Viewer");
+	set_ok_button_text("Close");
+	set_size(Size2(800, 600));
+	// Hide (don't free) on OK so the window can be reused by the next edit().
+	set_hide_on_ok(true);
 
-private:
-	// Standalone popup window hosting a NaniteMeshEditor for previewing
-	// NaniteMeshResource on double-click (Task 0.13). Lazily created on
-	// first edit() call, reused across subsequent edits.
-	NaniteMeshResourceEditorWindow *viewer_window = nullptr;
+	viewer = memnew(NaniteMeshEditor);
+	add_child(viewer);
+	// Fill the entire dialog content area above the OK button row.
+	viewer->set_anchors_and_offsets_preset(Control::PRESET_FULL_RECT);
+	// Give the viewer room to render a meaningful 3D preview.
+	viewer->set_custom_minimum_size(Size2(750, 500));
+}
 
-public:
-	// Main editor plugin hooks: when the user double-clicks a
-	// .nanite.tres file in the FileSystem, Godot calls handles() to find
-	// the plugin that accepts the resource, then edit() to open it.
-	virtual bool handles(Object *p_object) const override;
-	virtual void edit(Object *p_object) override;
-	virtual void make_visible(bool p_visible) override;
-
-	NaniteEditorPlugin();
-	~NaniteEditorPlugin();
-};
+NaniteMeshResourceEditorWindow::~NaniteMeshResourceEditorWindow() {
+}
 
 #endif // TOOLS_ENABLED

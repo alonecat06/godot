@@ -35,6 +35,7 @@
 #include "../core/nanite_builder.h"
 #include "../core/nanite_resource.h"
 #include "nanite_conversion_menu.h"
+#include "nanite_resource_editor_window.h"
 #include "nanite_resource_preview_gen.h"
 
 #include "core/object/class_db.h"
@@ -50,25 +51,16 @@
 #include <chrono>
 
 bool EditorInspectorPluginNanite::can_handle(Object *p_object) {
-	// Task 0.12.4 — extend can_handle() to also cover ArrayMesh resources
-	// and MeshInstance3D nodes so the Convert button appears for them.
-	return Object::cast_to<NaniteMeshResource>(p_object) != nullptr ||
-			Object::cast_to<ArrayMesh>(p_object) != nullptr ||
+	// Task 0.13.3 — NaniteMeshResource is now handled by the standalone
+	// NaniteMeshResourceEditorWindow (via NaniteEditorPlugin::handles()).
+	// Inspector only handles the Convert button for mesh sources.
+	return Object::cast_to<ArrayMesh>(p_object) != nullptr ||
 			Object::cast_to<MeshInstance3D>(p_object) != nullptr;
 }
 
 void EditorInspectorPluginNanite::parse_begin(Object *p_object) {
-	// Path 1: NaniteMeshResource — show the existing preview editor.
-	if (NaniteMeshResource *res = Object::cast_to<NaniteMeshResource>(p_object)) {
-		Ref<NaniteMeshResource> resource(res);
-		NaniteMeshEditor *editor = memnew(NaniteMeshEditor);
-		editor->edit(resource);
-		add_custom_control(editor);
-		return;
-	}
-
-	// Path 2: ArrayMesh / MeshInstance3D — show a Convert to Nanite button.
-	// (Task 0.12.4)
+	// ArrayMesh / MeshInstance3D — show a Convert to Nanite button.
+	// (Task 0.12.4; NaniteMeshResource preview moved to standalone window in Task 0.13.)
 	bool is_array_mesh = (Object::cast_to<ArrayMesh>(p_object) != nullptr);
 	bool is_mesh_instance = (Object::cast_to<MeshInstance3D>(p_object) != nullptr);
 	if (!is_array_mesh && !is_mesh_instance) {
@@ -187,11 +179,11 @@ void EditorInspectorPluginNanite::_on_convert_save_confirmed(const String &p_pat
 	EditorLog *log = EditorNode::get_log();
 	if (log) {
 		log->add_message(
-				vformat("[Nanite] Inspector conversion OK\n  clusters: %d  nodes: %d  pages: %d  time: %lld ms\n  saved: %s",
+				vformat("[Nanite] Inspector conversion OK\n  clusters: %d  nodes: %d  pages: %d  time: %d ms\n  saved: %s",
 						nanite_res->get_cluster_count(),
 						nanite_res->get_node_count(),
 						nanite_res->get_page_count(),
-						elapsed_ms,
+						(int)elapsed_ms,
 						p_path),
 				EditorLog::MSG_TYPE_STD);
 	}
@@ -217,6 +209,50 @@ NaniteEditorPlugin::NaniteEditorPlugin() {
 	Ref<NaniteConversionContextMenu> menu;
 	menu.instantiate();
 	add_context_menu_plugin(EditorContextMenuPlugin::CONTEXT_SLOT_FILESYSTEM, menu);
+
+	// Task 0.13.2 — the standalone viewer window is lazily created on the
+	// first edit() call (see edit()). Reused across subsequent edits.
+}
+
+NaniteEditorPlugin::~NaniteEditorPlugin() {
+	// The viewer window is a child of the editor base control (added via
+	// add_child in edit()); Godot frees it when the editor shuts down, so
+	// we do not manually memfree here. Reset the pointer for safety.
+	viewer_window = nullptr;
+}
+
+// Task 0.13.2 — main editor plugin hooks. When the user double-clicks a
+// .nanite.tres file in the FileSystem dock, EditorNode calls handles() to
+// find a plugin that accepts the resource, then edit() to open it.
+bool NaniteEditorPlugin::handles(Object *p_object) const {
+	return Object::cast_to<NaniteMeshResource>(p_object) != nullptr;
+}
+
+void NaniteEditorPlugin::edit(Object *p_object) {
+	NaniteMeshResource *res = Object::cast_to<NaniteMeshResource>(p_object);
+	if (!res) {
+		return;
+	}
+	Ref<NaniteMeshResource> resource(res);
+
+	// Lazily create and parent the viewer window on first use. Creating it
+	// in the constructor would fail because the editor base control is not
+	// fully set up during plugin registration.
+	if (!viewer_window) {
+		viewer_window = memnew(NaniteMeshResourceEditorWindow);
+		EditorInterface::get_singleton()->get_base_control()->add_child(viewer_window);
+	}
+
+	viewer_window->edit(resource);
+}
+
+void NaniteEditorPlugin::make_visible(bool p_visible) {
+	// When the editor switches away from this plugin (p_visible == false),
+	// hide the popup window if it is currently shown. We do NOT show it on
+	// p_visible == true — the window only appears in response to edit().
+	if (!p_visible && viewer_window && viewer_window->is_visible()) {
+		viewer_window->hide();
+	}
 }
 
 #endif // TOOLS_ENABLED

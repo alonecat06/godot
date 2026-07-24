@@ -63,7 +63,7 @@ private:
 	// save confirmation).
 	Ref<class Resource> pending_resource;
 
-	void _on_convert_callback();
+	void _on_convert_callback(const Variant &p_arg);
 	void _on_save_confirmed(const String &p_path);
 
 protected:

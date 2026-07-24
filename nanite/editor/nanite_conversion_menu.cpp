@@ -72,7 +72,8 @@ void NaniteConversionContextMenu::get_options(const Vector<String> &p_paths) {
 			Ref<Texture2D>());
 }
 
-void NaniteConversionContextMenu::_on_convert_callback() {
+void NaniteConversionContextMenu::_on_convert_callback(const Variant &p_arg) {
+	(void)p_arg; // Godot's EditorContextMenuPluginManager::invoke_callback passes a Variant arg; unused here.
 	if (pending_path.is_empty()) {
 		return;
 	}
@@ -172,12 +173,12 @@ void NaniteConversionContextMenu::_on_save_confirmed(const String &p_path) {
 	EditorLog *log = EditorNode::get_log();
 	if (log) {
 		log->add_message(
-				vformat("[Nanite] Conversion OK: %s\n  clusters: %d  nodes: %d  pages: %d  time: %lld ms\n  saved: %s",
+				vformat("[Nanite] Conversion OK: %s\n  clusters: %d  nodes: %d  pages: %d  time: %d ms\n  saved: %s",
 						pending_path,
 						nanite_res->get_cluster_count(),
 						nanite_res->get_node_count(),
 						nanite_res->get_page_count(),
-						elapsed_ms,
+						(int)elapsed_ms,
 						p_path),
 				EditorLog::MSG_TYPE_STD);
 	}

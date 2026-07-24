@@ -75,11 +75,29 @@ func _test_handles_returns_true() -> void:
 	_assert(ClassDB.is_parent_class("NaniteResourcePreviewGenerator", "EditorResourcePreviewGenerator"),
 			"NaniteResourcePreviewGenerator inherits EditorResourcePreviewGenerator")
 
+# Task 0.13.5 — standalone viewer window registration. When the user
+# double-clicks a .nanite.tres file, NaniteEditorPlugin::handles() returns
+# true and edit() pops up NaniteMeshResourceEditorWindow. Verify the window
+# class is registered and inherits from AcceptDialog (direct) and
+# ConfirmationDialog -> AcceptDialog (indirect chain is the other direction;
+# here we check AcceptDialog -> Window -> Viewport inheritance).
+func _test_viewer_window_registered() -> void:
+	print("\n=== test_viewer_window_registered ===")
+	_assert(ClassDB.class_exists("NaniteMeshResourceEditorWindow"),
+			"NaniteMeshResourceEditorWindow is registered to ClassDB")
+	_assert(ClassDB.is_parent_class("NaniteMeshResourceEditorWindow", "AcceptDialog"),
+			"NaniteMeshResourceEditorWindow inherits AcceptDialog")
+	_assert(ClassDB.is_parent_class("NaniteMeshResourceEditorWindow", "Window"),
+			"NaniteMeshResourceEditorWindow (transitively) inherits Window")
+	_assert(ClassDB.is_parent_class("NaniteMeshResourceEditorWindow", "Viewport"),
+			"NaniteMeshResourceEditorWindow (transitively) inherits Viewport")
+
 func _init():
 	print("=== Nanite Stage 0 Editor Integration Tests ===")
 	_test_can_handle_nanite_resource()
 	_test_edit_does_not_crash()
 	_test_handles_returns_true()
+	_test_viewer_window_registered()
 	if _failures.is_empty():
 		print("\n=== ALL EDITOR TESTS PASSED ===")
 	else:
