@@ -666,7 +666,147 @@ func test_build_large_mesh():
 - [ ] `NaniteMeshEditor` 在 Inspector 中可预览
 - [ ] 所有单元测试通过
 
+### 0.12 资源转换接口与编辑器对接
+
+**任务 0.12.1**：实现 `NaniteBuilder::build_from_resource(Ref<Resource>)` 静态方法
+
+```cpp
+// nanite/core/nanite_builder.h
+class NaniteBuilder : public RefCounted {
+    GDCLASS(NaniteBuilder, RefCounted);
+    // ...
+    static Ref<NaniteMeshResource> build_from_resource(Ref<Resource> p_resource);
+};
+
+// nanite/core/nanite_builder.cpp
+Ref<NaniteMeshResource> NaniteBuilder::build_from_resource(Ref<Resource> p_resource) {
+    // 1) 识别 ArrayMesh / PackedScene / MeshInstance3D
+    // 2) 合并所有 surface 到单个 ArrayMesh (按顶点偏移调整 index)
+    // 3) 调用 build() 返回 NaniteMeshResource
+}
+```
+
+`_bind_methods` 中用 `ClassDB::bind_static_method` 暴露：
+```cpp
+ClassDB::bind_static_method("NaniteBuilder", D_METHOD("build_from_resource", "resource"),
+                            &NaniteBuilder::build_from_resource);
+```
+
+**任务 0.12.2**：编写 `build_from_resource` 单元测试
+
+```cpp
+// test_nanite_builder_from_resource.h
+TEST_CASE("[NaniteBuilder] build_from_resource single surface ArrayMesh") {
+    Ref<ArrayMesh> cube = NaniteTestHelpers::create_cube_mesh();
+    Ref<NaniteMeshResource> res = NaniteBuilder::build_from_resource(cube);
+    REQUIRE(res.is_valid());
+    CHECK(res->cluster_count > 0);
+}
+
+TEST_CASE("[NaniteBuilder] build_from_resource multi surface merges vertices") {
+    // 构造两个 surface 的 ArrayMesh，验证合并后 vertex 数 = s0 + s1
+}
+
+TEST_CASE("[NaniteBuilder] build_from_resource accepts PackedScene") {
+    // 构造含 MeshInstance3D 子节点的 PackedScene，验证转换成功
+}
+
+TEST_CASE("[NaniteBuilder] build_from_resource rejects empty mesh") {
+    Ref<ArrayMesh> empty = memnew(ArrayMesh);
+    Ref<NaniteMeshResource> res = NaniteBuilder::build_from_resource(empty);
+    CHECK(res.is_null());
+}
+```
+
+**任务 0.12.3**：实现 `nanite/editor/nanite_conversion_menu.h` / `.cpp`
+
+```cpp
+// nanite/editor/nanite_conversion_menu.h
+#ifdef TOOLS_ENABLED
+class NaniteConversionContextMenu : public EditorContextMenuPlugin {
+    GDCLASS(NaniteConversionContextMenu, EditorContextMenuPlugin);
+
+protected:
+    virtual void _popup_menu(const Vector<String> &p_paths) override;
+    virtual void _execute_option(int p_idx) override;
+
+public:
+    virtual String _get_name() const override { return "NaniteConversion"; }
+    virtual String _get_label() const override { return "Convert to Nanite..."; }
+    virtual bool _is_available(const Vector<String> &p_paths) const override;
+};
+#endif
+```
+
+扩展名过滤：`.gltf` / `.glb` / `.fbx` / `.obj` / `.tres` (ArrayMesh 或 PackedScene)。
+
+在 `NaniteEditorPlugin` 构造函数中注册：
+```cpp
+NaniteEditorPlugin::NaniteEditorPlugin() {
+    // ... existing inspector plugin ...
+    add_context_menu_plugin(memnew(NaniteConversionContextMenu));
+}
+```
+
+**任务 0.12.4**：扩展 `EditorInspectorPluginNanite::parse_begin()`
+
+```cpp
+// 修改 can_handle()：扩展识别 ArrayMesh / MeshInstance3D
+bool EditorInspectorPluginNanite::can_handle(Object *p_object) {
+    return Object::cast_to<NaniteMeshResource>(p_object) != nullptr
+        || Object::cast_to<ArrayMesh>(p_object) != nullptr
+        || Object::cast_to<MeshInstance3D>(p_object) != nullptr;
+}
+
+// parse_begin() 对 ArrayMesh / MeshInstance3D 显示 Convert 按钮
+void EditorInspectorPluginNanite::parse_begin(Object *p_object) {
+    // ... 现有 NaniteMeshResource 分支保持不变 ...
+
+    if (Object::cast_to<ArrayMesh>(p_object) || Object::cast_to<MeshInstance3D>(p_object)) {
+        VBoxContainer *vb = memnew(VBoxContainer);
+        Button *btn = memnew(Button);
+        btn->set_text("Convert to Nanite...");
+        btn->connect("pressed", callable_mp(this, &EditorInspectorPluginNanite::_on_convert_pressed)
+                         .bind(p_object));
+        vb->add_child(btn);
+        add_custom_control(vb);
+    }
+}
+```
+
+**任务 0.12.5**：构建进度反馈
+
+```cpp
+// 使用 EditorProgress 显示构建进度
+Ref<EditorProgress> ep;
+ep.instantiate("nanite_convert", "Converting to Nanite...", 1);
+// ... build ...
+ep->step("Building clusters...", 0);
+// 完成后释放，EditorLog 输出统计
+```
+
+**任务 0.12.6**：端到端测试 `test_nanite_conversion.gd`
+
+```gdscript
+extends SceneTree
+
+func _test_build_from_resource_array_mesh() -> void:
+    var am := ArrayMesh.new()
+    var arrays := []
+    arrays.resize(Mesh.ARRAY_MAX)
+    arrays[Mesh.ARRAY_VERTEX] = PackedVector3Array([Vector3(0,0,0), Vector3(1,0,0), Vector3(0,1,0)])
+    arrays[Mesh.ARRAY_INDEX] = PackedInt32Array([0, 1, 2])
+    am.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+    var res := NaniteBuilder.build_from_resource(am)
+    assert(res != null, "build_from_resource should return non-null for ArrayMesh")
+
+func _test_classdb_registration() -> void:
+    assert(ClassDB.class_exists("NaniteConversionContextMenu"))
+    assert(ClassDB.is_parent_class("NaniteConversionContextMenu", "EditorContextMenuPlugin"))
+```
+
 ---
+
 
 ## 阶段 1：GDExtension 桥接
 
