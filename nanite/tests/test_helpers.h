@@ -35,6 +35,12 @@
 #include "core/variant/array.h"
 #include "core/variant/variant.h" // PackedInt32Array, PackedVector3Array typedefs
 #include "scene/resources/mesh.h"
+#include "servers/rendering/rendering_device.h"
+
+#include "../core/nanite_builder.h"
+#include "../core/nanite_resource.h"
+
+#include <cstring>
 
 // Test mesh generators for the NaniteBuilder unit tests. All functions
 // return a fully-formed ArrayMesh with a single PRIMITIVE_TRIANGLES surface
@@ -199,6 +205,89 @@ inline Ref<ArrayMesh> create_large_test_mesh(int p_target_tris) {
 	mesh.instantiate();
 	mesh->add_surface_from_arrays(Mesh::PRIMITIVE_TRIANGLES, arrays);
 	return mesh;
+}
+
+// Creates an R32_SFLOAT 2D texture of size p_width × p_height and fills
+// every texel with p_fill_value. Intended for HZB / culling tests that
+// need a constant-valued depth source. Returns an empty RID when p_rd is
+// null or texture creation fails.
+inline RID create_constant_depth_texture(RenderingDevice *p_rd, int p_width, int p_height, float p_fill_value) {
+	if (p_rd == nullptr) {
+		return RID();
+	}
+
+	RD::TextureFormat tf;
+	tf.format = RD::DATA_FORMAT_R32_SFLOAT;
+	tf.width = p_width;
+	tf.height = p_height;
+	tf.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_CAN_UPDATE_BIT | RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT;
+
+	RID tex = p_rd->texture_create(tf, RD::TextureView());
+	if (!tex.is_valid()) {
+		return RID();
+	}
+
+	const int pixel_count = p_width * p_height;
+	PackedByteArray data;
+	data.resize(pixel_count * sizeof(float));
+	float *dst = reinterpret_cast<float *>(data.ptrw());
+	for (int i = 0; i < pixel_count; ++i) {
+		memcpy(dst + i, &p_fill_value, sizeof(float));
+	}
+
+	p_rd->texture_update(tex, 0, data);
+	return tex;
+}
+
+// Specialized 4×4 R32_SFLOAT depth texture builder: fills the texture from
+// the 16 floats in p_data (row-major). Handy for HZB tests that need to
+// construct specific 2×2 region patterns to verify downsampling behavior.
+// Returns an empty RID when p_rd is null or texture creation fails.
+inline RID create_depth_texture_4x4(RenderingDevice *p_rd, const float p_data[16]) {
+	if (p_rd == nullptr) {
+		return RID();
+	}
+
+	RD::TextureFormat tf;
+	tf.format = RD::DATA_FORMAT_R32_SFLOAT;
+	tf.width = 4;
+	tf.height = 4;
+	tf.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_CAN_UPDATE_BIT | RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT;
+
+	RID tex = p_rd->texture_create(tf, RD::TextureView());
+	if (!tex.is_valid()) {
+		return RID();
+	}
+
+	PackedByteArray data;
+	data.resize(16 * sizeof(float));
+	memcpy(data.ptrw(), p_data, 16 * sizeof(float));
+
+	p_rd->texture_update(tex, 0, data);
+	return tex;
+}
+
+// Builds a NaniteMeshResource from a UV-sphere mesh (segments = p_segments,
+// clamped to a minimum of 4). Runs the full NaniteBuilder Stage-0 pipeline.
+// Returns a null Ref if the build fails — does not throw.
+inline Ref<NaniteMeshResource> build_test_resource_sphere(int p_segments = 32) {
+	if (p_segments < 4) {
+		p_segments = 4;
+	}
+
+	Ref<ArrayMesh> mesh = create_sphere_mesh(p_segments);
+	if (mesh.is_null()) {
+		return Ref<NaniteMeshResource>();
+	}
+
+	Ref<NaniteBuilder> builder;
+	builder.instantiate();
+	Ref<NaniteMeshResource> resource = builder->build(mesh);
+
+	if (resource.is_null()) {
+		return Ref<NaniteMeshResource>();
+	}
+	return resource;
 }
 
 } // namespace NaniteTestHelpers
