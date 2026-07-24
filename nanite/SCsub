@@ -1,0 +1,48 @@
+#!/usr/bin/env python
+from misc.utility.scons_hints import *
+
+Import("env")
+
+env_nanite = env.Clone()
+
+# Allow nanite code to use engine internals like modules do.
+env_nanite.Append(CPPDEFINES=["GODOT_MODULE"])
+
+# meshoptimizer C API (vertex remap, meshlets, simplification, encoding).
+env_nanite.Append(CPPPATH=["#thirdparty/meshoptimizer"])
+
+# Self-include path so `#include "core/..."` resolves from nanite/.
+env_nanite.Append(CPPPATH=["#nanite"])
+
+nanite_sources = []
+
+# register_types.cpp lives at the nanite/ top level (not under core/), so it
+# must be added explicitly — the modules/SCsub loop expects
+# initialize_nanite_module / uninitialize_nanite_module symbols to live in
+# libnanite (since nanite is registered as a pseudo-module in SConstruct).
+env_nanite.add_source_files(nanite_sources, "*.cpp")
+env_nanite.add_source_files(nanite_sources, "core/*.cpp")
+
+if env.editor_build:
+    env_nanite.add_source_files(nanite_sources, "editor/*.cpp")
+
+# Additional meshoptimizer sources not compiled by modules/meshoptimizer/SCsub.
+# Godot's meshoptimizer module only exposes SurfaceTool-friendly helpers;
+# meshlet utility APIs (meshopt_computeMeshletBounds, meshopt_optimizeMeshletLevel,
+# meshopt_encodeMeshlet, meshopt_decodeMeshlet, etc.) live in meshletutils.cpp
+# and meshletcodec.cpp, both of which Godot omits. Compile them directly into
+# libnanite with warnings disabled.
+nanite_thirdparty_sources = [
+    "#thirdparty/meshoptimizer/meshletutils.cpp",
+    "#thirdparty/meshoptimizer/meshletcodec.cpp",
+]
+env_nanite_thirdparty = env_nanite.Clone()
+env_nanite_thirdparty.disable_warnings()
+nanite_thirdparty_obj = []
+env_nanite_thirdparty.add_source_files(nanite_thirdparty_obj, nanite_thirdparty_sources)
+nanite_sources += nanite_thirdparty_obj
+
+lib = env_nanite.add_library("nanite", nanite_sources)
+env.Prepend(LIBS=[lib])
+
+Export("env_nanite")
