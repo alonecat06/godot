@@ -232,16 +232,21 @@ Nanite 的 GPU 渲染管线（阶段 1+）必须依赖一份预先构建好的**
 
 ---
 
-### Requirement: 编辑器预览与调试可视化
+### Requirement: 编辑器预览组件与 Inspector 集成
 
-系统 SHALL 提供 `NaniteMeshEditor`（继承 `SubViewportContainer`）、`EditorInspectorPluginNanite`、`NaniteEditorPlugin`、`NaniteResourcePreviewGenerator`，使 `NaniteMeshResource` 在 Inspector 中可旋转预览、显示构建统计、切换调试模式。
+系统 SHALL 提供 `NaniteMeshEditor`（继承 `SubViewportContainer`，3D 旋转预览 + 构建统计 + 调试模式切换）、`EditorInspectorPluginNanite`、`NaniteEditorPlugin`、`NaniteResourcePreviewGenerator`。
 
-#### Scenario: InspectorPlugin 识别资源
-- **WHEN** 在 Inspector 中选中 `NaniteMeshResource`
+> **Stage 0 修订**：原设计在 Inspector 中嵌入 `NaniteMeshEditor` 预览 `NaniteMeshResource`。现修订为：
+> - `NaniteMeshResource` 的可视化预览移至独立窗口（见 "独立资源编辑器窗口" 章节）
+> - `EditorInspectorPluginNanite` 仅对 `ArrayMesh` 资源 / `MeshInstance3D` 节点提供 "Convert to Nanite" 按钮（Task 0.12.4）
+> - `NaniteMeshEditor` 作为可复用的 3D 预览控件，被独立窗口内嵌使用
+
+#### Scenario: InspectorPlugin Convert 按钮
+- **WHEN** 在 Inspector 中选中 `ArrayMesh` 资源或 `MeshInstance3D` 节点
 - **THEN** `EditorInspectorPluginNanite::can_handle()` 返回 `true`
-- **AND** Inspector 顶部出现 `NaniteMeshEditor` 预览面板
+- **AND** Inspector 顶部出现 "Convert to Nanite" 按钮
 
-#### Scenario: 预览面板渲染不崩溃
+#### Scenario: NaniteMeshEditor 渲染不崩溃
 - **WHEN** 调用 `NaniteMeshEditor::edit(res)`（res 为有效资源）
 - **THEN** 不崩溃
 - **AND** `stats_label` 显示 `cluster_count` / `node_count` / `page_count` / shadow mesh 三角形数 / 估算内存
@@ -252,8 +257,43 @@ Nanite 的 GPU 渲染管线（阶段 1+）必须依赖一份预先构建好的**
 - **AND** `generate()` 使用 `shadow_mesh` 渲染缩略图（不启动 Nanite GPUPipeline）
 
 #### Scenario: 焦点隔离
-- **WHEN** `NaniteMeshEditor` 失去焦点
-- **THEN** 全局 `NaniteServer::set_debug_mode(NONE)` 被调用，避免影响场景渲染
+- **WHEN** `NaniteMeshEditor` 失去焦点（窗口关闭或切换）
+- **THEN** 全局 `NaniteServer::set_debug_mode(NONE)` 被调用，避免影响场景渲染（Stage 0 为 no-op，Stage 1 实现）
+
+---
+
+### Requirement: 独立资源编辑器窗口
+
+系统 SHALL 提供 `NaniteMeshResourceEditorWindow`（继承 `AcceptDialog`），并扩展 `NaniteEditorPlugin` 实现 `handles()` / `edit()` / `make_visible()`，使得双击 FileSystem 中的 `.nanite.tres` 文件时弹出独立窗口，内嵌 `NaniteMeshEditor` 显示 3D 预览 + 构建统计。
+
+#### Scenario: 双击资源弹出窗口
+- **WHEN** 用户双击 FileSystem 中的 `.nanite.tres` 文件（或 `EditorNode::edit_resource(NaniteMeshResource)` 被调用）
+- **THEN** `NaniteEditorPlugin::handles(Object*)` 对 `NaniteMeshResource` 返回 `true`
+- **AND** `NaniteEditorPlugin::edit(Object*)` 被调用
+- **AND** 弹出 `NaniteMeshResourceEditorWindow`，内嵌 `NaniteMeshEditor`
+- **AND** 调用 `NaniteMeshEditor::edit(res)` 设置预览资源
+
+#### Scenario: 窗口内 3D 预览
+- **WHEN** 窗口弹出后
+- **THEN** `NaniteMeshEditor` 渲染 `shadow_mesh`
+- **AND** `stats_label` 显示 `cluster_count` / `node_count` / `page_count` / shadow mesh 三角形数 / 估算内存
+- **AND** 鼠标左键拖拽可旋转预览
+
+#### Scenario: 窗口标题与尺寸
+- **WHEN** 窗口创建
+- **THEN** 标题为 "Nanite Mesh Viewer - <资源名>"
+- **AND** 默认尺寸 800×600（可调整）
+- **AND** 内嵌 `NaniteMeshEditor` 占据主区域（底部为按钮栏，复用 `NaniteMeshEditor` 现有 HBoxContainer）
+
+#### Scenario: 窗口关闭复用
+- **WHEN** 用户关闭窗口
+- **THEN** 窗口隐藏（`hide()`），不销毁
+- **AND** 下次 `edit()` 复用同一窗口实例，更新标题与 `NaniteMeshEditor::edit()`
+
+#### Scenario: make_visible 隔离
+- **WHEN** `NaniteEditorPlugin::make_visible(bool)` 被调用（切换主编辑器 plugin 时）
+- **THEN** 当 `p_visible = false` 时，若窗口存在则隐藏
+- **AND** 当 `p_visible = true` 时，不主动显示窗口（窗口仅由 `edit()` 触发弹出）
 
 ---
 

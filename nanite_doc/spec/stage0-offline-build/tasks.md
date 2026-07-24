@@ -254,6 +254,42 @@
 
 ---
 
+## 0.13 独立资源编辑器窗口
+
+> 解决"双击 `.nanite.tres` 仅在 Inspector 显示属性"的体验缺口。实现 `NaniteMeshResourceEditorWindow`（独立 `AcceptDialog`）+ 扩展 `NaniteEditorPlugin` 的 `handles()`/`edit()`/`make_visible()`，让双击资源弹出独立窗口预览 3D 模型 + 构建统计。原 Inspector 嵌入预览移除，`EditorInspectorPluginNanite` 仅保留 `ArrayMesh` / `MeshInstance3D` 的 Convert 按钮处理。
+
+- [ ] **Task 0.13.1**：实现 `nanite/editor/nanite_resource_editor_window.h` / `.cpp`
+  - 继承 `AcceptDialog`，`GDCLASS(NaniteMeshResourceEditorWindow, AcceptDialog)`
+  - 成员：`NaniteMeshEditor *viewer`（内嵌 3D 预览控件，复用现有实现）
+  - `edit(Ref<NaniteMeshResource>)`：设置窗口标题 `"Nanite Mesh Viewer - <资源名>"`，调 `viewer->edit(res)`，`popup_centered_clamped(Size2(800, 600))`
+  - 构造函数：创建 `NaniteMeshEditor` 作为内容子节点，连接 `confirmed` 信号到 `hide()`（关闭不销毁）
+  - 所有 `.cpp` 用 `#ifdef TOOLS_ENABLED` 包裹
+
+- [ ] **Task 0.13.2**：扩展 `NaniteEditorPlugin` 实现 main editor plugin 行为
+  - 添加成员 `NaniteMeshResourceEditorWindow *viewer_window = nullptr`
+  - 重写 `handles(Object *p_object) const`：对 `NaniteMeshResource` 返回 `true`
+  - 重写 `edit(Object *p_object)`：`cast_to<NaniteMeshResource>`，若窗口不存在则 `memnew`，调 `viewer_window->edit(res)`
+  - 重写 `make_visible(bool p_visible)`：当 `p_visible = false` 且窗口存在时 `hide()`
+  - 构造函数中创建窗口实例（不立即显示）
+
+- [ ] **Task 0.13.3**：修订 `EditorInspectorPluginNanite` 移除 NaniteMeshResource 预览
+  - `can_handle()`：移除对 `NaniteMeshResource` 的判断，仅保留 `ArrayMesh` / `MeshInstance3D`
+  - `parse_begin()`：移除对 `NaniteMeshResource` 创建 `NaniteMeshEditor` 的逻辑（保留 `ArrayMesh` / `MeshInstance3D` 的 Convert 按钮）
+  - 验证：双击 `.nanite.tres` 不再在 Inspector 嵌入预览，改为触发 `NaniteEditorPlugin::edit()` 弹窗
+
+- [ ] **Task 0.13.4**：在 `register_types.cpp` 注册新类
+  - `ClassDB::register_class<NaniteMeshResourceEditorWindow>()`（`TOOLS_ENABLED` 守卫）
+  - 验证：`ClassDB.class_exists("NaniteMeshResourceEditorWindow")` 返回 true
+
+- [ ] **Task 0.13.5**：扩展 `test_nanite_editor.gd` 测试
+  - 新增断言：`ClassDB.class_exists("NaniteMeshResourceEditorWindow")` 返回 true
+  - 新增断言：`ClassDB.is_parent_class("NaniteMeshResourceEditorWindow", "AcceptDialog")` 返回 true
+  - 新增断言：`ClassDB.is_parent_class("NaniteMeshResourceEditorWindow", "Window")` 返回 true（间接继承链 AcceptDialog → Window）
+  - 新增断言：`ClassDB.is_parent_class("NaniteMeshResourceEditorWindow", "Viewport")` 返回 true（间接继承链 Window → Viewport）
+  - 验证：所有断言 PASS
+
+---
+
 ## Task Dependencies
 
 - Task 0.1.* → 所有后续任务（编译脚手架先行）
@@ -269,8 +305,12 @@
 - Task 0.12.1 → Task 0.12.2 / 0.12.3 / 0.12.4（接口先行，UI 入口和测试随后）
 - Task 0.12.3 + 0.12.4 → Task 0.12.5（进度反馈在两个 UI 入口完成后统一加）
 - Task 0.12.* → Task 0.12.6（端到端测试最后跑）
+- Task 0.9.* → Task 0.13.*（独立窗口复用 NaniteMeshEditor 控件）
+- Task 0.13.1 → Task 0.13.2（窗口类先行，plugin 扩展随后）
+- Task 0.13.2 + 0.13.3 → Task 0.13.5（窗口 + Inspector 修订完成后跑测试）
 
 **可并行任务**：
 - Task 0.2.* 与 Task 0.3.* 可并行
 - Task 0.6.* 与 Task 0.7.* 可并行（均依赖 0.5.*）
 - Task 0.12.3 与 Task 0.12.4 可并行（右键菜单和 Inspector 按钮独立实现）
+- Task 0.13.3 与 Task 0.13.1/0.13.2 可并行（Inspector 修订与窗口实现独立）

@@ -91,16 +91,34 @@
 - [x] `meshopt_encodeMeshlet` → `meshopt_decodeMeshlet` 顶点位置 `is_equal_approx` 匹配
 - [x] `.nanite` 文件以 `"NANM"` magic + `version=1` 开头
 
-## 编辑器预览
+## 编辑器预览组件
 
-- [x] 选中 `NaniteMeshResource` 时 `EditorInspectorPluginNanite::can_handle()` 返回 true
-- [x] Inspector 顶部出现 `NaniteMeshEditor` 面板
+> **Stage 0 修订**：原 "Inspector 嵌入 NaniteMeshResource 预览" 已移至独立窗口（见下节）。本节仅保留组件本身验证与缩略图生成。
+
 - [x] `NaniteMeshEditor::edit(res)` 不崩溃 **[CANNOT_VERIFY]** 代码逻辑对 null/valid resource 均有处理（`nanite_mesh_editor.cpp:102-159`），但需手动启动编辑器验证
 - [x] `stats_label` 显示 cluster/node/page 数 + shadow tris + 估算 MB
 - [x] 鼠标拖拽可旋转预览 **[CANNOT_VERIFY]** `gui_input` 处理鼠标事件 + `_update_rotation` 修改 `rotation_node` Transform3D（`nanite_mesh_editor.cpp:74-100`），但需手动 UI 验证
 - [x] 失去焦点时 `NaniteServer::set_debug_mode(NONE)` 被调用（阶段 0 可空实现） **[PARTIAL]** `nanite_mesh_editor.cpp:63-67` `NOTIFICATION_FOCUS_EXIT` 为空体 + TODO 注释。`NaniteServer` 类未实现（属于阶段 1）。符合 spec "阶段 0 可空实现"语义，但需阶段 1 补齐
 - [x] FileSystem 中 `NaniteMeshResource` 缩略图由 `shadow_mesh` 生成
 - [x] 缩略图生成不启动 Nanite GPUPipeline
+
+## 独立资源编辑器窗口 (Task 0.13)
+
+- [ ] `NaniteMeshResourceEditorWindow` 类声明在 `nanite/editor/nanite_resource_editor_window.h`，继承 `AcceptDialog`，`GDCLASS` 注册
+- [ ] `NaniteMeshResourceEditorWindow::edit(Ref<NaniteMeshResource>)` 实现窗口标题设置 + `viewer->edit(res)` + `popup_centered_clamped(Size2(800, 600))`
+- [ ] `NaniteMeshResourceEditorWindow` 构造函数创建 `NaniteMeshEditor` 作为子节点
+- [ ] 窗口关闭时 `hide()` 不销毁，下次 `edit()` 复用
+- [ ] `NaniteEditorPlugin::handles(Object*)` 对 `NaniteMeshResource` 返回 `true`
+- [ ] `NaniteEditorPlugin::edit(Object*)` 弹出 `NaniteMeshResourceEditorWindow` 并调 `edit(res)`
+- [ ] `NaniteEditorPlugin::make_visible(false)` 隐藏窗口（若存在）
+- [ ] `EditorInspectorPluginNanite::can_handle()` 移除对 `NaniteMeshResource` 的判断，仅保留 `ArrayMesh` / `MeshInstance3D`
+- [ ] `EditorInspectorPluginNanite::parse_begin()` 移除对 `NaniteMeshResource` 创建 `NaniteMeshEditor` 的逻辑
+- [ ] 双击 `.nanite.tres` 不再在 Inspector 嵌入预览，改为弹出独立窗口 **[CANNOT_VERIFY]** 需手动启动编辑器双击验证
+- [ ] `register_types.cpp` 中 `ClassDB::register_class<NaniteMeshResourceEditorWindow>()`（`TOOLS_ENABLED` 守卫）
+- [ ] `test_nanite_editor.gd` 新增断言：`ClassDB.class_exists("NaniteMeshResourceEditorWindow")` 返回 true
+- [ ] `test_nanite_editor.gd` 新增断言：`ClassDB.is_parent_class("NaniteMeshResourceEditorWindow", "AcceptDialog")` 返回 true
+- [ ] `test_nanite_editor.gd` 新增断言：`ClassDB.is_parent_class("NaniteMeshResourceEditorWindow", "Window")` 返回 true（间接继承链 AcceptDialog → Window）
+- [ ] `test_nanite_editor.gd` 新增断言：`ClassDB.is_parent_class("NaniteMeshResourceEditorWindow", "Viewport")` 返回 true（间接继承链 Window → Viewport）
 
 ## 端到端
 
