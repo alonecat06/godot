@@ -468,6 +468,16 @@ for path in module_search_paths:
     # Note: custom modules can override built-in ones.
     modules_detected.update(modules)
 
+# Nanite lives at the repo top level (peer of `modules/`, `servers/`) but
+# participates in the module registration system so its
+# `initialize_nanite_module` / `uninitialize_nanite_module` are picked up by
+# the generated `register_module_types.gen.cpp`. Its SCsub is invoked by the
+# `modules/SCsub` loop like any other module, but its sources stay under
+# `nanite/` rather than `modules/nanite/`. Use an absolute path so that the
+# `modules/SCsub` loop (whose cwd is `modules/`) can locate the SCsub and
+# test headers via the same code path as custom modules.
+modules_detected["nanite"] = Dir("nanite").abspath
+
 # Add module options.
 for name, path in modules_detected.items():
     sys.path.insert(0, path)
@@ -1235,6 +1245,12 @@ SConscript("drivers/SCsub")
 
 SConscript("platform/SCsub")
 SConscript("modules/SCsub")
+
+# Nanite build bridge option (read here for downstream consumers; actual SCsub
+# invocation happens inside `modules/SCsub` since nanite is registered as a
+# pseudo-module in `modules_detected` above).
+env["nanite_bridge"] = ARGUMENTS.get("nanite_bridge", "gdext")
+
 if env["tests"]:
     SConscript("tests/SCsub")
 SConscript("main/SCsub")
