@@ -1726,7 +1726,7 @@ void NaniteMeshEditor::_notification(int p_what) {
 }
 ```
 
-### 9.7 构建后即时预览
+### 9.7 构建后即时预览与资源转换入口
 
 构建完成后不需要经过磁盘，直接用内存中的 `NaniteMeshResource`：
 
@@ -1742,6 +1742,48 @@ void NaniteImporter::_on_build_completed(Ref<NaniteMeshResource> p_resource) {
         NaniteDebugMode::CLUSTER_SOLID_COLOR);
 }
 ```
+
+#### 9.7.1 资源转换入口设计（Stage 0 任务组 0.12）
+
+阶段 0 离线构建模块需要解决"用户如何把 .gltf / .glb / .fbx / .obj 等 Godot 可导入的 mesh 资源转换为 NaniteMeshResource"的产品入口问题。设计原则：**手动触发优于自动导入**，避免每次重新导入都重跑构建（大模型 >100K tri 构建耗时 >100ms 会卡 UI）。
+
+**接口层**：`NaniteBuilder::build_from_resource(Ref<Resource>)` 静态方法
+
+```cpp
+// nanite/core/nanite_builder.h
+class NaniteBuilder : public RefCounted {
+    GDCLASS(NaniteBuilder, RefCounted);
+public:
+    static Ref<NaniteMeshResource> build_from_resource(Ref<Resource> p_resource);
+};
+```
+
+`build_from_resource` 内部实现：
+1. 识别输入类型：`ArrayMesh` / `PackedScene` (gltf/glb/fbx 导入产物) / `MeshInstance3D` 节点
+2. 合并所有 surface 的 `ARRAY_VERTEX` + `ARRAY_INDEX` 到单个 vertex/index 池（按顶点偏移调整 index）
+3. 调用现有 `build(Ref<ArrayMesh>)` 走完整的 leaf→hierarchy→bvh→shadow→finalize 管线
+4. 返回 `NaniteMeshResource`
+
+**编辑器入口层**（两个并行 UI 入口）：
+
+| 入口 | 触发方式 | 实现类 |
+|------|---------|--------|
+| FileSystem 右键菜单 | 选中 .gltf/.glb/.fbx/.obj/.tres mesh 资源右键 → "Convert to Nanite..." | `NaniteConversionContextMenu : EditorContextMenuPlugin` |
+| Inspector 按钮 | 选中 `ArrayMesh` 资源或 `MeshInstance3D` 节点 → Inspector 顶部 "Convert to Nanite..." 按钮 | 扩展 `EditorInspectorPluginNanite::parse_begin()` |
+
+两个入口共享同一个构建+保存流程：
+```
+用户点击 → 弹 EditorFileDialog (save, *.nanite.tres) → 调 build_from_resource() →
+显示 EditorProgress (大模型时) → ResourceSaver::save() → EditorLog 输出统计
+```
+
+**不接入自动导入的原因**：
+- Godot 的 `EditorImportPlugin` / `EditorScenePostImport` 在每次重新导入时都跑构建
+- 大模型构建 100K tri 耗时约 190ms (见 perf benchmark)，频繁重导入会卡 UI
+- 自动导入还会导致 .gltf 文件每改一次都生成新 .nanite.tres，污染版本控制
+- 手动触发让用户明确控制何时构建，与 Unreal Engine 的 Nanite "Build" 按钮模式一致
+
+**NaniteImporter 类的关系**：原设计中 `NaniteImporter` (见类图 `nanite-overall-design.md:458-462`) 在阶段 0 不实现 EditorImportPlugin 形式，而是通过 `NaniteConversionContextMenu` + `EditorInspectorPluginNanite` 的 Convert 按钮提供手动触发的等价能力。原 `NaniteImporter` 接口 `import(source_file, save_path, options)` 的语义由 `_execute_option()` 间接实现。
 
 ### 9.8 资源预览缩略图
 
