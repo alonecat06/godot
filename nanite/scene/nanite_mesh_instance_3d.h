@@ -1,5 +1,5 @@
 /**************************************************************************/
-/*  nanite_mesh_editor.h                                                  */
+/*  nanite_mesh_instance_3d.h                                             */
 /**************************************************************************/
 /*                         This file is part of:                          */
 /*                             GODOT ENGINE                               */
@@ -30,66 +30,50 @@
 
 #pragma once
 
-#ifdef TOOLS_ENABLED
+#include "scene/3d/mesh_instance_3d.h"
+#include "core/nanite_resource.h"
 
-#include "editor/plugins/editor_plugin.h"
-#include "scene/gui/option_button.h"
-#include "scene/gui/label.h"
-#include "scene/gui/button.h"
-#include "scene/gui/subviewport_container.h"
-#include "scene/3d/camera_3d.h"
-#include "scene/3d/light_3d.h"
-#include "../scene/nanite_mesh_instance_3d.h"
-#include "scene/3d/node_3d.h"
-#include "scene/main/viewport.h"
-#include "scene/resources/mesh.h"
+class NaniteServer;
 
-class NaniteMeshResource;
-
-// NaniteMeshEditor is an Inspector-embedded 3D preview widget for
-// NaniteMeshResource. It mirrors the structure of MeshEditor (editor/plugins/
-// mesh_editor_plugin.cpp): a SubViewportContainer hosting a SubViewport with a
-// rotation pivot Node3D, Camera3D, two DirectionalLights, and a MeshInstance3D
-// for the shadow mesh. A stats Label overlays cluster/node/page counts +
-// shadow triangle count + estimated memory.
-//
-// All file I/O and GPU pipeline work belongs to later stages; this widget
-// only renders the (already-built) shadow_mesh via a standard MeshInstance3D.
-class NaniteMeshEditor : public SubViewportContainer {
-	GDCLASS(NaniteMeshEditor, SubViewportContainer);
+// NaniteMeshInstance3D is the user-facing scene node for placing Nanite
+// geometry in a 3D scene. It inherits MeshInstance3D so that the engine's
+// mesh RID management, frustum culling, shadow casting, and material
+// system all work out of the box — the shadow_mesh from NaniteMeshResource
+// is assigned to the base mesh, and Nanite's GPU pipeline (when enabled)
+// replaces the main render with visibility-buffer rasterization.
+class NaniteMeshInstance3D : public MeshInstance3D {
+	GDCLASS(NaniteMeshInstance3D, MeshInstance3D);
 
 private:
-	SubViewport *viewport = nullptr;
-	Node3D *rotation_node = nullptr;
-	Camera3D *camera = nullptr;
-	DirectionalLight3D *light1 = nullptr;
-	DirectionalLight3D *light2 = nullptr;
-	NaniteMeshInstance3D *mesh_instance = nullptr;
-	OptionButton *debug_mode_btn = nullptr;
-	Button *wireframe_btn = nullptr;
-	Button *bounds_btn = nullptr;
-	Label *stats_label = nullptr;
-
-	Ref<NaniteMeshResource> current_resource;
-
-	bool dragging = false;
-	float rot_x = 0.0f;
-	float rot_y = 0.0f;
-
-	void _update_rotation();
-	void _on_debug_mode_changed(int p_index);
+	Ref<NaniteMeshResource> nanite_mesh;
+	RID nanite_mesh_rid; // RID returned by NaniteServer::register_mesh
+	bool nanite_enabled = true;
+	int forced_lod = -1; // -1 = automatic LOD selection
+	float relative_screen_size = 0.0f;
 
 protected:
 	static void _bind_methods();
 	void _notification(int p_what);
 
 public:
-	NaniteMeshEditor();
-	~NaniteMeshEditor();
+	// Resource binding.
+	void set_nanite_mesh(const Ref<NaniteMeshResource> &p_mesh);
+	Ref<NaniteMeshResource> get_nanite_mesh() const;
 
-	void edit(const Ref<NaniteMeshResource> &p_resource);
+	// Enable/disable Nanite GPU pipeline for this instance.
+	void set_nanite_enabled(bool p_enabled);
+	bool get_nanite_enabled() const;
 
-	virtual void gui_input(const Ref<InputEvent> &p_event) override;
+	// LOD control.
+	void set_forced_lod(int p_lod);
+	int get_forced_lod() const;
+
+	void set_relative_screen_size(float p_size);
+	float get_relative_screen_size() const;
+
+	// Accessor used by NaniteServer during render callbacks.
+	RID get_nanite_mesh_rid() const { return nanite_mesh_rid; }
+
+	NaniteMeshInstance3D();
+	~NaniteMeshInstance3D();
 };
-
-#endif // TOOLS_ENABLED

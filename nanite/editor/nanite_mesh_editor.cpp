@@ -33,8 +33,11 @@
 #include "nanite_mesh_editor.h"
 
 #include "../core/nanite_resource.h"
+#include "../core/nanite_server.h"
+#include "../scene/nanite_mesh_instance_3d.h"
 
 #include "core/math/math_funcs.h"
+#include "core/object/callable_method_pointer.h"
 #include "core/object/class_db.h"
 #include "core/variant/variant.h"
 #include "editor/editor_node.h"
@@ -56,18 +59,34 @@ void NaniteMeshEditor::_update_rotation() {
 void NaniteMeshEditor::_notification(int p_what) {
 	switch (p_what) {
 		case NOTIFICATION_FOCUS_ENTER: {
-			// Stage 0: NaniteServer does not exist yet; this would normally
-			// call NaniteServer::get_singleton()->set_debug_mode(current).
-			// Leave as a no-op until Stage 1 introduces NaniteServer.
+			// Apply the current OptionButton selection to the NaniteServer
+			// when the preview viewport gains focus.
+			if (debug_mode_btn) {
+				int mode = debug_mode_btn->get_selected();
+				// Remap OptionButton index -> NaniteDebug::DebugMode.
+				// Index 0 = NONE; indices 1..6 map to CLUSTER_SOLID_COLOR..HZB_OCCLUSION
+				// (we skip the legacy "Wireframe" / "Bounds" toggle entries; those are
+				//  handled by wireframe_btn / bounds_btn).
+				if (NaniteServer::get_singleton() != nullptr) {
+					NaniteServer::get_singleton()->set_debug_mode(mode);
+				}
+			}
 		} break;
 		case NOTIFICATION_FOCUS_EXIT: {
-			// Stage 0: NaniteServer does not exist yet; this would normally
-			// call NaniteServer::get_singleton()->set_debug_mode(NONE) to
-			// guarantee focus isolation. Leave as a no-op for now.
+			// Restore NONE so debug mode doesn't leak to the main editor viewport.
+			if (NaniteServer::get_singleton() != nullptr) {
+				NaniteServer::get_singleton()->set_debug_mode(0); // NONE
+			}
 		} break;
 		default: {
 			// No-op for other notifications.
 		} break;
+	}
+}
+
+void NaniteMeshEditor::_on_debug_mode_changed(int p_index) {
+	if (NaniteServer::get_singleton() != nullptr) {
+		NaniteServer::get_singleton()->set_debug_mode(p_index);
 	}
 }
 
@@ -103,13 +122,13 @@ void NaniteMeshEditor::edit(const Ref<NaniteMeshResource> &p_resource) {
 	current_resource = p_resource;
 
 	if (current_resource.is_null()) {
-		mesh_instance->set_mesh(Ref<Mesh>());
+		mesh_instance->set_nanite_mesh(Ref<NaniteMeshResource>());
 		stats_label->set_text("");
 		return;
 	}
 
 	Ref<ArrayMesh> shadow_mesh = current_resource->get_shadow_mesh();
-	mesh_instance->set_mesh(shadow_mesh);
+	mesh_instance->set_nanite_mesh(current_resource);
 
 	// Auto-fit camera distance based on shadow mesh AABB (if present).
 	if (shadow_mesh.is_valid()) {
@@ -185,7 +204,7 @@ NaniteMeshEditor::NaniteMeshEditor() {
 	rotation_node = memnew(Node3D);
 	viewport->add_child(rotation_node);
 
-	mesh_instance = memnew(MeshInstance3D);
+	mesh_instance = memnew(NaniteMeshInstance3D);
 	rotation_node->add_child(mesh_instance);
 
 	set_custom_minimum_size(Size2(0, 150) * EDSCALE);
@@ -197,13 +216,19 @@ NaniteMeshEditor::NaniteMeshEditor() {
 	hb->set_anchors_and_offsets_preset(Control::PRESET_BOTTOM_WIDE, Control::PRESET_MODE_MINSIZE, 2);
 
 	debug_mode_btn = memnew(OptionButton);
-	debug_mode_btn->add_item("None");
-	debug_mode_btn->add_item("Wireframe");
-	debug_mode_btn->add_item("Bounds");
-	debug_mode_btn->add_item("Clusters");
+	debug_mode_btn->add_item("None");                  // 0 = NONE
+	debug_mode_btn->add_item("Cluster Solid Color");   // 1 = CLUSTER_SOLID_COLOR
+	debug_mode_btn->add_item("LOD Solid Color");       // 2 = LOD_SOLID_COLOR
+	debug_mode_btn->add_item("Overdraw Heatmap");      // 3 = OVERDRAW_HEATMAP
+	debug_mode_btn->add_item("Page Residency");        // 4 = PAGE_RESIDENCY
+	debug_mode_btn->add_item("HZB Mip Levels");        // 5 = HZB_MIP_LEVELS
+	debug_mode_btn->add_item("HZB Occlusion");         // 6 = HZB_OCCLUSION
 	debug_mode_btn->select(0);
-	debug_mode_btn->set_custom_minimum_size(Size2(120, 0) * EDSCALE);
+	debug_mode_btn->set_custom_minimum_size(Size2(150, 0) * EDSCALE);
 	hb->add_child(debug_mode_btn);
+
+	// Connect item_selected to forward debug mode changes to NaniteServer.
+	debug_mode_btn->connect("item_selected", callable_mp(this, &NaniteMeshEditor::_on_debug_mode_changed));
 
 	wireframe_btn = memnew(Button);
 	wireframe_btn->set_text("Wireframe");

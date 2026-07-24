@@ -468,6 +468,9 @@ for path in module_search_paths:
     # Note: custom modules can override built-in ones.
     modules_detected.update(modules)
 
+# Nanite bridge compile-time switch (read early so nanite/SCsub can use it).
+env["nanite_bridge"] = ARGUMENTS.get("nanite_bridge", "gdext")
+
 # Nanite lives at the repo top level (peer of `modules/`, `servers/`) but
 # participates in the module registration system so its
 # `initialize_nanite_module` / `uninitialize_nanite_module` are picked up by
@@ -1245,11 +1248,6 @@ SConscript("drivers/SCsub")
 
 SConscript("platform/SCsub")
 SConscript("modules/SCsub")
-
-# Nanite build bridge option (read here for downstream consumers; actual SCsub
-# invocation happens inside `modules/SCsub` since nanite is registered as a
-# pseudo-module in `modules_detected` above).
-env["nanite_bridge"] = ARGUMENTS.get("nanite_bridge", "gdext")
 
 if env["tests"]:
     SConscript("tests/SCsub")

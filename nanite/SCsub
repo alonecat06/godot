@@ -14,7 +14,21 @@ env_nanite.Append(CPPPATH=["#thirdparty/meshoptimizer"])
 # Self-include path so `#include "core/..."` resolves from nanite/.
 env_nanite.Append(CPPPATH=["#nanite"])
 
+# Stage 1 bridge compile switch: define NANITE_BRIDGE_GDEXT when gdext or all.
+nanite_bridge = env["nanite_bridge"]
+if nanite_bridge in ("gdext", "all"):
+    env_nanite.Append(CPPDEFINES=["NANITE_BRIDGE_GDEXT"])
+
 nanite_sources = []
+
+# Embed GLSL compute shaders as raw C string headers (parsed at runtime via
+# RDShaderFile::parse_versions_from_text). Generates
+# shaders/<name>.glsl.gen.h defining `<name>_shader_glsl`.
+env_nanite.GLSL_HEADER("shaders/nanite_hzb_downsample.glsl")
+env_nanite.GLSL_HEADER("shaders/nanite_cull.glsl")
+env_nanite.GLSL_HEADER("shaders/nanite_rasterize.glsl")
+env_nanite.GLSL_HEADER("shaders/nanite_material_resolve.glsl")
+env_nanite.Depends(Glob("shaders/*.glsl.gen.h"), ["#glsl_builders.py"])
 
 # register_types.cpp lives at the nanite/ top level (not under core/), so it
 # must be added explicitly — the modules/SCsub loop expects
@@ -22,6 +36,9 @@ nanite_sources = []
 # libnanite (since nanite is registered as a pseudo-module in SConstruct).
 env_nanite.add_source_files(nanite_sources, "*.cpp")
 env_nanite.add_source_files(nanite_sources, "core/*.cpp")
+env_nanite.add_source_files(nanite_sources, "gpu/*.cpp")
+env_nanite.add_source_files(nanite_sources, "scene/*.cpp")
+env_nanite.add_source_files(nanite_sources, "bridge/*.cpp")
 
 if env.editor_build:
     env_nanite.add_source_files(nanite_sources, "editor/*.cpp")

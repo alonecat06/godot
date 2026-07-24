@@ -1,5 +1,5 @@
 /**************************************************************************/
-/*  nanite_mesh_editor.h                                                  */
+/*  nanite_bridge.h                                                       */
 /**************************************************************************/
 /*                         This file is part of:                          */
 /*                             GODOT ENGINE                               */
@@ -30,66 +30,49 @@
 
 #pragma once
 
-#ifdef TOOLS_ENABLED
-
-#include "editor/plugins/editor_plugin.h"
-#include "scene/gui/option_button.h"
-#include "scene/gui/label.h"
-#include "scene/gui/button.h"
-#include "scene/gui/subviewport_container.h"
-#include "scene/3d/camera_3d.h"
-#include "scene/3d/light_3d.h"
-#include "../scene/nanite_mesh_instance_3d.h"
-#include "scene/3d/node_3d.h"
-#include "scene/main/viewport.h"
-#include "scene/resources/mesh.h"
-
-class NaniteMeshResource;
-
-// NaniteMeshEditor is an Inspector-embedded 3D preview widget for
-// NaniteMeshResource. It mirrors the structure of MeshEditor (editor/plugins/
-// mesh_editor_plugin.cpp): a SubViewportContainer hosting a SubViewport with a
-// rotation pivot Node3D, Camera3D, two DirectionalLights, and a MeshInstance3D
-// for the shadow mesh. A stats Label overlays cluster/node/page counts +
-// shadow triangle count + estimated memory.
+// INaniteBridge is the abstract interface implemented by each Stage's
+// bridge (Stage 1: NaniteGDExtBridge, Stage 2: NaniteModuleBridge,
+// Stage 3: NaniteDeepBridge). It lets NaniteServer invoke rendering
+// callbacks without depending on the concrete bridge type.
 //
-// All file I/O and GPU pipeline work belongs to later stages; this widget
-// only renders the (already-built) shadow_mesh via a standard MeshInstance3D.
-class NaniteMeshEditor : public SubViewportContainer {
-	GDCLASS(NaniteMeshEditor, SubViewportContainer);
+// This header MUST stay free of heavy engine includes so it can be
+// included from nanite_server.h without pulling in CompositorEffect etc.
+// Use forward declarations for RenderData / NaniteServer / RID.
 
-private:
-	SubViewport *viewport = nullptr;
-	Node3D *rotation_node = nullptr;
-	Camera3D *camera = nullptr;
-	DirectionalLight3D *light1 = nullptr;
-	DirectionalLight3D *light2 = nullptr;
-	NaniteMeshInstance3D *mesh_instance = nullptr;
-	OptionButton *debug_mode_btn = nullptr;
-	Button *wireframe_btn = nullptr;
-	Button *bounds_btn = nullptr;
-	Label *stats_label = nullptr;
+#include "core/string/string_name.h"
+#include "core/templates/rid.h"
 
-	Ref<NaniteMeshResource> current_resource;
+class NaniteServer;
+class RenderData;
+struct RID;
 
-	bool dragging = false;
-	float rot_x = 0.0f;
-	float rot_y = 0.0f;
-
-	void _update_rotation();
-	void _on_debug_mode_changed(int p_index);
-
-protected:
-	static void _bind_methods();
-	void _notification(int p_what);
-
+// INaniteBridge — abstract bridge interface.
+// Not a Godot Object subclass (no GDCLASS) — it is owned by NaniteServer
+// via a raw pointer and destroyed in finish().
+class INaniteBridge {
 public:
-	NaniteMeshEditor();
-	~NaniteMeshEditor();
+	enum ShadowMode {
+		SHADOW_COARSE_LOD, // Stage 1: use shadow_mesh via mesh_set_shadow_mesh
+		SHADOW_DYNAMIC_GPU, // Stage 2/3: per-light GPU shadow rasterization
+	};
 
-	void edit(const Ref<NaniteMeshResource> &p_resource);
+	virtual ~INaniteBridge() = default;
 
-	virtual void gui_input(const Ref<InputEvent> &p_event) override;
+	// Called once after construction to install the bridge onto the server.
+	// Implementations should set the shadow mode and register any callbacks.
+	virtual void install(NaniteServer *p_server) = 0;
+
+	// Returns the shadow strategy this bridge provides.
+	virtual ShadowMode get_shadow_mode() const = 0;
+
+	// Render callbacks invoked by the bridge's own hook (e.g.
+	// CompositorEffect::_render_callback for Stage 1). NaniteServer
+	// delegates the heavy lifting; the bridge only decides WHEN.
+	virtual void on_pre_render(const RenderData *p_render_data) = 0;
+	virtual void on_pre_opaque_pass(const RenderData *p_render_data) = 0;
+	virtual void on_post_opaque_pass(const RenderData *p_render_data) = 0;
+	virtual void on_shadow_pass(const RenderData *p_render_data, const RID &p_light, int p_pass) = 0;
+
+	// Human-readable bridge identifier (e.g. "gdext" / "module" / "deep").
+	virtual StringName get_bridge_name() const = 0;
 };
-
-#endif // TOOLS_ENABLED

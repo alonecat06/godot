@@ -1,5 +1,5 @@
 /**************************************************************************/
-/*  nanite_mesh_editor.h                                                  */
+/*  nanite_page_cache.h                                                   */
 /**************************************************************************/
 /*                         This file is part of:                          */
 /*                             GODOT ENGINE                               */
@@ -30,66 +30,31 @@
 
 #pragma once
 
-#ifdef TOOLS_ENABLED
+#include "core/object/object.h"
 
-#include "editor/plugins/editor_plugin.h"
-#include "scene/gui/option_button.h"
-#include "scene/gui/label.h"
-#include "scene/gui/button.h"
-#include "scene/gui/subviewport_container.h"
-#include "scene/3d/camera_3d.h"
-#include "scene/3d/light_3d.h"
-#include "../scene/nanite_mesh_instance_3d.h"
-#include "scene/3d/node_3d.h"
-#include "scene/main/viewport.h"
-#include "scene/resources/mesh.h"
-
-class NaniteMeshResource;
-
-// NaniteMeshEditor is an Inspector-embedded 3D preview widget for
-// NaniteMeshResource. It mirrors the structure of MeshEditor (editor/plugins/
-// mesh_editor_plugin.cpp): a SubViewportContainer hosting a SubViewport with a
-// rotation pivot Node3D, Camera3D, two DirectionalLights, and a MeshInstance3D
-// for the shadow mesh. A stats Label overlays cluster/node/page counts +
-// shadow triangle count + estimated memory.
+// NanitePageCache owns the streaming page residency state for the
+// runtime. In Stage 1 there is no streaming — every NaniteMeshResource
+// is uploaded up-front and all of its pages are permanently resident,
+// so request_page() always succeeds and evict_lru() is a no-op.
 //
-// All file I/O and GPU pipeline work belongs to later stages; this widget
-// only renders the (already-built) shadow_mesh via a standard MeshInstance3D.
-class NaniteMeshEditor : public SubViewportContainer {
-	GDCLASS(NaniteMeshEditor, SubViewportContainer);
-
-private:
-	SubViewport *viewport = nullptr;
-	Node3D *rotation_node = nullptr;
-	Camera3D *camera = nullptr;
-	DirectionalLight3D *light1 = nullptr;
-	DirectionalLight3D *light2 = nullptr;
-	NaniteMeshInstance3D *mesh_instance = nullptr;
-	OptionButton *debug_mode_btn = nullptr;
-	Button *wireframe_btn = nullptr;
-	Button *bounds_btn = nullptr;
-	Label *stats_label = nullptr;
-
-	Ref<NaniteMeshResource> current_resource;
-
-	bool dragging = false;
-	float rot_x = 0.0f;
-	float rot_y = 0.0f;
-
-	void _update_rotation();
-	void _on_debug_mode_changed(int p_index);
+// TODO Stage 2+: implement a real LRU-based page cache backed by a
+// GPU buffer ring with async upload fences and per-page ref counts.
+class NanitePageCache : public Object {
+	GDCLASS(NanitePageCache, Object);
 
 protected:
 	static void _bind_methods();
-	void _notification(int p_what);
 
 public:
-	NaniteMeshEditor();
-	~NaniteMeshEditor();
+	// Stage 1: always returns true (all pages resident).
+	bool request_page(uint64_t p_page_id);
 
-	void edit(const Ref<NaniteMeshResource> &p_resource);
+	// Stage 1: no-op (no eviction).
+	void evict_lru();
 
-	virtual void gui_input(const Ref<InputEvent> &p_event) override;
+	// Stage 1: returns sentinel value (no real tracking).
+	int get_resident_count() const;
+
+	NanitePageCache() = default;
+	~NanitePageCache() = default;
 };
-
-#endif // TOOLS_ENABLED

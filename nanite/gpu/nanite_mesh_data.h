@@ -1,5 +1,5 @@
 /**************************************************************************/
-/*  nanite_mesh_editor.h                                                  */
+/*  nanite_mesh_data.h                                                    */
 /**************************************************************************/
 /*                         This file is part of:                          */
 /*                             GODOT ENGINE                               */
@@ -30,66 +30,46 @@
 
 #pragma once
 
-#ifdef TOOLS_ENABLED
+#include "core/templates/rid.h"
+#include "core/templates/local_vector.h"
 
-#include "editor/plugins/editor_plugin.h"
-#include "scene/gui/option_button.h"
-#include "scene/gui/label.h"
-#include "scene/gui/button.h"
-#include "scene/gui/subviewport_container.h"
-#include "scene/3d/camera_3d.h"
-#include "scene/3d/light_3d.h"
-#include "../scene/nanite_mesh_instance_3d.h"
-#include "scene/3d/node_3d.h"
-#include "scene/main/viewport.h"
-#include "scene/resources/mesh.h"
-
+class RenderingDevice;
 class NaniteMeshResource;
 
-// NaniteMeshEditor is an Inspector-embedded 3D preview widget for
-// NaniteMeshResource. It mirrors the structure of MeshEditor (editor/plugins/
-// mesh_editor_plugin.cpp): a SubViewportContainer hosting a SubViewport with a
-// rotation pivot Node3D, Camera3D, two DirectionalLights, and a MeshInstance3D
-// for the shadow mesh. A stats Label overlays cluster/node/page counts +
-// shadow triangle count + estimated memory.
+// NaniteMeshData owns the GPU SSBOs that mirror a NaniteMeshResource's
+// encoded blobs. Created by NaniteServer::register_mesh on first reference
+// and released when the ref count drops to zero.
 //
-// All file I/O and GPU pipeline work belongs to later stages; this widget
-// only renders the (already-built) shadow_mesh via a standard MeshInstance3D.
-class NaniteMeshEditor : public SubViewportContainer {
-	GDCLASS(NaniteMeshEditor, SubViewportContainer);
-
-private:
-	SubViewport *viewport = nullptr;
-	Node3D *rotation_node = nullptr;
-	Camera3D *camera = nullptr;
-	DirectionalLight3D *light1 = nullptr;
-	DirectionalLight3D *light2 = nullptr;
-	NaniteMeshInstance3D *mesh_instance = nullptr;
-	OptionButton *debug_mode_btn = nullptr;
-	Button *wireframe_btn = nullptr;
-	Button *bounds_btn = nullptr;
-	Label *stats_label = nullptr;
-
-	Ref<NaniteMeshResource> current_resource;
-
-	bool dragging = false;
-	float rot_x = 0.0f;
-	float rot_y = 0.0f;
-
-	void _update_rotation();
-	void _on_debug_mode_changed(int p_index);
-
-protected:
-	static void _bind_methods();
-	void _notification(int p_what);
-
+// Stage 1: all four blobs are uploaded as static storage buffers (no
+// streaming). The material_rids array mirrors the resource's materials so
+// the material-resolve shader can indirect-address them.
+class NaniteMeshData {
+	// Pure C++ class — no GDCLASS, no Object base.
 public:
-	NaniteMeshEditor();
-	~NaniteMeshEditor();
+	RID cluster_ssbo;
+	RID vertex_ssbo;
+	RID bvh_ssbo;
+	RID page_ssbo;
 
-	void edit(const Ref<NaniteMeshResource> &p_resource);
+	LocalVector<RID> material_rids;
 
-	virtual void gui_input(const Ref<InputEvent> &p_event) override;
+	int ref_count = 0;
+	bool gpu_uploaded = false;
+
+	// Uploads all 4 blobs + collects material RIDs.
+	// No-op if already uploaded.
+	void upload_to_gpu(RenderingDevice *p_rd, const NaniteMeshResource *p_resource);
+
+	// Frees all SSBOs. No-op if not uploaded.
+	void free_gpu_resources(RenderingDevice *p_rd);
+
+	// Getters for pipeline binding.
+	RID get_cluster_ssbo() const { return cluster_ssbo; }
+	RID get_vertex_ssbo() const { return vertex_ssbo; }
+	RID get_bvh_ssbo() const { return bvh_ssbo; }
+	RID get_page_ssbo() const { return page_ssbo; }
+	bool is_gpu_uploaded() const { return gpu_uploaded; }
+
+	NaniteMeshData() = default;
+	~NaniteMeshData() = default;
 };
-
-#endif // TOOLS_ENABLED

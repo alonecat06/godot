@@ -1,5 +1,5 @@
 /**************************************************************************/
-/*  nanite_mesh_editor.h                                                  */
+/*  nanite_debug.cpp                                                       */
 /**************************************************************************/
 /*                         This file is part of:                          */
 /*                             GODOT ENGINE                               */
@@ -28,68 +28,52 @@
 /* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
 /**************************************************************************/
 
-#pragma once
+#include "core/nanite_debug.h"
 
-#ifdef TOOLS_ENABLED
+#include "core/object/class_db.h"
 
-#include "editor/plugins/editor_plugin.h"
-#include "scene/gui/option_button.h"
-#include "scene/gui/label.h"
-#include "scene/gui/button.h"
-#include "scene/gui/subviewport_container.h"
-#include "scene/3d/camera_3d.h"
-#include "scene/3d/light_3d.h"
-#include "../scene/nanite_mesh_instance_3d.h"
-#include "scene/3d/node_3d.h"
-#include "scene/main/viewport.h"
-#include "scene/resources/mesh.h"
+void NaniteDebug::set_mode(int p_mode) {
+	mode = (DebugMode)p_mode;
+}
 
-class NaniteMeshResource;
+int NaniteDebug::get_mode() const {
+	return (int)mode;
+}
 
-// NaniteMeshEditor is an Inspector-embedded 3D preview widget for
-// NaniteMeshResource. It mirrors the structure of MeshEditor (editor/plugins/
-// mesh_editor_plugin.cpp): a SubViewportContainer hosting a SubViewport with a
-// rotation pivot Node3D, Camera3D, two DirectionalLights, and a MeshInstance3D
-// for the shadow mesh. A stats Label overlays cluster/node/page counts +
-// shadow triangle count + estimated memory.
-//
-// All file I/O and GPU pipeline work belongs to later stages; this widget
-// only renders the (already-built) shadow_mesh via a standard MeshInstance3D.
-class NaniteMeshEditor : public SubViewportContainer {
-	GDCLASS(NaniteMeshEditor, SubViewportContainer);
+void NaniteDebug::set_wireframe(bool p_wireframe) {
+	wireframe = p_wireframe;
+}
 
-private:
-	SubViewport *viewport = nullptr;
-	Node3D *rotation_node = nullptr;
-	Camera3D *camera = nullptr;
-	DirectionalLight3D *light1 = nullptr;
-	DirectionalLight3D *light2 = nullptr;
-	NaniteMeshInstance3D *mesh_instance = nullptr;
-	OptionButton *debug_mode_btn = nullptr;
-	Button *wireframe_btn = nullptr;
-	Button *bounds_btn = nullptr;
-	Label *stats_label = nullptr;
+bool NaniteDebug::get_wireframe() const {
+	return wireframe;
+}
 
-	Ref<NaniteMeshResource> current_resource;
+void NaniteDebug::set_show_bounds(bool p_show_bounds) {
+	show_bounds = p_show_bounds;
+}
 
-	bool dragging = false;
-	float rot_x = 0.0f;
-	float rot_y = 0.0f;
+bool NaniteDebug::get_show_bounds() const {
+	return show_bounds;
+}
 
-	void _update_rotation();
-	void _on_debug_mode_changed(int p_index);
+void NaniteDebug::_bind_methods() {
+	ClassDB::bind_method(D_METHOD("set_mode", "mode"), &NaniteDebug::set_mode);
+	ClassDB::bind_method(D_METHOD("get_mode"), &NaniteDebug::get_mode);
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "mode", PROPERTY_HINT_ENUM, "None,Cluster Solid Color,LOD Solid Color,Overdraw Heatmap,Page Residency,HZB Mip Levels,HZB Occlusion"), "set_mode", "get_mode");
 
-protected:
-	static void _bind_methods();
-	void _notification(int p_what);
+	ClassDB::bind_method(D_METHOD("set_wireframe", "wireframe"), &NaniteDebug::set_wireframe);
+	ClassDB::bind_method(D_METHOD("get_wireframe"), &NaniteDebug::get_wireframe);
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "wireframe"), "set_wireframe", "get_wireframe");
 
-public:
-	NaniteMeshEditor();
-	~NaniteMeshEditor();
+	ClassDB::bind_method(D_METHOD("set_show_bounds", "show_bounds"), &NaniteDebug::set_show_bounds);
+	ClassDB::bind_method(D_METHOD("get_show_bounds"), &NaniteDebug::get_show_bounds);
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "show_bounds"), "set_show_bounds", "get_show_bounds");
 
-	void edit(const Ref<NaniteMeshResource> &p_resource);
-
-	virtual void gui_input(const Ref<InputEvent> &p_event) override;
-};
-
-#endif // TOOLS_ENABLED
+	BIND_ENUM_CONSTANT(NONE);
+	BIND_ENUM_CONSTANT(CLUSTER_SOLID_COLOR);
+	BIND_ENUM_CONSTANT(LOD_SOLID_COLOR);
+	BIND_ENUM_CONSTANT(OVERDRAW_HEATMAP);
+	BIND_ENUM_CONSTANT(PAGE_RESIDENCY);
+	BIND_ENUM_CONSTANT(HZB_MIP_LEVELS);
+	BIND_ENUM_CONSTANT(HZB_OCCLUSION);
+}

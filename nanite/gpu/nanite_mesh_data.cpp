@@ -1,5 +1,5 @@
 /**************************************************************************/
-/*  nanite_mesh_editor.h                                                  */
+/*  nanite_mesh_data.cpp                                                  */
 /**************************************************************************/
 /*                         This file is part of:                          */
 /*                             GODOT ENGINE                               */
@@ -28,68 +28,70 @@
 /* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
 /**************************************************************************/
 
-#pragma once
+#include "gpu/nanite_mesh_data.h"
 
-#ifdef TOOLS_ENABLED
+#include "core/nanite_resource.h"
+#include "core/error/error_macros.h"
+#include "servers/rendering/rendering_device.h"
 
-#include "editor/plugins/editor_plugin.h"
-#include "scene/gui/option_button.h"
-#include "scene/gui/label.h"
-#include "scene/gui/button.h"
-#include "scene/gui/subviewport_container.h"
-#include "scene/3d/camera_3d.h"
-#include "scene/3d/light_3d.h"
-#include "../scene/nanite_mesh_instance_3d.h"
-#include "scene/3d/node_3d.h"
-#include "scene/main/viewport.h"
-#include "scene/resources/mesh.h"
+void NaniteMeshData::upload_to_gpu(RenderingDevice *p_rd, const NaniteMeshResource *p_resource) {
+	ERR_FAIL_NULL(p_rd);
+	ERR_FAIL_NULL(p_resource);
+	if (gpu_uploaded) {
+		return;
+	}
 
-class NaniteMeshResource;
+	// Create storage buffers (SSBOs) from each blob.
+	// storage_buffer_create(size, data) — data is Span<uint8_t>; PackedByteArray
+	// (a typedef of Vector<uint8_t>) implicitly converts to Span<uint8_t>.
+	PackedByteArray clusters = p_resource->get_clusters_data();
+	PackedByteArray vertices = p_resource->get_vertex_data();
+	PackedByteArray nodes = p_resource->get_nodes_data();
+	PackedByteArray pages = p_resource->get_page_table_data();
 
-// NaniteMeshEditor is an Inspector-embedded 3D preview widget for
-// NaniteMeshResource. It mirrors the structure of MeshEditor (editor/plugins/
-// mesh_editor_plugin.cpp): a SubViewportContainer hosting a SubViewport with a
-// rotation pivot Node3D, Camera3D, two DirectionalLights, and a MeshInstance3D
-// for the shadow mesh. A stats Label overlays cluster/node/page counts +
-// shadow triangle count + estimated memory.
-//
-// All file I/O and GPU pipeline work belongs to later stages; this widget
-// only renders the (already-built) shadow_mesh via a standard MeshInstance3D.
-class NaniteMeshEditor : public SubViewportContainer {
-	GDCLASS(NaniteMeshEditor, SubViewportContainer);
+	// Zero-sized buffers cause driver issues on some backends, so allocate a
+	// small 4-byte placeholder (with no initial data) when a blob is empty.
+	auto create_ssbo = [p_rd](const PackedByteArray &p_data) -> RID {
+		if (p_data.size() == 0) {
+			return p_rd->storage_buffer_create(4);
+		}
+		return p_rd->storage_buffer_create(static_cast<uint32_t>(p_data.size()), p_data);
+	};
 
-private:
-	SubViewport *viewport = nullptr;
-	Node3D *rotation_node = nullptr;
-	Camera3D *camera = nullptr;
-	DirectionalLight3D *light1 = nullptr;
-	DirectionalLight3D *light2 = nullptr;
-	NaniteMeshInstance3D *mesh_instance = nullptr;
-	OptionButton *debug_mode_btn = nullptr;
-	Button *wireframe_btn = nullptr;
-	Button *bounds_btn = nullptr;
-	Label *stats_label = nullptr;
+	cluster_ssbo = create_ssbo(clusters);
+	vertex_ssbo = create_ssbo(vertices);
+	bvh_ssbo = create_ssbo(nodes);
+	page_ssbo = create_ssbo(pages);
 
-	Ref<NaniteMeshResource> current_resource;
+	// TODO Stage 1: collect material_rids from resource->get_materials()
+	// once NaniteMeshResource exposes a materials accessor. Until then the
+	// material-resolve shader falls back to a white material.
 
-	bool dragging = false;
-	float rot_x = 0.0f;
-	float rot_y = 0.0f;
+	gpu_uploaded = true;
+}
 
-	void _update_rotation();
-	void _on_debug_mode_changed(int p_index);
+void NaniteMeshData::free_gpu_resources(RenderingDevice *p_rd) {
+	if (!gpu_uploaded || p_rd == nullptr) {
+		return;
+	}
 
-protected:
-	static void _bind_methods();
-	void _notification(int p_what);
+	if (cluster_ssbo.is_valid()) {
+		p_rd->free_rid(cluster_ssbo);
+		cluster_ssbo = RID();
+	}
+	if (vertex_ssbo.is_valid()) {
+		p_rd->free_rid(vertex_ssbo);
+		vertex_ssbo = RID();
+	}
+	if (bvh_ssbo.is_valid()) {
+		p_rd->free_rid(bvh_ssbo);
+		bvh_ssbo = RID();
+	}
+	if (page_ssbo.is_valid()) {
+		p_rd->free_rid(page_ssbo);
+		page_ssbo = RID();
+	}
 
-public:
-	NaniteMeshEditor();
-	~NaniteMeshEditor();
-
-	void edit(const Ref<NaniteMeshResource> &p_resource);
-
-	virtual void gui_input(const Ref<InputEvent> &p_event) override;
-};
-
-#endif // TOOLS_ENABLED
+	material_rids.clear();
+	gpu_uploaded = false;
+}

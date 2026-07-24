@@ -1,5 +1,5 @@
 /**************************************************************************/
-/*  nanite_mesh_editor.h                                                  */
+/*  nanite_debug.h                                                        */
 /**************************************************************************/
 /*                         This file is part of:                          */
 /*                             GODOT ENGINE                               */
@@ -30,66 +30,48 @@
 
 #pragma once
 
-#ifdef TOOLS_ENABLED
+#include "core/object/object.h"
+#include "core/object/ref_counted.h"
 
-#include "editor/plugins/editor_plugin.h"
-#include "scene/gui/option_button.h"
-#include "scene/gui/label.h"
-#include "scene/gui/button.h"
-#include "scene/gui/subviewport_container.h"
-#include "scene/3d/camera_3d.h"
-#include "scene/3d/light_3d.h"
-#include "../scene/nanite_mesh_instance_3d.h"
-#include "scene/3d/node_3d.h"
-#include "scene/main/viewport.h"
-#include "scene/resources/mesh.h"
+// NaniteDebug holds the runtime visualization/debug state used by the
+// GPU pipeline and the bridge to pick shader permutations or draw
+// debug overlays. It is owned by NaniteServer and exposed to the
+// singleton so editor tooling can flip modes at runtime.
+class NaniteDebug : public Object {
+	GDCLASS(NaniteDebug, Object);
 
-class NaniteMeshResource;
-
-// NaniteMeshEditor is an Inspector-embedded 3D preview widget for
-// NaniteMeshResource. It mirrors the structure of MeshEditor (editor/plugins/
-// mesh_editor_plugin.cpp): a SubViewportContainer hosting a SubViewport with a
-// rotation pivot Node3D, Camera3D, two DirectionalLights, and a MeshInstance3D
-// for the shadow mesh. A stats Label overlays cluster/node/page counts +
-// shadow triangle count + estimated memory.
-//
-// All file I/O and GPU pipeline work belongs to later stages; this widget
-// only renders the (already-built) shadow_mesh via a standard MeshInstance3D.
-class NaniteMeshEditor : public SubViewportContainer {
-	GDCLASS(NaniteMeshEditor, SubViewportContainer);
+public:
+	enum DebugMode {
+		NONE = 0,
+		CLUSTER_SOLID_COLOR,
+		LOD_SOLID_COLOR,
+		OVERDRAW_HEATMAP,
+		PAGE_RESIDENCY,
+		HZB_MIP_LEVELS,
+		HZB_OCCLUSION,
+	};
 
 private:
-	SubViewport *viewport = nullptr;
-	Node3D *rotation_node = nullptr;
-	Camera3D *camera = nullptr;
-	DirectionalLight3D *light1 = nullptr;
-	DirectionalLight3D *light2 = nullptr;
-	NaniteMeshInstance3D *mesh_instance = nullptr;
-	OptionButton *debug_mode_btn = nullptr;
-	Button *wireframe_btn = nullptr;
-	Button *bounds_btn = nullptr;
-	Label *stats_label = nullptr;
-
-	Ref<NaniteMeshResource> current_resource;
-
-	bool dragging = false;
-	float rot_x = 0.0f;
-	float rot_y = 0.0f;
-
-	void _update_rotation();
-	void _on_debug_mode_changed(int p_index);
+	DebugMode mode = NONE;
+	bool wireframe = false;
+	bool show_bounds = false;
 
 protected:
 	static void _bind_methods();
-	void _notification(int p_what);
 
 public:
-	NaniteMeshEditor();
-	~NaniteMeshEditor();
+	void set_mode(int p_mode);
+	int get_mode() const;
+	DebugMode get_mode_enum() const { return mode; }
 
-	void edit(const Ref<NaniteMeshResource> &p_resource);
+	void set_wireframe(bool p_wireframe);
+	bool get_wireframe() const;
 
-	virtual void gui_input(const Ref<InputEvent> &p_event) override;
+	void set_show_bounds(bool p_show_bounds);
+	bool get_show_bounds() const;
+
+	NaniteDebug() = default;
+	~NaniteDebug() = default;
 };
 
-#endif // TOOLS_ENABLED
+VARIANT_ENUM_CAST(NaniteDebug::DebugMode);
