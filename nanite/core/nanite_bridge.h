@@ -41,6 +41,7 @@
 
 #include "core/string/string_name.h"
 #include "core/templates/rid.h"
+#include "core/variant/type_info.h"
 
 class NaniteServer;
 class RenderData;
@@ -76,3 +77,5 @@ public:
 	// Human-readable bridge identifier (e.g. "gdext" / "module" / "deep").
 	virtual StringName get_bridge_name() const = 0;
 };
+
+VARIANT_ENUM_CAST(INaniteBridge::ShadowMode);

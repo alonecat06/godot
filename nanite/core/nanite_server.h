@@ -36,6 +36,7 @@
 #include "core/templates/hash_map.h"
 #include "core/templates/rid.h"
 #include "core/templates/rid_owner.h"
+#include "bridge/nanite_gdext_bridge.h" // NaniteGDExtBridge (Ref<> member needs complete type)
 
 class NaniteMeshResource;
 class NaniteGPUPipeline;
@@ -43,7 +44,6 @@ class NaniteMeshData;
 class NaniteMeshInstance3D;
 class NanitePageCache;
 class NaniteDebug;
-class NaniteGDExtBridge; // Stage 1 CompositorEffect bridge (Ref<> member below).
 class RenderData;
 class RenderingDevice;
 
@@ -78,10 +78,8 @@ private:
 	// Stage 1 gdext bridge is split across two CompositorEffect instances
 	// (one callback type each): PRE_OPAQUE drives render_visibility,
 	// POST_OPAQUE drives render_material_resolve. `bridge` above aliases
-	// pre_opaque_bridge.ptr() for the INaniteBridge interface. Ref<> is
-	// safe with the forward-declared NaniteGDExtBridge (see ref_counted.h);
-	// the full include lives in nanite_server.cpp so the Ref destructors
-	// instantiate against a complete type.
+	// pre_opaque_bridge.ptr() for the INaniteBridge interface. Both Refs
+	// are released in finish(); bridge aliases pre_opaque_bridge.ptr().
 	Ref<NaniteGDExtBridge> pre_opaque_bridge;
 	Ref<NaniteGDExtBridge> post_opaque_bridge;
 

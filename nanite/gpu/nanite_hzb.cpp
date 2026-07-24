@@ -62,7 +62,7 @@ void NaniteHZB::init(RenderingDevice *p_rd) {
 	Error err = shader_file->parse_versions_from_text(nanite_hzb_downsample_shader_glsl);
 	if (err != OK) {
 		shader_file->print_errors("nanite_hzb_downsample");
-		ERR_FAIL;
+		ERR_FAIL_MSG("Failed to parse nanite_hzb_downsample GLSL");
 	}
 
 	downsample_shader = p_rd->shader_create_from_spirv(shader_file->get_spirv_stages());

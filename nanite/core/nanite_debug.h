@@ -32,6 +32,7 @@
 
 #include "core/object/object.h"
 #include "core/object/ref_counted.h"
+#include "core/variant/type_info.h"
 
 // NaniteDebug holds the runtime visualization/debug state used by the
 // GPU pipeline and the bridge to pick shader permutations or draw

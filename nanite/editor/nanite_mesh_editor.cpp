@@ -37,7 +37,7 @@
 #include "../scene/nanite_mesh_instance_3d.h"
 
 #include "core/math/math_funcs.h"
-#include "core/object/callable_method_pointer.h"
+#include "core/object/callable_mp.h"
 #include "core/object/class_db.h"
 #include "core/variant/variant.h"
 #include "editor/editor_node.h"

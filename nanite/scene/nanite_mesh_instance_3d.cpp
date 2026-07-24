@@ -32,6 +32,7 @@
 
 #include "core/nanite_server.h"
 #include "core/nanite_resource.h"
+#include "core/object/class_db.h"
 #include "servers/rendering/rendering_server.h"
 
 void NaniteMeshInstance3D::set_nanite_mesh(const Ref<NaniteMeshResource> &p_mesh) {

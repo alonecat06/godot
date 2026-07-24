@@ -35,6 +35,7 @@
 #include "core/nanite_resource.h"
 #include "gpu/nanite_gpu_pipeline.h"
 #include "gpu/nanite_mesh_data.h"
+#include "scene/nanite_mesh_instance_3d.h"
 
 #include "core/config/project_settings.h"
 #include "core/error/error_macros.h"
