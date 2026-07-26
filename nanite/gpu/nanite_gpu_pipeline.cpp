@@ -45,23 +45,38 @@ namespace {
 
 // Must match the `Params` push constant block in nanite_cull.glsl.
 // Camera matrices live in a UBO, not here (see MAX_PUSH_CONSTANT_SIZE note).
+// Layout (std430, model_matrix first to keep mat4 16-aligned at offset 0):
+//   offset 0:  mat4 model_matrix (64 B)
+//   offset 64: ivec2 screen_size (8 B)
+//   offset 72: float error_threshold (4 B)
+//   offset 76: uint bvh_node_count (4 B)
+//   offset 80: uint cluster_count (4 B)
+//   offset 84: uint _pad (4 B)
+//   total: 88 B (rounded up to 16-multiple → 96 B by std430 rules)
 struct CullPushConstant {
+	float model_matrix[16]; // Task 1.16.6 — per-instance world transform
 	int32_t screen_size[2];
 	float error_threshold;
 	uint32_t bvh_node_count;
 	uint32_t cluster_count;
-	uint32_t _pad; // keep the struct a multiple of 8 (std430 ivec2 alignment)
+	uint32_t _pad;
 };
 
 // Must match the `Params` push constant block in nanite_rasterize.glsl.
+// Layout (std430): mat4 model_matrix (64B) + ivec2 screen_size (8B) +
+// uint visible_count (4B) + uint _pad (4B) = 80 B (rounded to 80 by std430).
 struct RasterizePushConstant {
+	float model_matrix[16]; // Task 1.16.6 — per-instance world transform
 	int32_t screen_size[2];
 	uint32_t visible_count;
 	uint32_t _pad;
 };
 
 // Must match the `Params` push constant block in nanite_material_resolve.glsl.
+// Layout (std430): mat4 model_matrix (64B) + ivec2 screen_size (8B) +
+// uint debug_mode (4B) + uint _pad (4B) = 80 B.
 struct MaterialResolvePushConstant {
+	float model_matrix[16]; // Task 1.16.6 — per-instance world transform
 	int32_t screen_size[2];
 	uint32_t debug_mode;
 	uint32_t _pad;
@@ -73,6 +88,26 @@ struct CameraUniform {
 	float view_matrix[16];
 	float projection[16];
 };
+
+// Task 1.16.6 — column-major identity matrix used when p_model_matrix is
+// nullptr (no per-instance transform). Stored in static const so callers
+// never need to allocate a stack buffer just to pass identity.
+static const float IDENTITY_MATRIX[16] = {
+	1.0f, 0.0f, 0.0f, 0.0f,
+	0.0f, 1.0f, 0.0f, 0.0f,
+	0.0f, 0.0f, 1.0f, 0.0f,
+	0.0f, 0.0f, 0.0f, 1.0f
+};
+
+// Copies p_src (16 floats, column-major) into p_dst, or fills with identity
+// when p_src is nullptr.
+static inline void copy_model_matrix(float *p_dst, const float *p_src) {
+	if (p_src != nullptr) {
+		memcpy(p_dst, p_src, sizeof(float) * 16);
+	} else {
+		memcpy(p_dst, IDENTITY_MATRIX, sizeof(float) * 16);
+	}
+}
 
 // Parses an embedded GLSL string into an RDShaderFile and creates a shader +
 // compute pipeline from it. Mirrors NaniteHZB::init. Returns false on error.
@@ -251,23 +286,26 @@ void NaniteGPUPipeline::ensure_screen_buffers(RenderingDevice *p_rd, int p_width
 
 	// vis_buffer: R32_UINT, one uint per pixel = (cluster_id << 8 | triangle_id).
 	// Storage for imageStore (rasterize) + sampling/copy for downstream passes.
+	// Task 1.16.8 — CAN_COPY_TO_BIT so dispatch_rasterize can texture_clear it.
 	RD::TextureFormat vis_tf;
 	vis_tf.format = RD::DATA_FORMAT_R32_UINT;
 	vis_tf.width = p_width;
 	vis_tf.height = p_height;
 	vis_tf.texture_type = RD::TEXTURE_TYPE_2D;
-	vis_tf.usage_bits = RD::TEXTURE_USAGE_STORAGE_BIT | RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT;
+	vis_tf.usage_bits = RD::TEXTURE_USAGE_STORAGE_BIT | RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT | RD::TEXTURE_USAGE_CAN_COPY_TO_BIT;
 	vis_buffer = p_rd->texture_create(vis_tf, RD::TextureView());
 	ERR_FAIL_COND(!vis_buffer.is_valid());
 
 	// depth_buffer: R32_SFLOAT, written by the rasterize pass and copied into
 	// HZB mip 0 by dispatch_hzb_build (so it needs CAN_COPY_FROM_BIT).
+	// Task 1.16.8 — CAN_COPY_TO_BIT so dispatch_rasterize can clear to 1.0 (far).
+	// Storage usage allows imageLoad (compare-then-store depth test).
 	RD::TextureFormat depth_tf;
 	depth_tf.format = RD::DATA_FORMAT_R32_SFLOAT;
 	depth_tf.width = p_width;
 	depth_tf.height = p_height;
 	depth_tf.texture_type = RD::TEXTURE_TYPE_2D;
-	depth_tf.usage_bits = RD::TEXTURE_USAGE_STORAGE_BIT | RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT | RD::TEXTURE_USAGE_CAN_UPDATE_BIT;
+	depth_tf.usage_bits = RD::TEXTURE_USAGE_STORAGE_BIT | RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT | RD::TEXTURE_USAGE_CAN_UPDATE_BIT | RD::TEXTURE_USAGE_CAN_COPY_TO_BIT;
 	depth_buffer = p_rd->texture_create(depth_tf, RD::TextureView());
 	ERR_FAIL_COND(!depth_buffer.is_valid());
 
@@ -344,6 +382,7 @@ RID NaniteGPUPipeline::dispatch_cull(RenderingDevice *p_rd, const CullParams &p_
 	ERR_FAIL_COND_V(!uniform_set.is_valid(), RID());
 
 	CullPushConstant pc;
+	copy_model_matrix(pc.model_matrix, p_params.model_matrix); // Task 1.16.6
 	pc.screen_size[0] = p_params.screen_size[0];
 	pc.screen_size[1] = p_params.screen_size[1];
 	pc.error_threshold = p_params.error_threshold;
@@ -366,7 +405,7 @@ RID NaniteGPUPipeline::dispatch_cull(RenderingDevice *p_rd, const CullParams &p_
 	return visible_clusters_buffer;
 }
 
-void NaniteGPUPipeline::dispatch_rasterize(RenderingDevice *p_rd, const RID &p_visible_buffer, uint32_t p_visible_count, const NaniteMeshData *p_mesh_data) {
+void NaniteGPUPipeline::dispatch_rasterize(RenderingDevice *p_rd, const RID &p_visible_buffer, uint32_t p_visible_count, const NaniteMeshData *p_mesh_data, const float *p_model_matrix) {
 	ERR_FAIL_NULL(p_rd);
 	ERR_FAIL_COND(!initialized);
 	ERR_FAIL_COND(!p_visible_buffer.is_valid());
@@ -376,6 +415,22 @@ void NaniteGPUPipeline::dispatch_rasterize(RenderingDevice *p_rd, const RID &p_v
 	ERR_FAIL_COND(!vis_buffer.is_valid());
 	ERR_FAIL_COND(!depth_buffer.is_valid());
 
+	// Task 1.16.8 — clear vis_buffer to 0 (no geometry) and depth_buffer to
+	// 1.0 (far) before rasterization. The shader uses imageLoad(depth_buffer)
+	// for a non-atomic compare-then-store, so the depth must start at far.
+	p_rd->texture_clear(vis_buffer, Color(0, 0, 0, 0), 0, 1, 0, 1);
+	p_rd->texture_clear(depth_buffer, Color(1.0, 0, 0, 0), 0, 1, 0, 1);
+	p_rd->barrier();
+
+	// Build the rasterize uniform set (set 0):
+	//   binding 0: visible_clusters_buffer (SSBO)
+	//   binding 1: cluster_ssbo (SSBO, uint32[] — 17 uints per cluster)
+	//   binding 2: vertex_ssbo (SSBO, raw stride 32 B)
+	//   binding 3: vis_buffer (image, r32ui, writeonly)
+	//   binding 4: depth_buffer (image, r32f, read+write)
+	//   binding 5: camera_ubo (UBO, view + projection)
+	//   binding 6: meshlet_vertices_ssbo (SSBO, uint32[])
+	//   binding 7: meshlet_triangles_ssbo (SSBO, packed uint8[])
 	Vector<RD::Uniform> uniforms;
 	{
 		RD::Uniform u_visible(RD::UNIFORM_TYPE_STORAGE_BUFFER, 0, p_visible_buffer);
@@ -383,16 +438,23 @@ void NaniteGPUPipeline::dispatch_rasterize(RenderingDevice *p_rd, const RID &p_v
 		RD::Uniform u_vertices(RD::UNIFORM_TYPE_STORAGE_BUFFER, 2, p_mesh_data->get_vertex_ssbo());
 		RD::Uniform u_vis(RD::UNIFORM_TYPE_IMAGE, 3, vis_buffer);
 		RD::Uniform u_depth(RD::UNIFORM_TYPE_IMAGE, 4, depth_buffer);
+		RD::Uniform u_camera(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 5, camera_ubo);
+		RD::Uniform u_mv(RD::UNIFORM_TYPE_STORAGE_BUFFER, 6, p_mesh_data->get_meshlet_vertices_ssbo());
+		RD::Uniform u_mt(RD::UNIFORM_TYPE_STORAGE_BUFFER, 7, p_mesh_data->get_meshlet_triangles_ssbo());
 		uniforms.push_back(u_visible);
 		uniforms.push_back(u_clusters);
 		uniforms.push_back(u_vertices);
 		uniforms.push_back(u_vis);
 		uniforms.push_back(u_depth);
+		uniforms.push_back(u_camera);
+		uniforms.push_back(u_mv);
+		uniforms.push_back(u_mt);
 	}
 	RID uniform_set = p_rd->uniform_set_create(uniforms, rasterize_shader, 0);
 	ERR_FAIL_COND(!uniform_set.is_valid());
 
 	RasterizePushConstant pc;
+	copy_model_matrix(pc.model_matrix, p_model_matrix); // Task 1.16.6
 	pc.screen_size[0] = current_width;
 	pc.screen_size[1] = current_height;
 	pc.visible_count = p_visible_count;
@@ -415,7 +477,7 @@ void NaniteGPUPipeline::dispatch_hzb_build(RenderingDevice *p_rd, const RID &p_d
 	hzb.build(p_rd, p_depth_texture);
 }
 
-void NaniteGPUPipeline::dispatch_material_resolve(RenderingDevice *p_rd, const RID &p_vis_buffer, const NaniteMeshData *p_mesh_data, int p_debug_mode) {
+void NaniteGPUPipeline::dispatch_material_resolve(RenderingDevice *p_rd, const RID &p_vis_buffer, const NaniteMeshData *p_mesh_data, int p_debug_mode, const float *p_model_matrix) {
 	ERR_FAIL_NULL(p_rd);
 	ERR_FAIL_COND(!initialized);
 	ERR_FAIL_COND(!material_resolve_pipeline.is_valid());
@@ -431,20 +493,36 @@ void NaniteGPUPipeline::dispatch_material_resolve(RenderingDevice *p_rd, const R
 	// Build the material-resolve uniform set (set 0):
 	//   binding 0: vis_buffer (readonly uimage2D, r32ui)
 	//   binding 1: color_buffer (writeonly image2D, rgba8)
-	//   binding 2: cluster_ssbo (storage buffer, for material lookup — unused in Stage 1)
+	//   binding 2: cluster_ssbo (storage buffer, for material lookup)
+	//   binding 3: vertex_ssbo (storage buffer, for barycentric interp)
+	//   binding 4: materials_ssbo (storage buffer, base_color lookup)
+	//   binding 5: meshlet_vertices_ssbo (Task 1.16.9 — global vertex indices)
+	//   binding 6: meshlet_triangles_ssbo (Task 1.16.9 — local triangle indices)
+	//   binding 7: camera_ubo (Task 1.16.9 — view + projection for re-projection)
 	Vector<RD::Uniform> uniforms;
 	{
 		RD::Uniform u_vis(RD::UNIFORM_TYPE_IMAGE, 0, vis);
 		RD::Uniform u_color(RD::UNIFORM_TYPE_IMAGE, 1, color_buffer);
 		RD::Uniform u_clusters(RD::UNIFORM_TYPE_STORAGE_BUFFER, 2, p_mesh_data->get_cluster_ssbo());
+		RD::Uniform u_vertices(RD::UNIFORM_TYPE_STORAGE_BUFFER, 3, p_mesh_data->get_vertex_ssbo());
+		RD::Uniform u_materials(RD::UNIFORM_TYPE_STORAGE_BUFFER, 4, p_mesh_data->get_materials_ssbo());
+		RD::Uniform u_mv(RD::UNIFORM_TYPE_STORAGE_BUFFER, 5, p_mesh_data->get_meshlet_vertices_ssbo());
+		RD::Uniform u_mt(RD::UNIFORM_TYPE_STORAGE_BUFFER, 6, p_mesh_data->get_meshlet_triangles_ssbo());
+		RD::Uniform u_camera(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 7, camera_ubo);
 		uniforms.push_back(u_vis);
 		uniforms.push_back(u_color);
 		uniforms.push_back(u_clusters);
+		uniforms.push_back(u_vertices);
+		uniforms.push_back(u_materials);
+		uniforms.push_back(u_mv);
+		uniforms.push_back(u_mt);
+		uniforms.push_back(u_camera);
 	}
 	RID uniform_set = p_rd->uniform_set_create(uniforms, material_resolve_shader, 0);
 	ERR_FAIL_COND(!uniform_set.is_valid());
 
 	MaterialResolvePushConstant pc;
+	copy_model_matrix(pc.model_matrix, p_model_matrix); // Task 1.16.6
 	pc.screen_size[0] = current_width;
 	pc.screen_size[1] = current_height;
 	pc.debug_mode = (uint32_t)p_debug_mode;

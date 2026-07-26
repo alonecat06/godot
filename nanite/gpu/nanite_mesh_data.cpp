@@ -48,6 +48,9 @@ void NaniteMeshData::upload_to_gpu(RenderingDevice *p_rd, const NaniteMeshResour
 	PackedByteArray vertices = p_resource->get_vertex_data();
 	PackedByteArray nodes = p_resource->get_nodes_data();
 	PackedByteArray pages = p_resource->get_page_table_data();
+	PackedByteArray materials = p_resource->get_materials_data(); // Task 1.16.5
+	PackedByteArray meshlet_vertices = p_resource->get_meshlet_vertices_data(); // Task 1.16.4
+	PackedByteArray meshlet_triangles = p_resource->get_meshlet_triangles_data(); // Task 1.16.4
 
 	// Zero-sized buffers cause driver issues on some backends, so allocate a
 	// small 4-byte placeholder (with no initial data) when a blob is empty.
@@ -62,10 +65,15 @@ void NaniteMeshData::upload_to_gpu(RenderingDevice *p_rd, const NaniteMeshResour
 	vertex_ssbo = create_ssbo(vertices);
 	bvh_ssbo = create_ssbo(nodes);
 	page_ssbo = create_ssbo(pages);
+	materials_ssbo = create_ssbo(materials); // Task 1.16.5
+	meshlet_vertices_ssbo = create_ssbo(meshlet_vertices); // Task 1.16.4
+	meshlet_triangles_ssbo = create_ssbo(meshlet_triangles); // Task 1.16.4
 
-	// TODO Stage 1: collect material_rids from resource->get_materials()
-	// once NaniteMeshResource exposes a materials accessor. Until then the
-	// material-resolve shader falls back to a white material.
+	// Task 1.16.5 — materials_data is a flat byte blob; no separate material_rids
+	// need to be collected (Stage 0 already had no `get_materials()` and Stage 1
+	// resolves materials via `material_index` into materials_ssbo directly).
+	// material_rids is left empty — kept in the struct for Stage 2+ when
+	// full Material resources may need to be bound.
 
 	gpu_uploaded = true;
 }
@@ -90,6 +98,18 @@ void NaniteMeshData::free_gpu_resources(RenderingDevice *p_rd) {
 	if (page_ssbo.is_valid()) {
 		p_rd->free_rid(page_ssbo);
 		page_ssbo = RID();
+	}
+	if (materials_ssbo.is_valid()) { // Task 1.16.5
+		p_rd->free_rid(materials_ssbo);
+		materials_ssbo = RID();
+	}
+	if (meshlet_vertices_ssbo.is_valid()) { // Task 1.16.4
+		p_rd->free_rid(meshlet_vertices_ssbo);
+		meshlet_vertices_ssbo = RID();
+	}
+	if (meshlet_triangles_ssbo.is_valid()) { // Task 1.16.4
+		p_rd->free_rid(meshlet_triangles_ssbo);
+		meshlet_triangles_ssbo = RID();
 	}
 
 	material_rids.clear();

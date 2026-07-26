@@ -89,6 +89,9 @@ void NaniteMeshInstance3D::set_nanite_enabled(bool p_enabled) {
 			if (NaniteServer *ns = NaniteServer::get_singleton()) {
 				ns->unregister_instance(this);
 			}
+			// Task 1.16.12 — restore default shadow casting so the engine
+			// renders the mesh normally (main + shadow passes).
+			set_cast_shadows_setting(SHADOW_CASTING_SETTING_ON);
 		}
 	} else {
 		// Re-register.
@@ -109,7 +112,10 @@ void NaniteMeshInstance3D::set_nanite_enabled(bool p_enabled) {
 		if (is_inside_tree()) {
 			if (NaniteServer *ns = NaniteServer::get_singleton()) {
 				ns->register_instance(this);
+				ns->update_instance_transform(this, get_global_transform());
 			}
+			// Task 1.16.12 — block native mesh rendering.
+			set_cast_shadows_setting(SHADOW_CASTING_SETTING_SHADOWS_ONLY);
 		}
 	}
 }
@@ -149,12 +155,36 @@ void NaniteMeshInstance3D::_notification(int p_what) {
 			if (nanite_enabled && nanite_mesh.is_valid()) {
 				if (NaniteServer *ns = NaniteServer::get_singleton()) {
 					ns->register_instance(this);
+					// Seed the transform cache immediately so the first
+					// render_visibility sees the correct model matrix.
+					ns->update_instance_transform(this, get_global_transform());
 				}
+				// Task 1.16.12 — block native mesh rendering. With Nanite
+				// enabled, the engine's main pass should NOT draw the shadow
+				// mesh we assigned via set_mesh(); only the shadow pass
+				// should use it. SHADOW_CASTING_SETTING_SHADOWS_ONLY hides the
+				// instance from the main camera while keeping shadow
+				// casting intact (so mesh_set_shadow_mesh still works).
+				set_cast_shadows_setting(SHADOW_CASTING_SETTING_SHADOWS_ONLY);
 			}
 		} break;
 		case NOTIFICATION_EXIT_TREE: {
 			if (NaniteServer *ns = NaniteServer::get_singleton()) {
 				ns->unregister_instance(this);
+			}
+			// Restore default shadow casting so the same node can be
+			// reused as a plain MeshInstance3D after nanite_enabled=false.
+			set_cast_shadows_setting(SHADOW_CASTING_SETTING_ON);
+		} break;
+		case NOTIFICATION_TRANSFORM_CHANGED: {
+			// Task 1.16.11 — push the new world transform to the server.
+			// The cached transform is read by render_visibility (cull +
+			// rasterize push constant) and render_material_resolve
+			// (re-projection for barycentric interpolation).
+			if (nanite_enabled && nanite_mesh.is_valid()) {
+				if (NaniteServer *ns = NaniteServer::get_singleton()) {
+					ns->update_instance_transform(this, get_global_transform());
+				}
 			}
 		} break;
 		default:

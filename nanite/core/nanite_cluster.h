@@ -43,12 +43,13 @@
 // ClassDB, never exposed to GDScript directly. Lifetime is managed inside
 // LocalVector<NaniteCluster> buffers owned by NaniteMeshResource.
 //
-// Serialization layout (little-endian, 4-byte aligned — see spec 0.6.2):
+// Serialization layout (little-endian, 4-byte aligned — see spec 0.6.2 + Task 1.16.1):
 //   uint32 vertex_offset
 //   uint32 vertex_count
 //   uint32 triangle_offset
 //   uint32 triangle_count
 //   uint32 group_id
+//   uint32 material_index          (Task 1.16.1 — index into NaniteMeshResource::materials_data)
 //   float  error
 //   AABB   bounds        (6 × float: position.xyz, size.xyz)
 //   Vec3   cone_axis     (3 × float)
@@ -60,6 +61,7 @@ struct NaniteCluster {
 	uint32_t triangle_offset = 0;
 	uint32_t triangle_count = 0;
 	uint32_t group_id = 0; // LOD level (L0 = 0)
+	uint32_t material_index = 0; // Task 1.16.1 — index into NaniteMeshResource::materials_data
 	float error = 0.0f; // 0 for leaves
 	AABB bounds = AABB(); // local-space
 	Vector3 cone_axis = Vector3(0, 0, 0); // unit normal-cone axis

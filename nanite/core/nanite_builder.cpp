@@ -34,6 +34,7 @@
 #include "core/object/class_db.h"
 #include "core/templates/list.h" // List<Node *> for PackedScene traversal.
 #include "page_packer.h" // PagePacker::pack + PageTable for finalize_resource().
+#include "scene/resources/material.h" // BaseMaterial3D for collect_materials().
 #include "scene/resources/mesh.h"
 
 #include <cstring> // memcpy
@@ -81,11 +82,24 @@ Ref<NaniteMeshResource> NaniteBuilder::build(Ref<ArrayMesh> p_mesh) {
 	Array surface_arrays = p_mesh->surface_get_arrays(0);
 	PackedVector3Array vertices = surface_arrays[Mesh::ARRAY_VERTEX];
 	PackedInt32Array indices = surface_arrays[Mesh::ARRAY_INDEX];
+	// Task 1.16.4 — extract normals + UVs for the raw stride-32 vertex_data
+	// blob. Empty arrays are OK; preprocess_mesh fills defaults.
+	PackedVector3Array normals;
+	PackedVector2Array uvs;
+	if (surface_arrays.size() > Mesh::ARRAY_NORMAL) {
+		normals = surface_arrays[Mesh::ARRAY_NORMAL];
+	}
+	if (surface_arrays.size() > Mesh::ARRAY_TEX_UV) {
+		uvs = surface_arrays[Mesh::ARRAY_TEX_UV];
+	}
 
 	ERR_FAIL_COND_V_MSG(vertices.size() == 0, null_result, "NaniteBuilder: Mesh surface has no vertices");
 	ERR_FAIL_COND_V_MSG(indices.size() == 0, null_result, "NaniteBuilder: Mesh surface has no indices");
 
-	if (!preprocess_mesh(vertices, indices)) {
+	if (!preprocess_mesh(vertices, indices, normals, uvs)) {
+		return null_result;
+	}
+	if (!collect_materials(p_mesh)) {
 		return null_result;
 	}
 	if (!build_leaf_clusters()) {
@@ -252,8 +266,10 @@ Ref<NaniteMeshResource> NaniteBuilder::build_from_resource(Ref<Resource> p_resou
 // preprocess_mesh — dedup + optimize (spec 0.4.2)
 // ---------------------------------------------------------------------------
 
-bool NaniteBuilder::preprocess_mesh(const PackedVector3Array &p_vertices, const PackedInt32Array &p_indices) {
+bool NaniteBuilder::preprocess_mesh(const PackedVector3Array &p_vertices, const PackedInt32Array &p_indices, const PackedVector3Array &p_normals, const PackedVector2Array &p_uvs) {
 	m_verts_pos.clear();
+	m_verts_nrm.clear();
+	m_verts_uv.clear();
 	m_indices.clear();
 
 	const size_t index_count = static_cast<size_t>(p_indices.size());
@@ -291,7 +307,19 @@ bool NaniteBuilder::preprocess_mesh(const PackedVector3Array &p_vertices, const 
 	const float *verts_in = reinterpret_cast<const float *>(p_vertices.ptr());
 	const size_t vertex_stride = sizeof(float) * 3;
 
-	// 1) Generate vertex remap (dedup).
+	// Task 1.16.4 — normals + UVs. PackedVector3Array/PackedVector2Array
+	// storage is tightly packed floats (3 / 2 per element). When the source
+	// mesh lacks the array, defaults are filled (normal=(0,1,0), uv=(0,0))
+	// so every vertex still has a full 32-byte record in vertex_data.
+	const bool has_normals = (p_normals.size() == static_cast<int>(vertex_count));
+	const bool has_uvs = (p_uvs.size() == static_cast<int>(vertex_count));
+	const float *nrms_in = has_normals ? reinterpret_cast<const float *>(p_normals.ptr()) : nullptr;
+	const float *uvs_in = has_uvs ? reinterpret_cast<const float *>(p_uvs.ptr()) : nullptr;
+	const size_t nrm_stride = sizeof(float) * 3;
+	const size_t uv_stride = sizeof(float) * 2;
+
+	// 1) Generate vertex remap (dedup) based on positions only. Normals/UVs
+	// follow the same remap — they're attributes of the same vertices.
 	LocalVector<unsigned int> remap;
 	remap.resize(vertex_count);
 	size_t unique_vertex_count = meshopt_generateVertexRemap(
@@ -302,7 +330,7 @@ bool NaniteBuilder::preprocess_mesh(const PackedVector3Array &p_vertices, const 
 			vertex_count,
 			vertex_stride);
 
-	// 2) Remap vertex buffer.
+	// 2) Remap vertex buffers (positions + normals + UVs share the remap).
 	LocalVector<float> remapped_verts;
 	remapped_verts.resize(unique_vertex_count * 3);
 	meshopt_remapVertexBuffer(
@@ -311,6 +339,38 @@ bool NaniteBuilder::preprocess_mesh(const PackedVector3Array &p_vertices, const 
 			vertex_count,
 			vertex_stride,
 			remap.ptr());
+
+	LocalVector<float> remapped_nrms;
+	remapped_nrms.resize(unique_vertex_count * 3);
+	if (has_normals) {
+		meshopt_remapVertexBuffer(
+				remapped_nrms.ptr(),
+				nrms_in,
+				vertex_count,
+				nrm_stride,
+				remap.ptr());
+	} else {
+		// Default normal = (0, 1, 0).
+		for (size_t i = 0; i < unique_vertex_count; ++i) {
+			remapped_nrms[i * 3 + 0] = 0.0f;
+			remapped_nrms[i * 3 + 1] = 1.0f;
+			remapped_nrms[i * 3 + 2] = 0.0f;
+		}
+	}
+
+	LocalVector<float> remapped_uvs;
+	remapped_uvs.resize(unique_vertex_count * 2);
+	if (has_uvs) {
+		meshopt_remapVertexBuffer(
+				remapped_uvs.ptr(),
+				uvs_in,
+				vertex_count,
+				uv_stride,
+				remap.ptr());
+	} else {
+		// Default UV = (0, 0).
+		memset(remapped_uvs.ptr(), 0, unique_vertex_count * 2 * sizeof(float));
+	}
 
 	// 3) Remap index buffer.
 	LocalVector<unsigned int> remapped_indices;
@@ -329,27 +389,96 @@ bool NaniteBuilder::preprocess_mesh(const PackedVector3Array &p_vertices, const 
 			index_count,
 			unique_vertex_count);
 
-	// 5) Optimize vertex fetch. This reorders the vertex buffer to match the
-	// access pattern of the index buffer and may shrink the unique vertex
-	// count if some vertices become unreferenced. The function returns the
-	// final vertex count actually used.
-	LocalVector<float> fetched_verts;
-	fetched_verts.resize(unique_vertex_count * 3); // upper bound; may shrink.
-	size_t final_vertex_count = meshopt_optimizeVertexFetch(
-			fetched_verts.ptr(),
+	// 5) Optimize vertex fetch via a remap table (Task 1.16.4). Using
+	// meshopt_optimizeVertexFetchRemap instead of meshopt_optimizeVertexFetch
+	// lets us apply the same reorder to all three attribute streams. The
+	// function may shrink the vertex count (drops unreferenced vertices).
+	LocalVector<unsigned int> fetch_remap;
+	fetch_remap.resize(unique_vertex_count);
+	size_t final_vertex_count = meshopt_optimizeVertexFetchRemap(
+			fetch_remap.ptr(),
 			remapped_indices.ptr(),
 			index_count,
+			unique_vertex_count);
+
+	// Reorder indices in place using fetch_remap.
+	meshopt_remapIndexBuffer(
+			remapped_indices.ptr(),
+			remapped_indices.ptr(),
+			index_count,
+			fetch_remap.ptr());
+
+	// Reorder each attribute stream using fetch_remap.
+	LocalVector<float> fetched_verts;
+	fetched_verts.resize(final_vertex_count * 3);
+	meshopt_remapVertexBuffer(
+			fetched_verts.ptr(),
 			remapped_verts.ptr(),
 			unique_vertex_count,
-			vertex_stride);
+			vertex_stride,
+			fetch_remap.ptr());
+
+	LocalVector<float> fetched_nrms;
+	fetched_nrms.resize(final_vertex_count * 3);
+	meshopt_remapVertexBuffer(
+			fetched_nrms.ptr(),
+			remapped_nrms.ptr(),
+			unique_vertex_count,
+			nrm_stride,
+			fetch_remap.ptr());
+
+	LocalVector<float> fetched_uvs;
+	fetched_uvs.resize(final_vertex_count * 2);
+	meshopt_remapVertexBuffer(
+			fetched_uvs.ptr(),
+			remapped_uvs.ptr(),
+			unique_vertex_count,
+			uv_stride,
+			fetch_remap.ptr());
 
 	// 6) Commit to member state.
 	m_verts_pos.resize(final_vertex_count * 3);
 	memcpy(m_verts_pos.ptr(), fetched_verts.ptr(), final_vertex_count * 3 * sizeof(float));
 
+	m_verts_nrm.resize(final_vertex_count * 3);
+	memcpy(m_verts_nrm.ptr(), fetched_nrms.ptr(), final_vertex_count * 3 * sizeof(float));
+
+	m_verts_uv.resize(final_vertex_count * 2);
+	memcpy(m_verts_uv.ptr(), fetched_uvs.ptr(), final_vertex_count * 2 * sizeof(float));
+
 	m_indices.resize(index_count);
 	memcpy(m_indices.ptr(), remapped_indices.ptr(), index_count * sizeof(unsigned int));
 
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// collect_materials — Task 1.16.3
+// Stage 1: single-surface ArrayMesh only. Reads surface 0's material, casts
+// to BaseMaterial3D, extracts albedo_color. Falls back to white (1,1,1,1)
+// when the material is null or not a BaseMaterial3D subclass. Always
+// produces exactly one entry in m_material_base_colors so the material_index
+// of every leaf/parent cluster (always 0) is valid.
+// ---------------------------------------------------------------------------
+bool NaniteBuilder::collect_materials(const Ref<ArrayMesh> &p_mesh) {
+	m_material_base_colors.clear();
+
+	if (p_mesh.is_null() || p_mesh->get_surface_count() == 0) {
+		// Defensive — should have been caught by build() earlier, but the
+		// helper is also independently testable. Emit white and succeed.
+		m_material_base_colors.push_back(Color(1.0f, 1.0f, 1.0f, 1.0f));
+		return true;
+	}
+
+	Color base_color(1.0f, 1.0f, 1.0f, 1.0f); // default albedo fallback
+	Ref<Material> mat = p_mesh->surface_get_material(0);
+	if (mat.is_valid()) {
+		BaseMaterial3D *bm3d = Object::cast_to<BaseMaterial3D>(mat.ptr());
+		if (bm3d != nullptr) {
+			base_color = bm3d->get_albedo();
+		}
+	}
+	m_material_base_colors.push_back(base_color);
 	return true;
 }
 
@@ -446,6 +575,7 @@ bool NaniteBuilder::build_leaf_clusters() {
 		c.triangle_offset = m.triangle_offset;
 		c.triangle_count = m.triangle_count;
 		c.group_id = 0; // L0 leaves.
+		c.material_index = 0; // Task 1.16.3 — Stage 1 single-material.
 		c.error = 0.0f; // Leaves have zero simplification error.
 		c.bounds = AABB(
 				Vector3(b.center[0] - b.radius, b.center[1] - b.radius, b.center[2] - b.radius),
@@ -873,12 +1003,13 @@ bool NaniteBuilder::build_hierarchy() {
 						vertex_stride);
 
 				NaniteCluster c;
-				c.vertex_offset = m.vertex_offset;
-				c.vertex_count = m.vertex_count;
-				c.triangle_offset = m.triangle_offset;
-				c.triangle_count = m.triangle_count;
-				c.group_id = parent_lod;
-				c.error = parent_error;
+			c.vertex_offset = m.vertex_offset;
+			c.vertex_count = m.vertex_count;
+			c.triangle_offset = m.triangle_offset;
+			c.triangle_count = m.triangle_count;
+			c.group_id = parent_lod;
+			c.material_index = 0; // Task 1.16.3 — Stage 1 single-material.
+			c.error = parent_error;
 				c.bounds = AABB(
 						Vector3(b.center[0] - b.radius, b.center[1] - b.radius, b.center[2] - b.radius),
 						Vector3(b.radius * 2.0f, b.radius * 2.0f, b.radius * 2.0f));
@@ -1300,84 +1431,46 @@ Ref<NaniteMeshResource> NaniteBuilder::finalize_resource() {
 	res.instantiate();
 	ERR_FAIL_COND_V(res.is_null(), Ref<NaniteMeshResource>());
 
-	// ---- 1) Vertex pool: meshopt_encodeVertexBuffer ----------------------
-	// Encode the m_verts_pos float pool (3 floats per vertex, tightly
-	// packed) into a meshopt vertex buffer. The encoded bytes are stored
-	// verbatim as the vertex_data blob.
+	// ---- 1) Vertex pool: raw stride-32 (Task 1.16.4) -------------------
+	// vertex_data is RAW (not meshopt-compressed) so the rasterize / material
+	// shaders can index it with a fixed stride. Layout per vertex (32 bytes):
+	//   float[3] position  (12 B)
+	//   float[3] normal    (12 B)
+	//   float[2] uv        (8 B)
+	// m_verts_pos / m_verts_nrm / m_verts_uv are parallel arrays that share
+	// the same dedup + fetch-optimize remap, so vertex i's attributes live at
+	// i*{3,3,2} in the respective arrays.
 	const size_t vertex_count = m_verts_pos.size() / 3;
-	const size_t vertex_stride = sizeof(float) * 3;
+	const size_t vertex_stride_32 = sizeof(float) * 8; // 3 + 3 + 2 = 32 bytes
 	PackedByteArray vertex_data;
+	vertex_data.resize(static_cast<int>(vertex_count * vertex_stride_32));
 	if (vertex_count > 0) {
-		const size_t bound = meshopt_encodeVertexBufferBound(vertex_count, vertex_stride);
-		LocalVector<unsigned char> encoded;
-		encoded.resize(bound);
-		const size_t encoded_size = meshopt_encodeVertexBuffer(
-				encoded.ptr(), bound,
-				m_verts_pos.ptr(), vertex_count, vertex_stride);
-		// Trim to actual encoded size and copy to PackedByteArray.
-		vertex_data.resize(static_cast<int>(encoded_size));
-		if (encoded_size > 0) {
-			memcpy(vertex_data.ptrw(), encoded.ptr(), encoded_size);
+		float *w = reinterpret_cast<float *>(vertex_data.ptrw());
+		for (size_t i = 0; i < vertex_count; ++i) {
+			float *rec = w + i * 8;
+			rec[0] = m_verts_pos[i * 3 + 0];
+			rec[1] = m_verts_pos[i * 3 + 1];
+			rec[2] = m_verts_pos[i * 3 + 2];
+			rec[3] = m_verts_nrm[i * 3 + 0];
+			rec[4] = m_verts_nrm[i * 3 + 1];
+			rec[5] = m_verts_nrm[i * 3 + 2];
+			rec[6] = m_verts_uv[i * 2 + 0];
+			rec[7] = m_verts_uv[i * 2 + 1];
 		}
 	}
 	res->set_vertex_data(vertex_data);
 
-	// ---- 2) Clusters: per-cluster metadata + meshopt_encodeMeshlet ------
-	// For each cluster we append:
-	//   - NaniteCluster::serialize() output (64 bytes — metadata: offsets,
-	//     counts, group_id, error, bounds, cone_axis, cone_cutoff)
-	//   - uint32 encoded_size (bytes of the meshopt_encodeMeshlet output)
-	//   - meshopt_encodeMeshlet output, zero-padded to 4-byte alignment
-	// The metadata is needed for runtime culling; the meshlet blob carries
-	// the encoded vertex indices + triangle micro-indices.
+	// ---- 2) Clusters: metadata only (Task 1.16.4) ----------------------
+	// clusters_data is the concatenation of NaniteCluster::serialize()
+	// output (68 bytes each — fixed stride). The meshopt-encoded meshlet
+	// geometry that used to be interleaved here was moved into
+	// meshlet_vertices_data + meshlet_triangles_data (Section 7) so the cull
+	// shader can index clusters as a fixed-stride array.
 	LocalVector<uint8_t> clusters_buf;
 	for (uint32_t ci = 0; ci < m_clusters.size(); ++ci) {
-		const NaniteCluster &cluster = m_clusters[ci];
-
-		// Metadata (64 bytes).
-		const PackedByteArray meta = cluster.serialize();
+		const PackedByteArray meta = m_clusters[ci].serialize();
 		for (int i = 0; i < meta.size(); ++i) {
 			clusters_buf.push_back(meta.ptr()[i]);
-		}
-
-		// Meshlet-encoded geometry.
-		if (cluster.vertex_count > 0 && cluster.triangle_count > 0 &&
-				cluster.vertex_offset + cluster.vertex_count <= m_meshlet_vertices.size() &&
-				static_cast<size_t>(cluster.triangle_offset) + static_cast<size_t>(cluster.triangle_count) * 3 <= m_meshlet_triangles.size()) {
-			const size_t bound = meshopt_encodeMeshletBound(cluster.vertex_count, cluster.triangle_count);
-			LocalVector<unsigned char> encoded;
-			encoded.resize(bound);
-			const size_t encoded_size = meshopt_encodeMeshlet(
-					encoded.ptr(), bound,
-					m_meshlet_vertices.ptr() + cluster.vertex_offset, cluster.vertex_count,
-					m_meshlet_triangles.ptr() + cluster.triangle_offset, cluster.triangle_count);
-			const uint32_t encoded_size_32 = static_cast<uint32_t>(encoded_size);
-
-			// Append encoded_size (uint32 little-endian).
-			clusters_buf.push_back(static_cast<uint8_t>((encoded_size_32 >> 0) & 0xFF));
-			clusters_buf.push_back(static_cast<uint8_t>((encoded_size_32 >> 8) & 0xFF));
-			clusters_buf.push_back(static_cast<uint8_t>((encoded_size_32 >> 16) & 0xFF));
-			clusters_buf.push_back(static_cast<uint8_t>((encoded_size_32 >> 24) & 0xFF));
-
-			// Append encoded bytes.
-			for (size_t i = 0; i < encoded_size; ++i) {
-				clusters_buf.push_back(encoded[i]);
-			}
-
-			// Pad to 4-byte alignment.
-			const uint32_t rem = static_cast<uint32_t>(encoded_size % 4);
-			if (rem != 0) {
-				const uint32_t pad = 4 - rem;
-				for (uint32_t i = 0; i < pad; ++i) {
-					clusters_buf.push_back(0);
-				}
-			}
-		} else {
-			// Defensive: cluster has no geometry — write a zero encoded_size.
-			clusters_buf.push_back(0);
-			clusters_buf.push_back(0);
-			clusters_buf.push_back(0);
-			clusters_buf.push_back(0);
 		}
 	}
 	PackedByteArray clusters_data;
@@ -1417,6 +1510,84 @@ Ref<NaniteMeshResource> NaniteBuilder::finalize_resource() {
 	res->set_cluster_count(static_cast<int>(m_clusters.size()));
 	res->set_node_count(static_cast<int>(m_nodes.size()));
 	res->set_page_count(static_cast<int>(page_table.pages.size()));
+
+	// ---- 6) Materials: Task 1.16.3 — encode materials_data blob ---------
+	// Layout (per material, 32 bytes = 2 × vec4, std430-friendly):
+	//   vec4 base_color (r, g, b, a)
+	//   vec4 metallic_roughness_pad (metallic, roughness, 0, 0)
+	// Stage 1 simplified: only base_color is consumed by the Lambert shader;
+	// metallic/roughness default to (0.0, 1.0) for a pure diffuse look. The
+	// pad bytes are zero. If collect_materials() produced no entries
+	// (defensive — should not happen), emit a single white material so
+	// shader sampling at material_index=0 never reads out of bounds.
+	if (m_material_base_colors.is_empty()) {
+		PackedByteArray fallback;
+		fallback.resize(32);
+		memset(fallback.ptrw(), 0, 32);
+		// base_color = (1,1,1,1)
+		float white[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+		memcpy(fallback.ptrw(), white, 16);
+		// metallic=0, roughness=1
+		float mr[2] = { 0.0f, 1.0f };
+		memcpy(fallback.ptrw() + 16, mr, 8);
+		res->set_materials_data(fallback);
+	} else {
+		// Each material = 32 bytes; total = count * 32.
+		const size_t mat_count = m_material_base_colors.size();
+		PackedByteArray materials_data;
+		materials_data.resize(static_cast<int>(mat_count * 32));
+		uint8_t *wptr = materials_data.ptrw();
+		memset(wptr, 0, mat_count * 32);
+		for (size_t i = 0; i < mat_count; ++i) {
+			const Color &c = m_material_base_colors[i];
+			float *slot = reinterpret_cast<float *>(wptr + i * 32);
+			slot[0] = c.r;
+			slot[1] = c.g;
+			slot[2] = c.b;
+			slot[3] = c.a;
+			// metallic=0, roughness=1, pad=0, pad=0
+			slot[4] = 0.0f;
+			slot[5] = 1.0f;
+			// slot[6], slot[7] left as zero from memset.
+		}
+		res->set_materials_data(materials_data);
+	}
+
+	// ---- 7) Meshlet vertex indices + triangle micro-indices (Task 1.16.4)
+	// meshlet_vertices_data: raw uint32[] — each entry is a global index into
+	//   vertex_data (0..vertex_count-1). A cluster's vertex_offset/vertex_count
+	//   indexes into this array directly.
+	// meshlet_triangles_data: raw uint8[] — each triangle consumes 3 bytes
+	//   (local vertex indices 0..255 into the cluster's own vertex range). A
+	//   cluster's triangle_offset is a BYTE offset into this array.
+	// Both pools are 4-byte aligned at the blob level so they can be uploaded
+	// as SSBOs without driver alignment warnings.
+	{
+		PackedByteArray mv_data;
+		const size_t mv_count = m_meshlet_vertices.size();
+		const size_t mv_bytes = mv_count * sizeof(unsigned int);
+		// Pad to 4-byte alignment.
+		const size_t mv_padded = (mv_bytes + 3u) & ~size_t(3);
+		mv_data.resize(static_cast<int>(mv_padded));
+		memset(mv_data.ptrw(), 0, mv_padded);
+		if (mv_count > 0) {
+			memcpy(mv_data.ptrw(), m_meshlet_vertices.ptr(), mv_bytes);
+		}
+		res->set_meshlet_vertices_data(mv_data);
+	}
+	{
+		PackedByteArray mt_data;
+		const size_t mt_count = m_meshlet_triangles.size();
+		const size_t mt_bytes = mt_count * sizeof(unsigned char);
+		// Pad to 4-byte alignment.
+		const size_t mt_padded = (mt_bytes + 3u) & ~size_t(3);
+		mt_data.resize(static_cast<int>(mt_padded));
+		memset(mt_data.ptrw(), 0, mt_padded);
+		if (mt_count > 0) {
+			memcpy(mt_data.ptrw(), m_meshlet_triangles.ptr(), mt_bytes);
+		}
+		res->set_meshlet_triangles_data(mt_data);
+	}
 
 	return res;
 }

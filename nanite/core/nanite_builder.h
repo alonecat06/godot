@@ -35,6 +35,7 @@
 #include "nanite_cluster.h"
 #include "nanite_resource.h" // NaniteMeshResource full type — needed for Ref<NaniteMeshResource> in build() / finalize_resource().
 
+#include "core/math/color.h"
 #include "core/object/ref_counted.h"
 #include "core/templates/local_vector.h"
 #include "core/variant/variant.h" // PackedInt32Array, PackedVector3Array typedefs
@@ -81,7 +82,17 @@ private:
 	Ref<BuilderConfig> m_cfg;
 
 	// Preprocessed vertex positions (3 floats per vertex, tightly packed).
+	// Used by meshopt meshlet building (bounds/cone computation).
 	LocalVector<float> m_verts_pos;
+
+	// Task 1.16.4 — preprocessed vertex normals (3 floats per vertex) and
+	// UVs (2 floats per vertex). These mirror m_verts_pos element-for-element
+	// (same dedup + fetch-optimize remap) so vertex i's position/normal/uv
+	// all live at offset i*{3,3,2}. finalize_resource interleaves them into
+	// the raw stride-32 vertex_data blob consumed by the rasterize/material
+	// shaders.
+	LocalVector<float> m_verts_nrm;
+	LocalVector<float> m_verts_uv;
 
 	// Preprocessed triangle-list indices (uint32 per index).
 	LocalVector<unsigned int> m_indices;
@@ -104,12 +115,26 @@ private:
 	// finalize_resource() can hand it off to NaniteMeshResource.
 	Ref<ArrayMesh> m_shadow_mesh;
 
+	// Task 1.16.3 — materials collected from the source ArrayMesh. Stage 1
+	// only processes surface 0, so this vector always has exactly 1 entry
+	// (the albedo color of surface 0's material, or white if no material).
+	// finalize_resource() encodes it into the materials_data blob consumed
+	// by nanite_material_resolve.glsl.
+	LocalVector<Color> m_material_base_colors;
+
 	// Pipeline stages. Each returns true on success.
-	bool preprocess_mesh(const PackedVector3Array &p_vertices, const PackedInt32Array &p_indices);
+	// Task 1.16.4 — p_normals/p_uvs are folded into the same dedup +
+	// fetch-optimize remap as positions. When empty (source mesh has no
+	// NORMAL/UV array), defaults are filled: normal=(0,1,0), uv=(0,0).
+	bool preprocess_mesh(const PackedVector3Array &p_vertices, const PackedInt32Array &p_indices, const PackedVector3Array &p_normals = PackedVector3Array(), const PackedVector2Array &p_uvs = PackedVector2Array());
 	bool build_leaf_clusters();
 	bool build_hierarchy();
 	bool build_bvh();
 	bool build_shadow_mesh(); // Task 0.7 — coarse LOD shadow mesh extraction.
+	// Task 1.16.3 — extracts base_color (albedo) from surface 0's material.
+	// Falls back to white (1,1,1,1) when the material is null or not a
+	// BaseMaterial3D. Always produces exactly one entry in m_material_base_colors.
+	bool collect_materials(const Ref<ArrayMesh> &p_mesh);
 	Ref<NaniteMeshResource> finalize_resource(); // Assembles the final NaniteMeshResource from m_clusters / m_nodes / m_meshlet_* / m_shadow_mesh.
 
 	// BVH assembly helpers (Task 0.5.2). Each returns an index into m_nodes.

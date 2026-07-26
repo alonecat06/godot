@@ -56,10 +56,35 @@ class NaniteMeshResource : public Resource {
 
 private:
 	// Encoded data blobs (all little-endian, 4-byte aligned internally).
-	PackedByteArray vertex_data; // meshopt_encodeVertexBuffer output
-	PackedByteArray clusters_data; // concatenation of NaniteCluster::serialize()
+	// Task 1.16.4 — vertex_data is RAW (not meshopt-compressed), stride 32 bytes
+	// per vertex: position.xyz (3f) + normal.xyz (3f) + uv.xy (2f) = 8 floats.
+	// Consumed directly by nanite_rasterize.glsl / nanite_material_resolve.glsl.
+	PackedByteArray vertex_data; // raw vertex pool (stride 32 B, see Task 1.16.4)
+	// Task 1.16.4 — clusters_data is ONLY NaniteCluster::serialize() output
+	// concatenated (fixed 68-byte stride). The variable-length meshopt-encoded
+	// meshlet geometry previously interleaved here was moved into
+	// meshlet_vertices_data + meshlet_triangles_data so the cull shader can
+	// index it as a fixed-stride array.
+	PackedByteArray clusters_data; // N × NaniteCluster::serialize() (68 B each)
 	PackedByteArray nodes_data; // concatenation of NaniteClusterNode::serialize()
 	PackedByteArray page_table_data; // PageTable::serialize() output
+
+	// Task 1.16.4 — meshlet vertex index pool (raw uint32 per entry). Each
+	// cluster's vertex_offset/vertex_count indexes into this array; each entry
+	// is a global index into vertex_data (0..vertex_count-1). 4-byte aligned.
+	PackedByteArray meshlet_vertices_data; // raw uint32[] (m_meshlet_vertices)
+	// Task 1.16.4 — meshlet triangle micro-index pool (raw uint8 per entry).
+	// Each cluster's triangle_offset is a BYTE offset into this array; each
+	// triangle consumes 3 bytes (local vertex indices 0..255 into the
+	// cluster's own vertex range). 4-byte aligned at the blob level.
+	PackedByteArray meshlet_triangles_data; // raw uint8[] (m_meshlet_triangles)
+
+	// Task 1.16.2 — materials blob consumed by nanite_material_resolve.glsl.
+	// Layout (per material, 32 bytes = 2 × vec4, std430-friendly):
+	//   vec4 base_color (r, g, b, a)
+	//   vec4 metallic_roughness_pad (metallic, roughness, 0, 0)
+	// Stage 1 simplified: emissive/IBL left to Stage 2+.
+	PackedByteArray materials_data;
 
 	Ref<ArrayMesh> shadow_mesh;
 	Ref<BuilderConfig> build_config;
@@ -82,6 +107,16 @@ public:
 	void set_page_table_data(const PackedByteArray &p_data);
 	PackedByteArray get_page_table_data() const;
 
+	// Task 1.16.4 — meshlet vertex index + triangle micro-index pools.
+	void set_meshlet_vertices_data(const PackedByteArray &p_data);
+	PackedByteArray get_meshlet_vertices_data() const;
+	void set_meshlet_triangles_data(const PackedByteArray &p_data);
+	PackedByteArray get_meshlet_triangles_data() const;
+
+	// Task 1.16.2 — materials_data blob (see layout comment above).
+	void set_materials_data(const PackedByteArray &p_data);
+	PackedByteArray get_materials_data() const;
+
 	void set_shadow_mesh(const Ref<ArrayMesh> &p_mesh);
 	Ref<ArrayMesh> get_shadow_mesh() const;
 
@@ -95,17 +130,28 @@ public:
 	void set_page_count(int p_count);
 	int get_page_count() const;
 
-	// .nanite binary format. Magic = "NANM" (4 bytes), Version = 1 (uint32).
-	// Layout:
+	// .nanite binary format. Magic = "NANM" (4 bytes), Version = 3 (uint32).
+	// Layout (v3, after Task 1.16.4):
 	//   char[4]   magic = "NANM"
-	//   uint32    version = 1
-	//   uint32    vertex_data_size, then vertex_data bytes
-	//   uint32    clusters_data_size, then clusters_data bytes
+	//   uint32    version = 3
+	//   uint32    vertex_data_size, then vertex_data bytes   (raw stride 32 B)
+	//   uint32    clusters_data_size, then clusters_data bytes (68 B per cluster)
 	//   uint32    nodes_data_size, then nodes_data bytes
 	//   uint32    page_table_data_size, then page_table_data bytes
+	//   uint32    materials_data_size, then materials_data bytes   (v2+)
+	//   uint32    meshlet_vertices_data_size, then bytes            (v3+)
+	//   uint32    meshlet_triangles_data_size, then bytes           (v3+)
 	//   uint32    cluster_count, node_count, page_count (trailer)
 	//   (build_config + shadow_mesh intentionally NOT included in .nanite;
 	//    they are Godot-side metadata only — re-build from source mesh if needed)
+	// Version history:
+	//   v1: original (NaniteCluster 64 B, no materials, meshopt-compressed
+	//       vertex_data, meshlet data interleaved into clusters_data).
+	//   v2: Task 1.16.1 — NaniteCluster 68 B (added material_index); Task 1.16.2
+	//       — added materials_data blob.
+	//   v3: Task 1.16.4 — vertex_data now raw (stride 32 B: pos+normal+uv);
+	//       clusters_data now metadata-only (fixed 68 B stride); meshlet
+	//       geometry moved to meshlet_vertices_data + meshlet_triangles_data.
 	Error save(const String &p_path) const;
 	Error load(const String &p_path);
 };

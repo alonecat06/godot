@@ -40,9 +40,10 @@ class NaniteMeshResource;
 // encoded blobs. Created by NaniteServer::register_mesh on first reference
 // and released when the ref count drops to zero.
 //
-// Stage 1: all four blobs are uploaded as static storage buffers (no
-// streaming). The material_rids array mirrors the resource's materials so
-// the material-resolve shader can indirect-address them.
+// Stage 1: all seven blobs (cluster + vertex + bvh + page + materials +
+// meshlet_vertices + meshlet_triangles) are uploaded as static storage
+// buffers (no streaming). The material_rids array mirrors the resource's
+// materials so the material-resolve shader can indirect-address them.
 class NaniteMeshData {
 	// Pure C++ class — no GDCLASS, no Object base.
 public:
@@ -50,13 +51,16 @@ public:
 	RID vertex_ssbo;
 	RID bvh_ssbo;
 	RID page_ssbo;
+	RID materials_ssbo; // Task 1.16.5 — materials_data blob (vec4 base_color + vec4 metallic_roughness_pad per material)
+	RID meshlet_vertices_ssbo; // Task 1.16.4 — raw uint32[] (global vertex indices into vertex_ssbo)
+	RID meshlet_triangles_ssbo; // Task 1.16.4 — raw uint8[] (local vertex indices 0..255 per triangle)
 
 	LocalVector<RID> material_rids;
 
 	int ref_count = 0;
 	bool gpu_uploaded = false;
 
-	// Uploads all 4 blobs + collects material RIDs.
+	// Uploads all 7 blobs + collects material RIDs.
 	// No-op if already uploaded.
 	void upload_to_gpu(RenderingDevice *p_rd, const NaniteMeshResource *p_resource);
 
@@ -68,6 +72,9 @@ public:
 	RID get_vertex_ssbo() const { return vertex_ssbo; }
 	RID get_bvh_ssbo() const { return bvh_ssbo; }
 	RID get_page_ssbo() const { return page_ssbo; }
+	RID get_materials_ssbo() const { return materials_ssbo; }
+	RID get_meshlet_vertices_ssbo() const { return meshlet_vertices_ssbo; }
+	RID get_meshlet_triangles_ssbo() const { return meshlet_triangles_ssbo; }
 	bool is_gpu_uploaded() const { return gpu_uploaded; }
 
 	NaniteMeshData() = default;

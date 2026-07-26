@@ -104,6 +104,11 @@ private:
 	// instance_map: ObjectID -> NaniteMeshInstance3D*.
 	HashMap<ObjectID, NaniteMeshInstance3D *> instance_map;
 
+	// Task 1.16.11 — per-instance world transforms, updated each frame by
+	// NaniteMeshInstance3D::_notification(NOTIFICATION_TRANSFORM_CHANGED).
+	// Keyed by ObjectID to match instance_map.
+	HashMap<ObjectID, Transform3D> instance_transforms;
+
 	int visible_cluster_count = 0;
 
 protected:
@@ -124,6 +129,12 @@ public:
 	void register_instance(NaniteMeshInstance3D *p_instance);
 	void unregister_instance(NaniteMeshInstance3D *p_instance);
 	int get_instance_count() const { return instance_map.size(); }
+
+	// Task 1.16.11 — per-instance world transform update. Called by
+	// NaniteMeshInstance3D::_notification(NOTIFICATION_TRANSFORM_CHANGED).
+	// Stores the transform in `instance_transforms` keyed by ObjectID; the
+	// next render_visibility / render_material_resolve will pick it up.
+	void update_instance_transform(NaniteMeshInstance3D *p_instance, const Transform3D &p_transform);
 
 	// Render callbacks (called by bridge).
 	void render_visibility(const RenderData *p_render_data);

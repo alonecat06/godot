@@ -55,9 +55,12 @@ public:
 	// float[16] (Projection/Transform3D::columns). They are uploaded to a
 	// uniform buffer internally because two mat4s (128 B) alone would fill the
 	// RenderingDevice push-constant budget (MAX_PUSH_CONSTANT_SIZE == 128).
+	// model_matrix (Task 1.16.6) is the per-instance world transform, uploaded
+	// via push constant (column-major float[16]).
 	struct CullParams {
 		float view_matrix[16];
 		float projection[16];
+		float model_matrix[16]; // Task 1.16.6 — per-instance world transform
 		int screen_size[2];
 		float error_threshold;
 		uint32_t bvh_node_count;
@@ -112,7 +115,9 @@ public:
 	// Runs the rasterize pass over the visible clusters. p_visible_count is the
 	// number of entries written by the preceding dispatch_cull (read back by
 	// the caller; the simplified Stage 1 cull emits exactly cluster_count).
-	void dispatch_rasterize(RenderingDevice *p_rd, const RID &p_visible_buffer, uint32_t p_visible_count, const NaniteMeshData *p_mesh_data);
+	// p_model_matrix (Task 1.16.6) is the per-instance world transform
+	// (column-major float[16]); pass nullptr to use identity.
+	void dispatch_rasterize(RenderingDevice *p_rd, const RID &p_visible_buffer, uint32_t p_visible_count, const NaniteMeshData *p_mesh_data, const float *p_model_matrix);
 
 	// Rebuilds the HZB pyramid from the rasterize depth output. Delegates to
 	// the embedded NaniteHZB.
@@ -123,8 +128,10 @@ public:
 	// debug-mode-specific color (or Stage 1 placeholder gray for NONE) into
 	// the internal color_buffer. p_debug_mode is a NaniteDebug::DebugMode
 	// value cast to int. If p_vis_buffer is invalid the pipeline's internal
-	// vis_buffer is used (caller convenience).
-	void dispatch_material_resolve(RenderingDevice *p_rd, const RID &p_vis_buffer, const NaniteMeshData *p_mesh_data, int p_debug_mode);
+	// vis_buffer is used (caller convenience). p_model_matrix (Task 1.16.6)
+	// is the per-instance world transform (column-major float[16]); pass
+	// nullptr to use identity (only used by NONE-mode Lambert shading).
+	void dispatch_material_resolve(RenderingDevice *p_rd, const RID &p_vis_buffer, const NaniteMeshData *p_mesh_data, int p_debug_mode, const float *p_model_matrix);
 
 	NaniteHZB *get_hzb() { return &hzb; }
 	RID get_vis_buffer() const { return vis_buffer; }

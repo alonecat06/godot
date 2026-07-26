@@ -99,8 +99,15 @@ void NaniteServer::init() {
 	(void)active_bridge;
 #endif
 
-	// gpu_pipeline is left nullptr until Task 1.5 wires up the real
-	// GPU raster pipeline; do NOT call gpu_pipeline->init(rd) here yet.
+	// Task 1.5 / 1.16.11 — create + initialize the GPU pipeline when a
+	// RenderingDevice is available. Headless/test runs without a Vulkan
+	// backend leave gpu_pipeline nullptr; render_visibility /
+	// render_material_resolve early-out on the null check.
+	RenderingDevice *rd = RenderingDevice::get_singleton();
+	if (rd) {
+		gpu_pipeline = memnew(NaniteGPUPipeline);
+		gpu_pipeline->init(rd);
+	}
 }
 
 void NaniteServer::finish() {
@@ -113,7 +120,10 @@ void NaniteServer::finish() {
 		debug = nullptr;
 	}
 	if (gpu_pipeline) {
-		// TODO Task 1.5: gpu_pipeline->finish();
+		RenderingDevice *rd = RenderingDevice::get_singleton();
+		if (rd) {
+			gpu_pipeline->cleanup(rd);
+		}
 		memdelete(gpu_pipeline);
 		gpu_pipeline = nullptr;
 	}
@@ -208,12 +218,28 @@ void NaniteServer::register_instance(NaniteMeshInstance3D *p_instance) {
 	// NaniteMeshInstance3D is forward-declared, so cast to its Object
 	// base to reach get_instance_id(). This is safe because every
 	// NaniteMeshInstance3D (Task 1.8) will derive from Object.
-	instance_map[((Object *)p_instance)->get_instance_id()] = p_instance;
+	ObjectID oid = ((Object *)p_instance)->get_instance_id();
+	instance_map[oid] = p_instance;
+	// Seed the transform cache with identity so render_visibility never
+	// reads an uninitialized entry before the first TRANSFORM_CHANGED.
+	instance_transforms[oid] = Transform3D();
 }
 
 void NaniteServer::unregister_instance(NaniteMeshInstance3D *p_instance) {
 	ERR_FAIL_NULL(p_instance);
-	instance_map.erase(((Object *)p_instance)->get_instance_id());
+	ObjectID oid = ((Object *)p_instance)->get_instance_id();
+	instance_map.erase(oid);
+	instance_transforms.erase(oid);
+}
+
+void NaniteServer::update_instance_transform(NaniteMeshInstance3D *p_instance, const Transform3D &p_transform) {
+	ERR_FAIL_NULL(p_instance);
+	// Only cache the transform if the instance is currently registered —
+	// avoids filling the map with entries for nodes that aren't in tree.
+	ObjectID oid = ((Object *)p_instance)->get_instance_id();
+	if (instance_map.has(oid)) {
+		instance_transforms[oid] = p_transform;
+	}
 }
 
 void NaniteServer::render_visibility(const RenderData *p_render_data) {
@@ -226,46 +252,104 @@ void NaniteServer::render_visibility(const RenderData *p_render_data) {
 		return;
 	}
 
-	// Stage 1: drive a single mesh through the GPU pipeline. Multi-mesh
-	// iteration is a Stage 2 concern; for now use the first mesh in mesh_map.
-	HashMap<const NaniteMeshResource *, MeshEntry>::Iterator it = mesh_map.begin();
-	if (!it) {
-		return;
-	}
-	NaniteMeshData *md = it->value.data;
-	if (!md || !md->is_gpu_uploaded()) {
-		return;
-	}
-
 	// Stage 1: identity camera + fixed screen size. The bridge will provide
 	// real view/projection matrices and the render-target size in a later
 	// task; for now use identity so dispatches don't crash.
-	NaniteGPUPipeline::CullParams params;
 	static const float identity[16] = {
 		1, 0, 0, 0,
 		0, 1, 0, 0,
 		0, 0, 1, 0,
 		0, 0, 0, 1
 	};
-	memcpy(params.view_matrix, identity, sizeof(identity));
-	memcpy(params.projection, identity, sizeof(identity));
-	params.screen_size[0] = 1280; // TODO: from render_data->get_render_scene_buffers()
-	params.screen_size[1] = 720;
-	params.error_threshold = 0.01f;
-	params.bvh_node_count = 1; // Stage 1: BVH traversal not yet implemented
-	params.cluster_count = it->key->get_cluster_count();
-	if (params.cluster_count == 0) {
-		return;
+
+	// Stage 1: fixed screen size. The bridge will provide the real
+	// render-target size in a later task; for now use a constant so
+	// ensure_screen_buffers + dispatches don't crash.
+	const int screen_w = 1280;
+	const int screen_h = 720;
+	gpu_pipeline->ensure_screen_buffers(rd, screen_w, screen_h);
+
+	// Reset accumulated visible-cluster count. Each instance's dispatch
+	// returns the cull's visible_count, which is added to this counter.
+	visible_cluster_count = 0;
+
+	// Task 1.16.11 — iterate every registered instance. Each instance
+	// independently drives dispatch_cull + dispatch_rasterize with its own
+	// model_matrix. Multiple instances referencing the same NaniteMeshResource
+	// share a single NaniteMeshData (ref-counted in mesh_map) — we just look
+	// it up via the resource pointer rather than re-uploading.
+	bool any_rasterized = false;
+	for (const KeyValue<ObjectID, NaniteMeshInstance3D *> &E : instance_map) {
+		NaniteMeshInstance3D *inst = E.value;
+		if (!inst) {
+			continue;
+		}
+		// Resolve the instance's mesh RID → resource → mesh_map entry.
+		RID mesh_rid = inst->get_nanite_mesh_rid();
+		if (mesh_rid.is_null()) {
+			continue;
+		}
+		const NaniteMeshResource *res = mesh_rid_owner.get_or_null(mesh_rid);
+		if (!res) {
+			continue;
+		}
+		HashMap<const NaniteMeshResource *, MeshEntry>::Iterator mit = mesh_map.find(res);
+		if (!mit || !mit->value.data || !mit->value.data->is_gpu_uploaded()) {
+			continue;
+		}
+		NaniteMeshData *md = mit->value.data;
+
+		const int cluster_count = res->get_cluster_count();
+		if (cluster_count == 0) {
+			continue;
+		}
+
+		// Per-instance transform: column-major float[16] from Transform3D.
+		// Godot's Basis stores rows[3] where each row is a local axis vector
+		// (rows[0] = X axis, rows[1] = Y axis, rows[2] = Z axis expressed in
+		// world coords). For a column-major GLSL mat4 each axis becomes a
+		// column, so model_matrix[col*4 + row] = basis.rows[col][row].
+		// Translation lives in Transform3D::origin → model_matrix[12..14].
+		Transform3D tr = instance_transforms.has(E.key) ? instance_transforms[E.key] : Transform3D();
+		float model_matrix[16];
+		const Basis &b = tr.basis;
+		const Vector3 &o = tr.origin;
+		// Column-major (matches GLSL mat4 layout). Columns 0..2 = basis
+		// columns, column 3 = translation.
+		model_matrix[0] = b.rows[0].x; model_matrix[1] = b.rows[0].y; model_matrix[2] = b.rows[0].z; model_matrix[3] = 0.0f;
+		model_matrix[4] = b.rows[1].x; model_matrix[5] = b.rows[1].y; model_matrix[6] = b.rows[1].z; model_matrix[7] = 0.0f;
+		model_matrix[8] = b.rows[2].x; model_matrix[9] = b.rows[2].y; model_matrix[10] = b.rows[2].z; model_matrix[11] = 0.0f;
+		model_matrix[12] = o.x; model_matrix[13] = o.y; model_matrix[14] = o.z; model_matrix[15] = 1.0f;
+
+		NaniteGPUPipeline::CullParams params;
+		memcpy(params.view_matrix, identity, sizeof(identity));
+		memcpy(params.projection, identity, sizeof(identity));
+		memcpy(params.model_matrix, model_matrix, sizeof(model_matrix));
+		params.screen_size[0] = screen_w;
+		params.screen_size[1] = screen_h;
+		params.error_threshold = 0.01f;
+		params.bvh_node_count = 1; // Stage 1: BVH traversal not yet implemented (per-cluster parallel cull)
+		params.cluster_count = cluster_count;
+
+		RID visible_buffer = gpu_pipeline->dispatch_cull(rd, params, md);
+		if (!visible_buffer.is_valid()) {
+			continue;
+		}
+		// Stage 1 simplification: dispatch rasterize with cluster_count as
+		// the visible_count upper bound. The rasterize shader's push
+		// constant `visible_count` is used for the early-out bounds check
+		// (`if (tid >= params.visible_count) return;`), so threads beyond
+		// the actual visible list return early without reading uninitialized
+		// memory. Stage 2 will read back the real visible_count via
+		// buffer_get_data(visible_count_buffer) to avoid wasted threads.
+		gpu_pipeline->dispatch_rasterize(rd, visible_buffer, cluster_count, md, model_matrix);
+		any_rasterized = true;
+		visible_cluster_count += cluster_count;
 	}
 
-	gpu_pipeline->ensure_screen_buffers(rd, params.screen_size[0], params.screen_size[1]);
-	RID visible_buffer = gpu_pipeline->dispatch_cull(rd, params, md);
-	if (visible_buffer.is_valid()) {
-		// Stage 1 cull emits cluster_count as visible_count (pass-through).
-		gpu_pipeline->dispatch_rasterize(rd, visible_buffer, params.cluster_count, md);
+	if (any_rasterized) {
 		gpu_pipeline->dispatch_hzb_build(rd, gpu_pipeline->get_depth_buffer());
 	}
-	visible_cluster_count = params.cluster_count;
 }
 
 void NaniteServer::render_material_resolve(const RenderData *p_render_data) {
@@ -277,20 +361,49 @@ void NaniteServer::render_material_resolve(const RenderData *p_render_data) {
 	if (!rd || !gpu_pipeline->is_initialized()) {
 		return;
 	}
-	// Stage 1: dispatch material resolve using the pipeline's internal
-	// vis_buffer + color_buffer. For multi-mesh, we'd loop over mesh_map;
-	// for now use the first mesh_data. (Stage 2 will properly iterate
-	// instances + meshes.)
-	HashMap<const NaniteMeshResource *, MeshEntry>::Iterator it = mesh_map.begin();
-	if (!it) {
-		return;
-	}
-	NaniteMeshData *md = it->value.data;
-	if (!md || !md->is_gpu_uploaded()) {
-		return;
-	}
 	int debug_mode = debug ? (int)debug->get_mode_enum() : 0;
-	gpu_pipeline->dispatch_material_resolve(rd, gpu_pipeline->get_vis_buffer(), md, debug_mode);
+
+	// Task 1.16.11 — iterate instances. Material resolve re-projects each
+	// instance's triangles via the model_matrix push constant to compute
+	// barycentric coordinates in screen space. The vis_buffer is shared
+	// (one image per screen), so we resolve the first instance for now;
+	// proper multi-instance composition (per-instance vis layers) is a
+	// Stage 2 concern. Stage 1 still drives dispatch_material_resolve per
+	// instance so each instance's model_matrix is applied.
+	for (const KeyValue<ObjectID, NaniteMeshInstance3D *> &E : instance_map) {
+		NaniteMeshInstance3D *inst = E.value;
+		if (!inst) {
+			continue;
+		}
+		RID mesh_rid = inst->get_nanite_mesh_rid();
+		if (mesh_rid.is_null()) {
+			continue;
+		}
+		const NaniteMeshResource *res = mesh_rid_owner.get_or_null(mesh_rid);
+		if (!res) {
+			continue;
+		}
+		HashMap<const NaniteMeshResource *, MeshEntry>::Iterator mit = mesh_map.find(res);
+		if (!mit || !mit->value.data || !mit->value.data->is_gpu_uploaded()) {
+			continue;
+		}
+		NaniteMeshData *md = mit->value.data;
+
+		Transform3D tr = instance_transforms.has(E.key) ? instance_transforms[E.key] : Transform3D();
+		float model_matrix[16];
+		const Basis &b = tr.basis;
+		const Vector3 &o = tr.origin;
+		model_matrix[0] = b.rows[0].x; model_matrix[1] = b.rows[0].y; model_matrix[2] = b.rows[0].z; model_matrix[3] = 0.0f;
+		model_matrix[4] = b.rows[1].x; model_matrix[5] = b.rows[1].y; model_matrix[6] = b.rows[1].z; model_matrix[7] = 0.0f;
+		model_matrix[8] = b.rows[2].x; model_matrix[9] = b.rows[2].y; model_matrix[10] = b.rows[2].z; model_matrix[11] = 0.0f;
+		model_matrix[12] = o.x; model_matrix[13] = o.y; model_matrix[14] = o.z; model_matrix[15] = 1.0f;
+
+		gpu_pipeline->dispatch_material_resolve(rd, gpu_pipeline->get_vis_buffer(), md, debug_mode, model_matrix);
+		// Stage 1 single-pass: one dispatch per instance is enough since
+		// vis_buffer is shared. Break after the first so we don't overwrite
+		// the color_buffer with a second instance's model_matrix.
+		break;
+	}
 }
 
 void NaniteServer::set_debug_mode(int p_mode) {

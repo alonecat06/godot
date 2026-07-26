@@ -40,6 +40,7 @@ PackedByteArray NaniteCluster::serialize() const {
 	w.write_uint32(triangle_offset);
 	w.write_uint32(triangle_count);
 	w.write_uint32(group_id);
+	w.write_uint32(material_index); // Task 1.16.1
 	w.write_real(error);
 
 	// AABB: position.xyz then size.xyz
@@ -71,6 +72,7 @@ NaniteCluster NaniteCluster::deserialize(const PackedByteArray &p_data, uint32_t
 	c.triangle_offset = r.read_uint32();
 	c.triangle_count = r.read_uint32();
 	c.group_id = r.read_uint32();
+	c.material_index = r.read_uint32(); // Task 1.16.1
 	c.error = r.read_real();
 
 	c.bounds.position.x = r.read_real();
@@ -91,7 +93,10 @@ NaniteCluster NaniteCluster::deserialize(const PackedByteArray &p_data, uint32_t
 }
 
 size_t NaniteCluster::get_serialized_size() {
-	// 5 × uint32 + 1 × float (error) + 6 × float (AABB) + 3 × float (cone_axis)
-	// + 1 × float (cone_cutoff) = 20 + 4 + 24 + 12 + 4 = 64 bytes.
-	return 64;
+	// 6 × uint32 (vertex_offset, vertex_count, triangle_offset, triangle_count,
+	//             group_id, material_index)
+	// + 1 × float (error) + 6 × float (AABB) + 3 × float (cone_axis)
+	// + 1 × float (cone_cutoff)
+	// = 24 + 4 + 24 + 12 + 4 = 68 bytes (Task 1.16.1 bumped from 64 → 68).
+	return 68;
 }
