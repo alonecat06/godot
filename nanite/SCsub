@@ -11,8 +11,11 @@ env_nanite.Append(CPPDEFINES=["GODOT_MODULE"])
 # meshoptimizer C API (vertex remap, meshlets, simplification, encoding).
 env_nanite.Append(CPPPATH=["#thirdparty/meshoptimizer"])
 
-# Self-include path so `#include "core/..."` resolves from nanite/.
-env_nanite.Append(CPPPATH=["#nanite"])
+# Note: nanite sources use `#include "nanite/core/..."` etc. (absolute from
+# repo root) so no per-module CPPPATH is needed. This also fixes IntelliSense
+# in the generated VS solution, which previously couldn't resolve the
+# `core/...` / `gpu/...` paths because the engine itself has a top-level
+# `core/` directory that shadowed them.
 
 # Stage 1 bridge compile switch: define NANITE_BRIDGE_GDEXT when gdext or all.
 nanite_bridge = env["nanite_bridge"]
