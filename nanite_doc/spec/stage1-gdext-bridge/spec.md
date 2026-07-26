@@ -371,7 +371,173 @@ Stage 0 的 `NaniteMeshResource` 已有 `materials` 字段但未暴露。Stage 1
 
 ## REMOVED Requirements
 
-（本阶段不删除任何已有需求。）
+### Requirement: Cull / Rasterize / MaterialResolve 占位实现
+
+**Reason**: Stage 1 框架已验证，占位 pass-through / 每线程写固定像素 / 固定灰输出不再需要
+**Migration**: 由下方"补完：真实 Nanite 渲染"section 的完整算法实现替代
+
+---
+
+## 补完：真实 Nanite 渲染（替代占位实现）
+
+### Why
+
+Stage 1 最初的四个 Pass 框架已完整跑通（PRE_OPAQUE → Cull → Rasterize → HZB Build → POST_OPAQUE → MaterialResolve），但 Cull / Rasterize / MaterialResolve 三个 shader 都是占位实现（Cull pass-through 全可见 / Rasterize 每线程写一个像素 / MaterialResolve 输出固定灰），只有 HZB downsample 是真实算法。这导致 Stage 1 不能真正"渲染"任何 Nanite 网格 —— 用户放置 `NaniteMeshInstance3D` 后只能看到引擎原生阴影 mesh，看不到 Nanite 输出。
+
+`nanite-overall-design.md` 10.5 节虽将此列为偏差写入"留待 Stage 2"，但 Stage 2 tasks 实际只覆盖 Module 桥接 + 动态 GPU 阴影，不包含完整 culling/rasterize 任务，造成文档自相矛盾。
+
+本 section 在 Stage 1 内补完真实 Nanite 渲染，让 Stage 1 真正可渲染可见 `NaniteMeshInstance3D`。
+
+### What Changes
+
+- **MODIFIED** `nanite/shaders/nanite_cull.glsl` — 完整实现 BVH 遍历、视锥剔除、背面剔除、HZB 遮挡剔除、LOD 选择
+- **MODIFIED** `nanite/shaders/nanite_rasterize.glsl` — 完整实现 meshlet 解码、三角形软光栅化、深度测试、VisBuffer 写入
+- **MODIFIED** `nanite/shaders/nanite_material_resolve.glsl` — 实现真实 barycentric 插值、简单 lambert + 调试模式
+- **MODIFIED** `nanite/core/nanite_cluster.h/.cpp` — 新增 `material_index` 字段
+- **MODIFIED** `nanite/core/nanite_resource.h/.cpp` — 暴露 `get_materials()` / `set_materials()` + `materials_data` blob
+- **MODIFIED** `nanite/core/nanite_builder.h/.cpp` — 构建阶段收集材质信息（每个 cluster 的 `material_index`）写入 resource
+- **MODIFIED** `nanite/gpu/nanite_mesh_data.h/.cpp` — 上传 `materials_ssbo` + 扩展 `vertex_ssbo` 布局（含法线/UV）
+- **MODIFIED** `nanite/gpu/nanite_gpu_pipeline.h/.cpp` — `dispatch_material_resolve` 绑定 `materials_ssbo` + `vertex_ssbo`；push constant 扩展 `model_matrix`
+- **MODIFIED** `nanite/core/nanite_server.h/.cpp` — 多实例支持（遍历 instance_map，per-mesh dispatch，per-instance model_matrix）
+- **MODIFIED** `nanite/scene/nanite_mesh_instance_3d.h/.cpp` — `_notification(TRANSFORM_CHANGED)` 上报 transform；`ENTER_TREE` 阻断引擎原生 mesh 渲染
+- **MODIFIED** `nanite_doc/nanite-overall-design.md` 10.5 节 — 更新 S1-05/S1-06/S1-07 状态为"已补完"
+- **MODIFIED** `nanite_doc/nanite-implementation-tasks.md` Stage 1 Task 1.5 / 1.11 — 删除"留待 Stage 2"措辞，标注为"已补完"
+
+### 关键设计决策
+
+#### 决策 1：Cull shader 采用 per-cluster parallel（而非 BVH 栈式遍历）
+
+- **方案**：每个 GPU thread 处理一个 cluster，直接做视锥/背面/HZB 测试 + LOD 选择
+- **理由**：BVH 栈式遍历需要工作队列 + atomic 操作，复杂度高且 GPU 占用低；per-cluster parallel 直接 `dispatch_threads(cluster_count)`，每个 thread 独立判断
+- **LOD 选择简化**：stage 1 用"如果 cluster.error > error_threshold 则用其 parent 替代"的逻辑，不做完整 BVH 自顶向下选择
+- **后续**：Stage 2 可改为完整 BVH 栈式遍历
+
+#### 决策 2：Rasterize shader 全软光栅化（Stage 1 不做硬件光栅混合）
+
+- **方案**：每个 GPU thread 处理一个 cluster 的所有三角形，对每个三角形做 2D 重心坐标测试 + 深度插值 + 非原子 compare-then-store 深度测试
+- **理由**：硬件光栅混合路径需要 dual-vertex-buffer + 索引重映射，复杂度高；全软光栅化虽慢但简单可靠
+- **深度测试实现细节**：Stage 1 因 `DATA_FORMAT_R32_SFLOAT` 不支持 `imageAtomicCompSwap`，简化为 `imageLoad(depth_buffer, pos).r` 比较后 `imageStore` 的非原子路径；race-safe 由"last writer wins per pixel"语义保证（多个 cluster 写同一像素时，最终结果必为某个有效三角形，不会出现垃圾）。Stage 2 可改 `R32_UINT` + `imageAtomicCompSwap` 路径获得严格深度排序
+- **后续**：Stage 2 可加入大三角硬件光栅路径
+
+#### 决策 3：Material Resolve 使用简单 Lambert + 调试模式
+
+- **方案**：NONE 模式 = Lambert + 单方向光（hardcoded）+ 环境光；其他调试模式保持现有 hash_color 等逻辑
+- **理由**：完整 PBR 需要 BRDF + IBL + 多光源，超出 Stage 1 范围；简单 Lambert 足以验证 VisBuffer 解码 + barycentric 插值正确性
+- **后续**：Stage 2+ 接入引擎材质系统
+
+#### 决策 4：材质数据上传格式
+
+- `materials_ssbo`：每个材质 = `vec4 base_color + vec4 emissive + float metallic + float roughness + vec2 _pad`（32 字节）
+- `vertex_ssbo` 当前布局是 `vec4[]`（position.xyz + 1 pad），需改为 stride 8 floats（position.xyz + normal.xyz + uv.xy，32 字节/顶点）
+- **Stage 0 限制**：`NaniteBuilder` 当前只写 position，不写 normal/UV，所以 stage 1 先用 hardcoded 法线（`vec3(0,1,0)`）+ UV=(0,0)，让 `materials_ssbo` 仅含 `base_color`
+
+#### 决策 5：多实例 per-mesh dispatch
+
+- `NaniteServer::render_visibility` 遍历 `instance_map`，对每个实例的 mesh resource 调用一次 `dispatch_cull + dispatch_rasterize`
+- 实例 transform（model matrix）通过 push constant 传入（每实例一次 dispatch）
+- push constant 扩展：增加 `mat4 model_matrix`（64 字节，cull push constant 44 + 64 = 108 ≤ 128 OK；rasterize 16 + 64 = 80 OK）
+
+### ADDED Requirements
+
+#### Requirement: Cull Shader 真实剔除
+
+系统 SHALL 实现 `nanite_cull.glsl` 的真实剔除逻辑，使每个 cluster 经过 BVH-aware 测试后只输出真正可见的 cluster。
+
+##### Scenario: 视锥内的 cluster 被保留
+
+- **WHEN** cluster 的 AABB 经 model + view + projection 变换后落在视锥内
+- **THEN** 该 cluster 被写入 `visible_clusters_buffer`
+- **AND** `visible_count` 递增
+
+##### Scenario: 视锥外的 cluster 被剔除
+
+- **WHEN** cluster 的 AABB 完全落在视锥外
+- **THEN** 该 cluster 不被写入 `visible_clusters_buffer`
+
+##### Scenario: 背面 cluster 被剔除
+
+- **WHEN** cluster 的 normal cone 朝向远离相机
+- **THEN** 该 cluster 不被写入 `visible_clusters_buffer`
+
+##### Scenario: LOD 选择
+
+- **WHEN** cluster.error > error_threshold 且 cluster 的 parent 存在
+- **THEN** 使用 parent cluster 替代（输出 parent 的 cluster_id）
+
+#### Requirement: Rasterize Shader 软光栅化
+
+系统 SHALL 实现 `nanite_rasterize.glsl` 的软光栅化逻辑，使每个可见 cluster 的三角形被正确写入 VisBuffer + depth buffer。
+
+##### Scenario: 三角形覆盖像素被写入
+
+- **WHEN** 像素中心落在三角形内（重心坐标全为正）
+- **THEN** 该像素的 VisBuffer 被写入 `(cluster_id << 8 | triangle_id)`
+- **AND** 该像素的 depth_buffer 被写入插值深度
+- **AND** 深度更近的覆盖优先（Stage 1 实现为非原子 compare-then-store：`imageLoad` 比较后 `imageStore`；race-safe 由"last writer wins per pixel"语义保证）
+
+##### Scenario: 三角形外的像素不被写入
+
+- **WHEN** 像素中心落在三角形外
+- **THEN** 该像素的 VisBuffer / depth_buffer 不被修改
+
+#### Requirement: Material Resolve 真实着色
+
+系统 SHALL 实现 `nanite_material_resolve.glsl` 的真实着色逻辑，使 VisBuffer 被解码为带光照的 color buffer。
+
+##### Scenario: NONE 模式输出 Lambert 着色
+
+- **WHEN** debug_mode == 0 (NONE)
+- **THEN** 像素输出 Lambert 漫反射 + 环境光
+- **AND** 法线通过 barycentric 插值（stage 1 用 hardcoded `vec3(0,1,0)`）
+
+##### Scenario: 调试模式输出对应可视化
+
+- **WHEN** debug_mode == 1 (CLUSTER_SOLID_COLOR)
+- **THEN** 像素输出 cluster_id 的 hash_color
+- **WHEN** debug_mode == 2 (LOD_SOLID_COLOR)
+- **THEN** 像素输出 LOD 深度的 heat_color
+
+#### Requirement: 多实例渲染
+
+系统 SHALL 支持多个 `NaniteMeshInstance3D` 同时渲染，每个实例独立 dispatch。
+
+##### Scenario: 多实例独立渲染
+
+- **WHEN** 场景中有 2 个 `NaniteMeshInstance3D`（不同 mesh 或不同 transform）
+- **THEN** 两个实例都被正确渲染到 color_buffer
+- **AND** 不出现深度冲突或 VisBuffer 覆盖错误
+
+#### Requirement: 阻断引擎原生 mesh 渲染
+
+系统 SHALL 在 `NaniteMeshInstance3D` 进入 SceneTree 时阻断引擎原生 mesh 渲染，避免双重渲染。
+
+##### Scenario: nanite_enabled 时隐藏引擎 mesh
+
+- **WHEN** `NaniteMeshInstance3D::set_nanite_enabled(true)` 且节点 ENTER_TREE
+- **THEN** 引擎原生 mesh 不可见（`set_mesh(null)` 或 `instance_set_visible(false)`）
+- **AND** Nanite GPU 管线输出可见
+
+### MODIFIED Requirements
+
+#### Requirement: NaniteMeshResource 材质访问器
+
+Stage 0 的 `NaniteMeshResource` 已有 `materials` 字段但未暴露。补完：
+
+- `NaniteMeshResource` SHALL 暴露 `materials_data` 属性（`PackedByteArray`，编码的材质 blob）
+- `NaniteMeshResource` SHALL 暴露 `get_materials() -> Array`（返回 base_color 数组）
+- `NaniteMeshData::upload_to_gpu` SHALL 上传 `materials_ssbo`
+
+#### Requirement: NaniteGPUPipeline per-mesh uniform set
+
+`dispatch_material_resolve` SHALL 绑定 `materials_ssbo`（binding 3）+ `vertex_ssbo`（binding 4，含 normal/uv）。
+
+#### Requirement: NaniteCluster material_index 字段
+
+`NaniteCluster` SHALL 包含 `uint32_t material_index` 字段，由 `NaniteBuilder` 在构建阶段写入。
+
+#### Requirement: VertexSSBO 布局扩展
+
+`NaniteBuilder::encode_vertex_buffer` SHALL 输出 stride 8 floats 的顶点数据（position.xyz + normal.xyz + uv.xy，32 字节/顶点）。
 
 ---
 

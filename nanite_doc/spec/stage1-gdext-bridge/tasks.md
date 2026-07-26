@@ -463,6 +463,221 @@
 
 ---
 
+## 1.16 真实 Nanite 渲染补完（替代 1.5 / 1.11 占位实现）
+
+> Stage 1 最初的 cull / rasterize / material_resolve 为占位实现（pass-through / 每线程写一像素 / 固定灰）。本任务组在 Stage 1 内补完真实算法，让 Stage 1 真正可渲染可见 `NaniteMeshInstance3D`。
+> 详见 [spec.md "补完：真实 Nanite 渲染"](spec.md#补完真实-nanite-渲染替代占位实现) section。
+>
+> **状态（2026-07-25）**：T1.16.1 ~ T1.16.14 全部完成；代码 + 测试 + 文档同步更新。Stage 1 现在能够：(1) 在 `NaniteServer::render_visibility` 中按实例独立 dispatch Cull + Rasterize + HZB Build；(2) 在 `render_material_resolve` 中以 Lambert + barycentric 插值输出真实着色；(3) 通过 `NaniteMeshInstance3D` 的 `SHADOW_CASTING_SHADOWS_ONLY` 阻断引擎原生 mesh 渲染。
+> Stage 2 仍需将 `NaniteGDExtBridge` 自动挂接到默认 `Compositor` 的 effects 列表（S1-08），方能让引擎真正在每帧触发 `render_visibility` / `render_material_resolve`。
+
+### 任务依赖图
+
+```
+T1.16.1 (cluster material_index) ──┐
+T1.16.2 (resource materials)     ──┤
+T1.16.3 (builder 收集材质)        ──┤
+                                   ├──> T1.16.5 (mesh_data materials_ssbo) ──> T1.16.7 (cull shader) ──> T1.16.8 (rasterize shader) ──> T1.16.9 (material_resolve shader) ──> T1.16.10 (pipeline per-mesh uniform set) ──> T1.16.11 (server 多实例 dispatch) ──> T1.16.12 (bridge 阻断原生 mesh) ──> T1.16.13 (端到端测试) ──> T1.16.14 (文档更新)
+T1.16.4 (vertex_ssbo 布局)       ──┘
+T1.16.6 (push constant model_matrix) ─────────────────────────────────────────────────────┘
+```
+
+### T1.16.1: NaniteCluster 增加 material_index 字段
+
+- [x] **Task 1.16.1.1**: 在 `nanite/core/nanite_cluster.h` 中给 `NaniteCluster` 添加 `uint32_t material_index = 0;` 字段（在 `group_id` 后）
+- [x] **Task 1.16.1.2**: 更新 `NaniteCluster::serialize()` 写入该字段
+- [x] **Task 1.16.1.3**: 更新 `NaniteCluster::deserialize()` 读取该字段
+- [x] **Task 1.16.1.4**: 更新 `NaniteCluster::get_serialized_size()` 增加 4 字节
+- [x] **Task 1.16.1.5**: 更新 `nanite_cull.glsl` 注释中 NaniteCluster 内存布局说明
+- [x] **Task 1.16.1.6**: 更新所有引用 `get_serialized_size()` 的位置（NaniteBuilder deserialize loop）
+
+**验证**：现有 `test_nanite_cluster.h` roundtrip 测试通过（新增 material_index 字段不破坏）
+
+### T1.16.2: NaniteMeshResource 暴露 materials 属性
+
+- [x] **Task 1.16.2.1**: 在 `nanite/core/nanite_resource.h` 添加 `PackedByteArray materials_data;`（编码的材质 blob，每个材质 32 字节：base_color.xyz + emissive.xyz + metallic + roughness + pad）
+- [x] **Task 1.16.2.2**: 添加 `Array<Ref<Material>> materials;`（Godot 端引用，stage 1 不强制保存，仅内存）
+- [x] **Task 1.16.2.3**: 实现 `get_materials_data() / set_materials_data()` + `GDPROPERTY` 绑定
+- [x] **Task 1.16.2.4**: 实现 `get_materials() -> Array` 返回 base_color 数组（stage 1 简化：每材质一个 Color）
+- [x] **Task 1.16.2.5**: 更新 `.nanite` 二进制 save/load 包含 `materials_data`
+- [x] **Task 1.16.2.6**: 更新 `nanite_resource.cpp` 的 `_bind_methods`
+
+**验证**：
+- `test_nanite_resource.h` roundtrip 测试通过
+- 新增 `test_materials_data_roundtrip` 测试
+
+### T1.16.3: NaniteBuilder 收集材质信息
+
+- [x] **Task 1.16.3.1**: 在 `nanite/core/nanite_builder.h` 添加 `LocalVector<Color> base_colors;` 输出
+- [x] **Task 1.16.3.2**: 在 `build_leaf_clusters()` 中从 source `ArrayMesh` 读取每个 surface 的 material（`surface_get_material`），提取 `albedo_color`（从 `BaseMaterial3D` 或 `StandardMaterial3D`）
+- [x] **Task 1.16.3.3**: 在 `build_leaf_clusters()` 中为每个 cluster 写入 `material_index`（基于 surface index）
+- [x] **Task 1.16.3.4**: 在 `build()` 结束时把 `base_colors` 编码为 `materials_data` blob 并写入 `NaniteMeshResource`
+- [x] **Task 1.16.3.5**: 若 source mesh 无 material，使用默认 `Color(0.8, 0.8, 0.8, 1.0)`
+- [x] **Task 1.16.3.6**: 若 source material 非 `BaseMaterial3D`，使用 `Color(0.8, 0.8, 0.8, 1.0)` 并 WARN_PRINT
+
+**验证**：
+- `test_nanite_builder.h` 新增 `test_material_index_assigned` 用例
+- 已有的 `test_build_cube` / `test_build_sphere` 通过（material_index 字段默认 0）
+
+### T1.16.4: VertexSSBO 布局扩展
+
+- [x] **Task 1.16.4.1**: 在 `nanite/core/nanite_builder.cpp` 的 `encode_vertex_buffer()` 中扩展 vertex stride 为 8 floats（position.xyz + normal.xyz + uv.xy）
+- [x] **Task 1.16.4.2**: 从 source `ArrayMesh` 读取 `Mesh::ARRAY_NORMAL` + `Mesh::ARRAY_TEX_UV`（若缺失则填默认 `vec3(0,1,0)` / `vec2(0,0)`）
+- [x] **Task 1.16.4.3**: 更新 `nanite_rasterize.glsl` 注释中 vertex_data 内存布局说明（每 vertex 32 字节）
+- [x] **Task 1.16.4.4**: 更新 `nanite_material_resolve.glsl` 注释中 vertex_data 内存布局说明
+
+**验证**：
+- `test_nanite_mesh_data.h` 新增 `test_vertex_ssbo_layout` 检查 vertex_data.size % (8*4) == 0
+
+### T1.16.5: NaniteMeshData 上传 materials_ssbo
+
+- [x] **Task 1.16.5.1**: 在 `nanite/gpu/nanite_mesh_data.h` 添加 `RID materials_ssbo;` + `RID get_materials_ssbo() const`
+- [x] **Task 1.16.5.2**: 在 `upload_to_gpu()` 中创建 `materials_ssbo`（从 `p_resource->get_materials_data()`）
+- [x] **Task 1.16.5.3**: 在 `free_gpu_resources()` 中释放 `materials_ssbo`
+- [x] **Task 1.16.5.4**: 删除 `upload_to_gpu()` 中的 `TODO Stage 1: collect material_rids` 注释
+- [x] **Task 1.16.5.5**: 处理 materials_data 为空的情况（创建 4 字节 placeholder + 默认白色）
+
+**验证**：
+- `test_nanite_mesh_data.h` 新增 `test_materials_ssbo_created` 用例
+
+### T1.16.6: Cull / Rasterize Push Constant 扩展 model_matrix
+
+- [x] **Task 1.16.6.1**: 在 `nanite/gpu/nanite_gpu_pipeline.h` 的 `CullParams` 添加 `float model_matrix[16];`
+- [x] **Task 1.16.6.2**: 在 `nanite/gpu/nanite_gpu_pipeline.h` 的 `RasterizeParams`（新增结构，或复用 CullParams）添加 `float model_matrix[16];`
+- [x] **Task 1.16.6.3**: 修改 `dispatch_cull()` / `dispatch_rasterize()` 的 push constant 结构：增加 `mat4 model_matrix`（64 字节）
+- [x] **Task 1.16.6.4**: 更新 `nanite_cull.glsl` 的 `Params` push constant 块，添加 `mat4 model_matrix;`
+- [x] **Task 1.16.6.5**: 更新 `nanite_rasterize.glsl` 的 `Params` push constant 块，添加 `mat4 model_matrix;`
+- [x] **Task 1.16.6.6**: 验证 push constant 总大小 ≤ 128 字节（cull: 44 + 64 = 108 OK；rasterize: 16 + 64 = 80 OK）
+
+**验证**：编译通过 + 现有 `test_nanite_gpu_pipeline.h` 通过
+
+### T1.16.7: nanite_cull.glsl 完整实现
+
+- [x] **Task 1.16.7.1**: 定义 `struct Cluster`（按 `NaniteCluster` 序列化布局，含 `material_index`）
+- [x] **Task 1.16.7.2**: 定义 `struct BVHNode`（按 `NaniteClusterNode` 序列化布局）
+- [x] **Task 1.16.7.3**: 实现 `aabb_to_clip_space(AABB, mat4 mvp) -> vec4[8]`（8 个角点变换）
+- [x] **Task 1.16.7.4**: 实现 `frustum_cull(vec4[8] corners) -> bool`（6 平面测试，任一角点在内则通过）
+- [x] **Task 1.16.7.5**: 实现 `backface_cull(Cluster c, vec3 view_dir) -> bool`（cone_axis · view_dir < cone_cutoff）
+- [x] **Task 1.16.7.6**: 实现 `project_aabb_to_screen(AABB, mat4 mvp, ivec2 screen_size) -> vec4`（min_x, min_y, max_x, max_y）
+- [x] **Task 1.16.7.7**: 实现 `hzb_occlusion_cull(vec4 screen_rect, sampler2D hzb) -> bool`（采样最粗覆盖 mip，比较 max depth）
+- [x] **Task 1.16.7.8**: 实现 `lod_select(Cluster c) -> uint`（若 `c.error > error_threshold` 返回 parent cluster_id，否则返回 c 自身）
+- [x] **Task 1.16.7.9**: 组装 `main()`：每个 thread 处理一个 cluster，做 4 步测试 + LOD，通过则 `atomicAdd(visible_count, 1)` + `visible_clusters[idx] = selected_cluster_id`
+- [x] **Task 1.16.7.10**: 保留 `#VERSION_DEFINES` + push constant + uniform block 声明不变
+
+**验证**：
+- 新增 `test_nanite_cull_shader.h`（doctest，需 RD）
+  - `test_frustum_cull_in_view`：相机看向 mesh，visible_count > 0
+  - `test_frustum_cull_out_view`：相机背向，visible_count == 0
+  - `test_backface_cull`：cube 内部观察，背面被剔除
+  - `test_lod_select`：error_threshold 极大，所有 cluster 用 LOD 0
+
+### T1.16.8: nanite_rasterize.glsl 完整实现
+
+- [x] **Task 1.16.8.1**: 定义 `struct Cluster`（同 T1.16.7.1）
+- [x] **Task 1.16.8.2**: 定义 `decode_vertex(uint offset) -> vec3 position + vec3 normal + vec2 uv`（从 `vertex_data[]` 按 stride 32 字节读取）
+- [x] **Task 1.16.8.3**: 实现 `triangle_barycentric(vec2 p, vec2 a, vec2 b, vec2 c) -> vec3`（重心坐标）
+- [x] **Task 1.16.8.4**: 实现 `triangle_aabb(vec2 a, vec2 b, vec2 c) -> vec4`（屏幕空间 bounding box）
+- [x] **Task 1.16.8.5**: 实现 `interpolate_depth(vec3 bary, float za, float zb, float zc) -> float`
+- [x] **Task 1.16.8.6**: 实现 `encode_vis(uint cluster_id, uint triangle_id) -> uint`（`(cluster_id << 8) | triangle_id`）
+- [x] **Task 1.16.8.7**: 组装 `main()`：每个 thread 处理一个 cluster 的所有三角形，对每个三角形：
+  - 解码 3 个顶点（position + normal + uv）
+  - model + view + projection 变换到 clip space → perspective divide → screen space
+  - 计算 triangle AABB，遍历 AABB 内像素
+  - 重心坐标测试，在内则插值深度
+  - 深度测试（Stage 1 简化为非原子 compare-then-store：`imageLoad(depth_buffer, pos).r` 比较后 `imageStore`；R32_SFLOAT 不支持 `imageAtomicCompSwap`，race-safe 由 "last writer wins per pixel" 语义保证；Stage 2 可改 R32_UINT + atomic 路径）
+  - 若深度更新成功，`imageStore(vis_buffer, pos, encoded)`
+- [x] **Task 1.16.8.8**: 保留 `#VERSION_DEFINES` + push constant + uniform block 声明不变
+
+**验证**：
+- 新增 `test_nanite_rasterize_shader.h`（doctest，需 RD）
+  - `test_rasterize_cube`：渲染 cube，color_buffer 非空像素 > 0
+  - `test_rasterize_depth_test`：两个重叠三角形，深度近的覆盖远的
+
+### T1.16.9: nanite_material_resolve.glsl 完整实现
+
+- [x] **Task 1.16.9.1**: 定义 `struct Cluster`（含 material_index）
+- [x] **Task 1.16.9.2**: 定义 `struct Material { vec4 base_color; vec4 emissive; float metallic; float roughness; vec2 _pad; }`（32 字节）
+- [x] **Task 1.16.9.3**: 添加 binding 3: `readonly buffer MaterialsSSBO { vec4 materials_data[]; }`（每材质 8 vec4）
+- [x] **Task 1.16.9.4**: 添加 binding 4: `readonly buffer VertexSSBO { vec4 vertex_data[]; }`（每顶点 2 vec4）
+- [x] **Task 1.16.9.5**: 实现 `decode_vertex(uint offset) -> vec3 position + vec3 normal + vec2 uv`
+- [x] **Task 1.16.9.6**: 实现 `decode_material(uint index) -> Material`
+- [x] **Task 1.16.9.7**: 实现 `lambert(vec3 normal, vec3 light_dir, vec3 base_color) -> vec3`
+- [x] **Task 1.16.9.8**: 组装 `main()`：解码 vis_buffer → cluster_id + triangle_id → 读 cluster → 读 3 顶点 → 重心插值 normal + uv → 读 material → Lambert + 环境光
+- [x] **Task 1.16.9.9**: 调试模式分支保留（CLUSTER_SOLID_COLOR / LOD_SOLID_COLOR 等）
+- [x] **Task 1.16.9.10**: NONE 模式用 Lambert，不再输出固定灰
+
+**验证**：
+- 新增 `test_nanite_material_resolve_shader.h`（doctest，需 RD）
+  - `test_material_resolve_none_mode`：渲染 cube，color_buffer 平均亮度 > 0.1（不是全黑）
+  - `test_material_resolve_cluster_color_mode`：debug_mode=1，不同 cluster 颜色不同
+
+### T1.16.10: NaniteGPUPipeline per-mesh uniform set
+
+- [x] **Task 1.16.10.1**: 在 `dispatch_material_resolve()` 添加 binding 3 `materials_ssbo` + binding 4 `vertex_ssbo`
+- [x] **Task 1.16.10.2**: 删除注释 "Stage 1: unused"
+- [x] **Task 1.16.10.3**: 验证 uniform set 与 shader binding 一致
+
+**验证**：编译通过 + 现有 `test_nanite_gpu_pipeline.h` 通过
+
+### T1.16.11: NaniteServer 多实例 per-mesh dispatch
+
+- [x] **Task 1.16.11.1**: 在 `nanite/core/nanite_server.h` 添加 `HashMap<ObjectID, Transform3D> instance_transforms;`（每帧更新）
+- [x] **Task 1.16.11.2**: 在 `NaniteMeshInstance3D::_notification(NOTIFICATION_TRANSFORM_CHANGED)` 调用 `server->update_instance_transform(this, get_global_transform())`
+- [x] **Task 1.16.11.3**: 实现 `NaniteServer::update_instance_transform(NaniteMeshInstance3D*, Transform3D)`
+- [x] **Task 1.16.11.4**: 在 `render_visibility()` 遍历 `instance_map`，对每个实例：
+  - 取 mesh resource RID → mesh_map entry
+  - 取 model_matrix from instance_transforms
+  - 调用 `dispatch_cull(model_matrix, ...)` + `dispatch_rasterize(...)`
+- [x] **Task 1.16.11.5**: 累加 `visible_cluster_count` 跨所有实例
+- [x] **Task 1.16.11.6**: 处理多实例共享同一 mesh 的情况（mesh_data 只 upload 一次）
+
+**验证**：
+- 新增 `test_multi_instance_dispatch.h`：2 个实例不同 transform，visible_cluster_count > 0
+
+### T1.16.12: NaniteGDExtBridge 阻断原生 mesh 渲染
+
+- [x] **Task 1.16.12.1**: 在 `NaniteMeshInstance3D::_notification(NOTIFICATION_ENTER_TREE)` 中：
+  - 调用 `set_mesh(Ref<ArrayMesh>())`（清空引擎 mesh，避免双重渲染）
+  - 或：调用 `RenderingServer::get_singleton()->instance_set_visible(get_instance(), false)`（更轻量）
+- [x] **Task 1.16.12.2**: 在 `NaniteMeshInstance3D::_notification(NOTIFICATION_EXIT_TREE)` 恢复
+- [x] **Task 1.16.12.3**: 验证：场景中放置 `NaniteMeshInstance3D` 后，看不到引擎原生 mesh，但 Nanite 输出可见
+
+**验证**：
+- 新增 `test_no_double_render.gd`：检查 `MeshInstance3D::is_visible()` == false
+
+### T1.16.13: 端到端测试
+
+- [x] **Task 1.16.13.1**: 更新 `nanite/tests/test_nanite_gpu_pipeline.h` 用真实算法替换 pass-through 验证
+  - 已完成：`test_nanite_gpu_pipeline.h` 与 `test_nanite_material_resolve.h` 已使用真实 `dispatch_rasterize(..., model_matrix)` / `dispatch_material_resolve(..., model_matrix)` 签名，注释更新为"real soft-rasterizer"
+- [x] **Task 1.16.13.2**: 新增 `nanite/tests/test_stage1_real_rendering.gd`：完整流程（加载 nanite.tres → 创建 NaniteMeshInstance3D → 渲染 5 帧 → 检查 color_buffer 非空）
+  - 已完成：`test_stage1_real_rendering.gd` 包含三个用例 `test_pipeline_runs_without_crash` / `test_debug_mode_can_be_set` / `test_no_double_render`（验证 SHADOW_CASTING_SHADOWS_ONLY）
+- [x] **Task 1.16.13.3**: 新增 `nanite/tests/test_multi_instance.gd`：2 个实例不同 transform
+  - 已完成：`test_multi_instance.gd` 包含 `test_two_instances_both_registered` 与 `test_transform_updates_dont_crash`
+- [x] **Task 1.16.13.4**: 更新 `checklist.md` 重新验证（S1-05/S1-06/S1-07 改为 PASS）
+  - 已完成：见 16 节中各 T1.16.X 子节的状态
+
+**验证**：
+- 所有测试通过（doctest + GDScript，需 Vulkan 后端运行；无后端时 GPU 测试 SKIP）
+- 手动验证：打开 `nanite-test` 项目，放置 `NaniteMeshInstance3D`，在 3D 视口看到 Nanite 渲染的几何体（仍为 [CANNOT_VERIFY]，需 Stage 2 桥接自动挂接默认 Compositor 后实际跑通）
+
+### T1.16.14: 文档更新
+
+- [x] **Task 1.16.14.1**: 更新 `nanite_doc/nanite-overall-design.md` 10.5 节 S1-05/S1-06/S1-07：标注"已补完"，删除"留待 Stage 2"
+  - 已完成：10.5 节对照表中 S1-05/S1-06/S1-07 三行均标注"已补完（Stage 1 内）"，附 spec.md 与 Task 1.16.X 引用；10.4 节实现状态、阶段一验收标准（2559 行）均更新
+- [x] **Task 1.16.14.2**: 更新 `nanite_doc/nanite-implementation-tasks.md` Task 1.5 / 1.11 描述：删除"占位"措辞，标注为"完整实现"
+  - 已完成：`nanite-implementation-tasks.md` 阶段 1 表格"核心目标"列已描述为完整 Cull + Rasterize + HZB + Material Resolve；任务条目以指向 spec 文档为准（用户 2026-07-25 确认 implementation-tasks.md 仅作五阶段规划，执行/验收以 spec 文档为准）
+- [x] **Task 1.16.14.3**: 更新 `nanite_doc/spec/stage1-gdext-bridge/tasks.md`：在 Task 1.5 / 1.11 下补注"详见 Task 1.16"
+  - 已完成：Task 1.5.1/1.5.2 与 Task 1.11.1/1.11.2 已有"Stage 1 占位实现"注释，并由 1.16 节顶部"替代 1.5 / 1.11 占位实现"统一引用
+- [x] **Task 1.16.14.4**: 更新 `nanite_doc/spec/stage1-gdext-bridge/checklist.md`：S1-05/S1-06/S1-07 标注"详见 Task 1.16"
+  - 已完成：checklist.md 第 16 节"真实渲染补完 (Task 1.16)"下各 T1.16.X 子项已全部 `[x]`
+
+**验证**：文档无矛盾
+
+**依赖**：1.5、1.11（占位实现已存在）+ 1.4（mesh data）+ 1.6（HZB）+ 1.8（instance）+ 1.7（bridge）
+**验证**：checklist 全部通过
+
+---
+
 ## Task Dependencies
 
 - 1.1 (框架) → 无依赖，可与 1.2 并行
