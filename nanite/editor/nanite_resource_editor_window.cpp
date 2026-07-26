@@ -32,7 +32,7 @@
 #include "nanite_resource_editor_window.h"
 
 #include "nanite_mesh_editor.h"
-#include "../core/nanite_resource.h"
+#include "nanite/core/nanite_resource.h"
 
 #include "scene/gui/dialogs.h"
 

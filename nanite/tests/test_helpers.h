@@ -37,8 +37,8 @@
 #include "scene/resources/mesh.h"
 #include "servers/rendering/rendering_device.h"
 
-#include "../core/nanite_builder.h"
-#include "../core/nanite_resource.h"
+#include "nanite/core/nanite_builder.h"
+#include "nanite/core/nanite_resource.h"
 
 #include <cstring>
 

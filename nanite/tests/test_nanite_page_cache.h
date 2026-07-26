@@ -1,6 +1,6 @@
 #pragma once
 
-#include "core/nanite_page_cache.h"
+#include "nanite/core/nanite_page_cache.h"
 #include "tests/test_macros.h"
 
 #include <climits>

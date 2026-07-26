@@ -32,8 +32,8 @@
 
 #include "nanite_conversion_menu.h"
 
-#include "../core/nanite_builder.h"
-#include "../core/nanite_resource.h"
+#include "nanite/core/nanite_builder.h"
+#include "nanite/core/nanite_resource.h"
 
 #include "core/object/callable_mp.h" // callable_mp
 #include "editor/editor_node.h"

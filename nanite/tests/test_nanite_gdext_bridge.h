@@ -38,9 +38,9 @@
 // tests use memnew / is_class / install, none of which require ClassDB
 // registration (which IS gated on NANITE_BRIDGE_GDEXT in register_types.cpp).
 
-#include "bridge/nanite_gdext_bridge.h"
-#include "core/nanite_bridge.h"
-#include "core/nanite_server.h"
+#include "nanite/bridge/nanite_gdext_bridge.h"
+#include "nanite/core/nanite_bridge.h"
+#include "nanite/core/nanite_server.h"
 #include "scene/resources/compositor.h"
 #include "tests/test_macros.h"
 

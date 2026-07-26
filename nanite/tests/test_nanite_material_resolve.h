@@ -30,13 +30,13 @@
 
 #pragma once
 
-#include "gpu/nanite_gpu_pipeline.h"
+#include "nanite/gpu/nanite_gpu_pipeline.h"
 #include "tests/test_macros.h"
 
-#include "core/nanite_builder.h"
-#include "core/nanite_resource.h"
-#include "gpu/nanite_mesh_data.h"
-#include "tests/test_helpers.h"
+#include "nanite/core/nanite_builder.h"
+#include "nanite/core/nanite_resource.h"
+#include "nanite/gpu/nanite_mesh_data.h"
+#include "nanite/tests/test_helpers.h"
 
 #include "servers/rendering/rendering_device.h"
 

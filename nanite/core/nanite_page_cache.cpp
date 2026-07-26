@@ -28,7 +28,7 @@
 /* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
 /**************************************************************************/
 
-#include "core/nanite_page_cache.h"
+#include "nanite/core/nanite_page_cache.h"
 
 #include "core/object/class_db.h"
 

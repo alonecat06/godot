@@ -30,8 +30,8 @@
 
 #pragma once
 
-#include "gpu/nanite_mesh_data.h"
-#include "core/nanite_resource.h"
+#include "nanite/gpu/nanite_mesh_data.h"
+#include "nanite/core/nanite_resource.h"
 #include "tests/test_macros.h"
 
 #include "servers/rendering/rendering_device.h"

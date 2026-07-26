@@ -30,26 +30,26 @@
 
 #include "register_types.h"
 
-#include "core/builder_config.h"
-#include "core/nanite_builder.h"
-#include "core/nanite_debug.h"
-#include "core/nanite_page_cache.h"
-#include "core/nanite_resource.h"
-#include "core/nanite_server.h"
-#include "scene/nanite_mesh_instance_3d.h"
+#include "nanite/core/builder_config.h"
+#include "nanite/core/nanite_builder.h"
+#include "nanite/core/nanite_debug.h"
+#include "nanite/core/nanite_page_cache.h"
+#include "nanite/core/nanite_resource.h"
+#include "nanite/core/nanite_server.h"
+#include "nanite/scene/nanite_mesh_instance_3d.h"
 #include "core/config/engine.h"
 #include "core/object/class_db.h"
 
 #if defined(NANITE_BRIDGE_GDEXT)
-#include "bridge/nanite_gdext_bridge.h"
+#include "nanite/bridge/nanite_gdext_bridge.h"
 #endif
 
 #ifdef TOOLS_ENABLED
-#include "editor/nanite_conversion_menu.h"
-#include "editor/nanite_editor_plugin.h"
-#include "editor/nanite_mesh_editor.h"
-#include "editor/nanite_resource_editor_window.h" // Task 0.13.4
-#include "editor/nanite_resource_preview_gen.h"
+#include "nanite/editor/nanite_conversion_menu.h"
+#include "nanite/editor/nanite_editor_plugin.h"
+#include "nanite/editor/nanite_mesh_editor.h"
+#include "nanite/editor/nanite_resource_editor_window.h" // Task 0.13.4
+#include "nanite/editor/nanite_resource_preview_gen.h"
 #include "editor/plugins/editor_plugin.h"
 #endif // TOOLS_ENABLED
 

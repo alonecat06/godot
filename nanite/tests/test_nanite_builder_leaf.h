@@ -32,7 +32,7 @@
 
 #include "tests/test_macros.h"
 
-#include "../core/nanite_builder.h"
+#include "nanite/core/nanite_builder.h"
 #include "test_helpers.h"
 
 #include "core/math/math_funcs.h"

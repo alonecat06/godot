@@ -32,7 +32,7 @@
 
 #include "nanite_resource_preview_gen.h"
 
-#include "../core/nanite_resource.h"
+#include "nanite/core/nanite_resource.h"
 
 #include "core/object/class_db.h"
 #include "editor/inspector/editor_preview_plugins.h"

@@ -30,7 +30,7 @@
 
 #pragma once
 
-#include "gpu/nanite_hzb.h"
+#include "nanite/gpu/nanite_hzb.h"
 #include "tests/test_macros.h"
 
 #include "core/math/math_funcs.h"

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "core/nanite_bridge.h"
+#include "nanite/core/nanite_bridge.h"
 #include "tests/test_macros.h"
 
 #include <type_traits>

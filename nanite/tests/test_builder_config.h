@@ -32,7 +32,7 @@
 
 #include "tests/test_macros.h"
 
-#include "../core/builder_config.h"
+#include "nanite/core/builder_config.h"
 
 namespace TestBuilderConfig {
 

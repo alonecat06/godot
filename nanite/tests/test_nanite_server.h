@@ -1,8 +1,8 @@
 #pragma once
 
-#include "core/nanite_debug.h"
-#include "core/nanite_resource.h"
-#include "core/nanite_server.h"
+#include "nanite/core/nanite_debug.h"
+#include "nanite/core/nanite_resource.h"
+#include "nanite/core/nanite_server.h"
 #include "tests/test_macros.h"
 
 namespace TestNaniteServer {

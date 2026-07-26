@@ -39,7 +39,7 @@
 #include "scene/gui/subviewport_container.h"
 #include "scene/3d/camera_3d.h"
 #include "scene/3d/light_3d.h"
-#include "../scene/nanite_mesh_instance_3d.h"
+#include "nanite/scene/nanite_mesh_instance_3d.h"
 #include "scene/3d/node_3d.h"
 #include "scene/main/viewport.h"
 #include "scene/resources/mesh.h"

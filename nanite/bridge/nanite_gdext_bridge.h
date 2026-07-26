@@ -30,7 +30,7 @@
 
 #pragma once
 
-#include "core/nanite_bridge.h" // INaniteBridge
+#include "nanite/core/nanite_bridge.h" // INaniteBridge
 #include "scene/resources/compositor.h" // CompositorEffect (also pulls in RenderData)
 
 class NaniteServer;

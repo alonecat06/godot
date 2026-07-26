@@ -32,8 +32,8 @@
 
 #include "tests/test_macros.h"
 
-#include "../core/nanite_builder.h"
-#include "../core/nanite_resource.h"
+#include "nanite/core/nanite_builder.h"
+#include "nanite/core/nanite_resource.h"
 #include "test_helpers.h"
 
 #include "core/os/time.h"

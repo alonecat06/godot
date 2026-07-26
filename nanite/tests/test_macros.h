@@ -30,4 +30,8 @@
 
 #pragma once
 
+// Pull in the engine's main test_macros.h (doctest framework + TEST_CASE macros).
+// NOTE: previously this file self-included "tests/test_macros.h", which was a
+// no-op due to #pragma once but indicated the wrong intent. The engine test
+// macros header lives at tests/test_macros.h relative to the repo root.
 #include "tests/test_macros.h"

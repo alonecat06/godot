@@ -30,9 +30,9 @@
 
 #pragma once
 
-#include "scene/nanite_mesh_instance_3d.h"
-#include "core/nanite_server.h"
-#include "core/nanite_resource.h"
+#include "nanite/scene/nanite_mesh_instance_3d.h"
+#include "nanite/core/nanite_server.h"
+#include "nanite/core/nanite_resource.h"
 #include "tests/test_macros.h"
 
 namespace TestNaniteMeshInstance3D {

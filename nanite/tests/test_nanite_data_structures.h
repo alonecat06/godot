@@ -32,8 +32,8 @@
 
 #include "tests/test_macros.h"
 
-#include "../core/nanite_bvh.h"
-#include "../core/nanite_cluster.h"
+#include "nanite/core/nanite_bvh.h"
+#include "nanite/core/nanite_cluster.h"
 
 #include "core/math/math_funcs.h"
 

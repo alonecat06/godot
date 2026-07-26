@@ -32,11 +32,11 @@
 
 #include "core/object/object.h"
 #include "core/object/object_id.h"
-#include "core/nanite_bridge.h" // INaniteBridge
+#include "nanite/core/nanite_bridge.h" // INaniteBridge
 #include "core/templates/hash_map.h"
 #include "core/templates/rid.h"
 #include "core/templates/rid_owner.h"
-#include "bridge/nanite_gdext_bridge.h" // NaniteGDExtBridge (Ref<> member needs complete type)
+#include "nanite/bridge/nanite_gdext_bridge.h" // NaniteGDExtBridge (Ref<> member needs complete type)
 
 class NaniteMeshResource;
 class NaniteGPUPipeline;

@@ -28,9 +28,9 @@
 /* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
 /**************************************************************************/
 
-#include "gpu/nanite_mesh_data.h"
+#include "nanite/gpu/nanite_mesh_data.h"
 
-#include "core/nanite_resource.h"
+#include "nanite/core/nanite_resource.h"
 #include "core/error/error_macros.h"
 #include "servers/rendering/rendering_device.h"
 

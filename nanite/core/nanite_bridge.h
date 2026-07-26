@@ -45,7 +45,9 @@
 
 class NaniteServer;
 class RenderData;
-struct RID;
+// RID is already fully defined by `#include "core/templates/rid.h"` above —
+// no forward declaration needed (and forward-declaring it as `class RID`
+// triggers C4099 because the engine declares it as `struct RID`).
 
 // INaniteBridge — abstract bridge interface.
 // Not a Godot Object subclass (no GDCLASS) — it is owned by NaniteServer

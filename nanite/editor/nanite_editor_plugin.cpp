@@ -32,8 +32,8 @@
 
 #include "nanite_editor_plugin.h"
 
-#include "../core/nanite_builder.h"
-#include "../core/nanite_resource.h"
+#include "nanite/core/nanite_builder.h"
+#include "nanite/core/nanite_resource.h"
 #include "nanite_conversion_menu.h"
 #include "nanite_resource_editor_window.h"
 #include "nanite_resource_preview_gen.h"

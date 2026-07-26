@@ -28,14 +28,14 @@
 /* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
 /**************************************************************************/
 
-#include "core/nanite_server.h"
+#include "nanite/core/nanite_server.h"
 
-#include "core/nanite_debug.h"
-#include "core/nanite_page_cache.h"
-#include "core/nanite_resource.h"
-#include "gpu/nanite_gpu_pipeline.h"
-#include "gpu/nanite_mesh_data.h"
-#include "scene/nanite_mesh_instance_3d.h"
+#include "nanite/core/nanite_debug.h"
+#include "nanite/core/nanite_page_cache.h"
+#include "nanite/core/nanite_resource.h"
+#include "nanite/gpu/nanite_gpu_pipeline.h"
+#include "nanite/gpu/nanite_mesh_data.h"
+#include "nanite/scene/nanite_mesh_instance_3d.h"
 
 #include "core/config/project_settings.h"
 #include "core/error/error_macros.h"
@@ -43,7 +43,7 @@
 #include "servers/rendering/rendering_device.h"
 
 #if defined(NANITE_BRIDGE_GDEXT)
-#include "bridge/nanite_gdext_bridge.h"
+#include "nanite/bridge/nanite_gdext_bridge.h"
 #include "scene/resources/compositor.h" // CompositorEffect::EffectCallbackType
 #endif
 

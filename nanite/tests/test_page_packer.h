@@ -32,9 +32,9 @@
 
 #include "tests/test_macros.h"
 
-#include "../core/builder_config.h"
-#include "../core/nanite_cluster.h"
-#include "../core/page_packer.h"
+#include "nanite/core/builder_config.h"
+#include "nanite/core/nanite_cluster.h"
+#include "nanite/core/page_packer.h"
 
 #include "core/math/aabb.h"
 #include "core/math/vector3.h"

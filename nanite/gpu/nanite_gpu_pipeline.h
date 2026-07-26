@@ -31,7 +31,7 @@
 #pragma once
 
 #include "core/templates/rid.h"
-#include "gpu/nanite_hzb.h"
+#include "nanite/gpu/nanite_hzb.h"
 
 class RenderingDevice;
 class NaniteMeshData;
