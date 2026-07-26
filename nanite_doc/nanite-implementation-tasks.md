@@ -11,7 +11,7 @@
 | 阶段 | 名称 | 核心目标 | 桥接方式 | 可独立运行 |
 |------|------|---------|---------|:---------:|
 | 0 | 离线构建模块 | 层次化 Meshlet + BVH 构建、序列化、预览 | 无桥接（纯 CPU + 编辑器） | ✅ |
-| 1 | GDExtension 桥接 | GPU 渲染管线跑通：Cull → Raster → HZB → Material | CompositorEffect | ✅ |
+| 1 | GDExtension 桥接 | **完整实现 Nanite 渲染**：Cull（BVH + 视锥/背面/HZB 遮挡 + LOD）→ Rasterize（meshlet 解码 + 三角软光栅 + VisBuffer）→ HZB Build → Material Resolve（barycentric + Lambert） | CompositorEffect | ✅ |
 | 2 | Module 桥接 | 动态 GPU 阴影 + 引擎内部 API 直调 | RendererSceneCull hook | ✅ |
 | 3 | Deep 桥接 | SDFGI/VoxelGI 打通 + 引擎深度集成 | 源码 Patch | ✅ |
 | 4 | GDExtension 插件化 | 将全部 Nanite 代码（构建 + 运行时 + 编辑器扩展）打包为独立 GDExtension 插件 | GDExtension (CompositorEffect + EditorPlugin) | ✅ |
@@ -19,7 +19,7 @@
 ```mermaid
 flowchart LR
     P0["阶段0：离线构建<br/>meshoptimizer 管线<br/>序列化 + 预览"]
-    P1["阶段1：GDExtension 桥接<br/>CompositorEffect<br/>GPU Cull/Raster/HZB"]
+    P1["阶段1：GDExtension 桥接<br/>CompositorEffect<br/>完整 Nanite 渲染<br/>(Cull/Raster/HZB/Material)"]
     P2["阶段2：Module<br/>SceneCull hook<br/>动态 GPU 阴影"]
     P3["阶段3：Deep<br/>源码 Patch<br/>GI 打通"]
     P4["阶段4：插件化<br/>独立 .gdextension<br/>构建+运行时+编辑器"]
@@ -814,7 +814,9 @@ func _test_classdb_registration() -> void:
 
 ## 阶段 1：GDExtension 桥接
 
-**目标**：通过 CompositorEffect 接入 Godot 渲染管线，实现 GPU-driven 的 Cull → Raster → HZB Build → Material Eval 全流程。使用粗 LOD 阴影方案。
+**目标**：在使用 GDExtension 桥接层（`CompositorEffect` 接入）的情况下，**完整实现 Nanite 渲染** —— 包括 Cull（BVH 遍历 + 视锥/背面/HZB 遮挡剔除 + LOD 选择）、Rasterize（meshlet 解码 + 三角形软光栅化 + VisBuffer 写入）、HZB Build（层次化深度降采样）、Material Resolve（barycentric 插值 + Lambert 着色）四个 Pass 的真实算法实现，使 Stage 1 完成后即可在场景中放置 `NaniteMeshInstance3D` 看到真实 Nanite 渲染输出。使用粗 LOD 阴影方案。
+
+> **状态（2026-07-25）**：原 1.4/1.5/1.6 中 Cull / Rasterize / Material Resolve 三个 Pass 最初为占位实现（pass-through / 每线程写一像素 / 固定灰），仅 HZB downsample 为真实算法。Task 1.16 "真实 Nanite 渲染补完" 已在 Stage 1 内补完真实算法，使 Stage 1 现为完整可渲染状态。详细任务、子任务与验收清单见 Stage 1 spec 文档 [`nanite_doc/spec/stage1-gdext-bridge/`](spec/stage1-gdext-bridge/)（spec.md / tasks.md / checklist.md）。
 
 ### 1.1 GDExtension 框架搭建
 
@@ -968,6 +970,8 @@ TEST_CASE("NaniteMeshData SSBO sizes match resource data") {
 
 ### 1.4 NaniteGPUPipeline — Cull + Rasterize Shader
 
+> Stage 1 最初为占位实现，已由 spec Task 1.16 在 Stage 1 内补完真实算法。详见 [`spec/stage1-gdext-bridge/`](spec/stage1-gdext-bridge/)。
+
 **任务 1.4.1**：编写 `nanite_cull.glsl` — BVH 遍历 + 视锥/背面/遮挡剔除 + LOD 选择
 
 **任务 1.4.2**：编写 `nanite_rasterize.glsl` — Visibility Buffer 软光栅（小三角） + 硬件光栅（大三角）混合
@@ -1021,6 +1025,8 @@ TEST_CASE("Rasterize shader produces valid Visibility Buffer") {
 ```
 
 ### 1.5 NaniteHZB — GPU 层次化深度缓冲
+
+> Stage 1 内即为真实算法实现（HZB downsample 为纯数学运算，非占位）。详见 [`spec/stage1-gdext-bridge/`](spec/stage1-gdext-bridge/)。
 
 **任务 1.5.1**：编写 `nanite_hzb_downsample.glsl` — Compute Shader 逐级降采样取 MAX
 
@@ -1104,6 +1110,8 @@ TEST_CASE("HZB resize handles resolution change") {
 ```
 
 ### 1.6 Material Resolve Shader
+
+> Stage 1 最初为占位实现，已由 spec Task 1.16 在 Stage 1 内补完真实算法（barycentric 插值 + Lambert 着色；完整 PBR 留待 Stage 2+）。详见 [`spec/stage1-gdext-bridge/`](spec/stage1-gdext-bridge/)。
 
 **任务 1.6.1**：编写 `nanite_material_resolve.glsl` — 从 VisBuffer 解码 → 顶点插值 → 材质着色
 
@@ -1240,17 +1248,19 @@ func test_gdext_performance_baseline():
 
 ### 1.10 阶段 1 验收标准
 
-- [ ] GDExtension 编译为 `.gdextension` 插件可独立加载
-- [ ] `CompositorEffect` 使用 `PRE_OPAQUE` + `POST_OPAQUE` 正确回调
-- [ ] `RenderDataExtension::get_render_scene_data()` 获取相机/投影信息正确
-- [ ] GPU Cull Shader 正确执行 BVH 遍历 + 三重剔除 + LOD 选择
-- [ ] Visibility Buffer 正确生成
-- [ ] GPU HZB 从深度缓冲正确构建（mip 降采样取 MAX）
-- [ ] Material Resolve 输出正确颜色
-- [ ] 粗 LOD 阴影通过 `mesh_set_shadow_mesh` 工作正常
-- [ ] `NaniteDebug` 5+1 种调试模式可切换
-- [ ] 帧率 ≥ 30fps（10K tri 单网格场景，1080p）
-- [ ] 所有单元测试通过
+> **状态（2026-07-25）**：除"独立 `.gdextension` 插件"项外，其余项均已实现。Task 1.16 真实渲染补完已合入后，原 PARTIAL 项（BVH 遍历 / 可见性缓冲 / 材质解析）从占位实现升级为完整算法实现（Lambert + barycentric 插值）。详细验收清单见 [`spec/stage1-gdext-bridge/checklist.md`](spec/stage1-gdext-bridge/checklist.md)，差异对照见 [总体设计 10.5 节](nanite-overall-design.md#105-实现差异对照)（S1-05/S1-06/S1-07 已标注"已补完"）。
+
+- [ ] ~~GDExtension 编译为 `.gdextension` 插件可独立加载~~ → **延后至 Stage 4**：Stage 1 当前以 C++ module + `CompositorEffect` 内嵌实现，不打包为独立 `.gdextension`
+- [x] `CompositorEffect` 使用 `PRE_OPAQUE` + `POST_OPAQUE` 正确回调
+- [x] `RenderDataExtension::get_render_scene_data()` 获取相机/投影信息正确
+- [x] GPU Cull Shader 正确执行 BVH 遍历 + 三重剔除 + LOD 选择（Task 1.16.7 已补完）
+- [x] Visibility Buffer 正确生成（Task 1.16.8 已补完）
+- [x] GPU HZB 从深度缓冲正确构建（mip 降采样取 MAX）
+- [x] Material Resolve 输出正确颜色（Task 1.16.9 已补完，完整 PBR 留待 Stage 2+）
+- [x] 粗 LOD 阴影通过 `mesh_set_shadow_mesh` 工作正常
+- [x] `NaniteDebug` 5+1 种调试模式可切换
+- [x] 帧率 ≥ 30fps（10K tri 单网格场景，1080p）
+- [x] 所有单元测试通过
 
 ---
 
