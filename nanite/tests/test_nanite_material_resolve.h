@@ -48,11 +48,12 @@ namespace TestNaniteMaterialResolve {
 // NOTE: These tests require a Vulkan backend (RenderingDevice::get_singleton()
 // != nullptr). On OpenGL/headless they SKIP rather than FAIL.
 //
-// The Stage 1 rasterize shader writes exactly one pixel per visible cluster
-// (a placeholder coverage scheme — see nanite_rasterize.glsl). For the
+// Task 1.16.13.1 — the rasterize shader is the full soft-rasterizer
+// (per-triangle barycentric coverage test + depth interpolation). For the
 // ">= 10% non-black" assertion to pass, the screen size must be small
 // relative to the cluster count. We use an 8x8 target (64 pixels) with a
-// 32-segment sphere (~16 clusters by default config), giving ~25% coverage.
+// 32-segment sphere (~16 clusters by default config); the soft rasterizer
+// covers well over 10% of pixels when the camera looks at the sphere.
 
 // Builds a sphere NaniteMeshResource, uploads it to GPU SSBOs via
 // NaniteMeshData, and runs cull -> rasterize -> material_resolve.
@@ -83,8 +84,10 @@ inline NaniteMeshData *build_upload_and_run_pipeline(NaniteGPUPipeline &p_pipeli
 
 	p_pipeline.ensure_screen_buffers(p_rd, p_screen_w, p_screen_h);
 
-	// Stage 1: identity camera; the cull shader is pass-through so matrices
-	// don't affect the visible list.
+	// Task 1.16.13.1 — identity camera + identity model. The real cull
+	// shader (frustum + backface + HZB) may cull some clusters, but with
+	// identity view and the sphere centered at origin enough clusters
+	// remain visible to exercise the soft rasterizer.
 	NaniteGPUPipeline::CullParams params;
 	static const float identity[16] = {
 		1, 0, 0, 0,
@@ -94,6 +97,7 @@ inline NaniteMeshData *build_upload_and_run_pipeline(NaniteGPUPipeline &p_pipeli
 	};
 	memcpy(params.view_matrix, identity, sizeof(identity));
 	memcpy(params.projection, identity, sizeof(identity));
+	memcpy(params.model_matrix, identity, sizeof(identity));
 	params.screen_size[0] = p_screen_w;
 	params.screen_size[1] = p_screen_h;
 	params.error_threshold = 0.01f;
@@ -107,10 +111,12 @@ inline NaniteMeshData *build_upload_and_run_pipeline(NaniteGPUPipeline &p_pipeli
 		return nullptr;
 	}
 
-	// Stage 1 cull emits cluster_count as visible_count (pass-through).
-	p_pipeline.dispatch_rasterize(p_rd, visible_buffer, params.cluster_count, md);
+	// Task 1.16.6 — pass the per-instance model_matrix via push constant.
+	// Use cluster_count as the visible_count upper bound (extra threads
+	// return early via the shader's bounds check).
+	p_pipeline.dispatch_rasterize(p_rd, visible_buffer, params.cluster_count, md, identity);
 
-	p_pipeline.dispatch_material_resolve(p_rd, p_pipeline.get_vis_buffer(), md, p_debug_mode);
+	p_pipeline.dispatch_material_resolve(p_rd, p_pipeline.get_vis_buffer(), md, p_debug_mode, identity);
 
 	// Make the compute writes visible to the CPU read-back below.
 	p_rd->barrier();
@@ -157,9 +163,10 @@ TEST_CASE("[Nanite][MaterialResolve] output_is_non_black") {
 	REQUIRE(md != nullptr);
 
 	uint32_t non_black = count_non_black_pixels(rd, pipeline.get_color_buffer(), screen_w, screen_h);
-	// Stage 1 writes one pixel per visible cluster. The 32-segment sphere
-	// yields ~16 clusters, all of which land inside the 8x8 target, so we
-	// expect well above the 10% threshold (16/64 = 25%).
+	// Task 1.16.13.1 — the soft rasterizer covers all pixels inside each
+	// visible triangle. With identity camera and the 32-segment sphere
+	// centered at origin, multiple clusters overlap the 8x8 target; the
+	// real coverage is well above the 10% threshold.
 	CHECK(non_black * 10 >= (uint32_t)total_pixels); // >= 10%
 
 	md->free_gpu_resources(rd);
