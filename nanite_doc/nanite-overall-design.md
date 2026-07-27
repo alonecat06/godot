@@ -248,62 +248,96 @@ public:
 
 ### 4.2 编译期宏控制
 
-```cpp
-// nanite/nanite_server.cpp
-#include "nanite_bridge.h"
+> **S1-08 重构后**：核心模块（`nanite/core/`）不再 `#include` 任何桥接具体类型。编译期宏只影响桥接层自身与 `register_types.cpp` 的编译选型。核心 `NaniteServer` 通过 `INaniteBridge *` 抽象指针 + `set_bridge()` setter 与桥接解耦。
 
+```cpp
+// nanite/core/nanite_server.cpp — 核心零桥接依赖
+#include "nanite/core/nanite_bridge.h"  // 仅抽象接口
+
+// nanite/register_types.cpp — 桥接选型在 register_types 完成
+#include "nanite/core/nanite_server.h"
 #if defined(NANITE_BRIDGE_GDEXT)
-#include "nanite_gdext_bridge.h"
+#include "nanite/bridge/nanite_gdext_bridge_manager.h"
 #endif
 #if defined(NANITE_BRIDGE_MODULE)
-#include "nanite_module_bridge.h"
+#include "nanite/bridge/nanite_module_bridge_manager.h"
 #endif
-#if defined(NANITE_BRIDGE_DEEP)
-#include "nanite_deep_bridge.h"
-#endif
+// ... Stage 2/3 各自的 Manager
 ```
 
 ### 4.3 运行时 ProjectSettings 激活
 
+> **设计原则（S1-08 重构后）**：核心 `NaniteServer` 不直接 `memnew` 任何具体桥接类，只持有 `INaniteBridge *` 抽象指针。具体桥接（如 `NaniteGDExtBridge`）的实例化、Compositor 创建、SceneTree 监听等全部由各桥接层独立的 Manager（如 `NaniteGDExtBridgeManager`）在 `register_types.cpp` 的 `MODULE_INITIALIZATION_LEVEL_SERVERS` 阶段完成，再通过 `NaniteServer::set_bridge(INaniteBridge *)` setter 注入。核心模块不依赖任何桥接具体类型。
+
 ```cpp
-// nanite/nanite_server.cpp — NaniteServer::init()
+// nanite/core/nanite_server.h — 核心只持有抽象指针
+class NaniteServer {
+    INaniteBridge *bridge = nullptr;  // 抽象指针，由 register_types 注入
+public:
+    void set_bridge(INaniteBridge *p_bridge);  // 公开 setter
+    // ...
+};
 
+// nanite/core/nanite_server.cpp — init() 不再创建具体桥接
 void NaniteServer::init() {
-    // 注册 ProjectSettings
-    if (!ProjectSettings::get_singleton()->has_setting("nanite/bridge/active")) {
-        ProjectSettings::get_singleton()->set("nanite/bridge/active", "gdext");
+    singleton = this;
+    GLOBAL_DEF(PropertyInfo(...), "gdext");
+    // 不 memnew 桥接 — 由 register_types 负责
+    page_cache = memnew(NanitePageCache);
+    debug = memnew(NaniteDebug);
+    // gpu_pipeline 在首次 render_visibility 时懒创建
+}
+
+// nanite/bridge/nanite_gdext_bridge_manager.cpp — 桥接层独立 singleton
+NaniteGDExtBridgeManager *NaniteGDExtBridgeManager::singleton = nullptr;
+
+void NaniteGDExtBridgeManager::init(NaniteServer *p_server) {
+    singleton = this;
+    // 1) 创建两个 CompositorEffect 实例（PRE_OPAQUE + POST_OPAQUE）
+    pre_opaque_bridge = Ref<NaniteGDExtBridge>(memnew(NaniteGDExtBridge(...)));
+    post_opaque_bridge = Ref<NaniteGDExtBridge>(memnew(NaniteGDExtBridge(...)));
+    // 2) 创建预制 Compositor 并塞入两个 bridge Ref
+    default_compositor.instantiate();
+    TypedArray<CompositorEffect> effects;
+    effects.push_back(pre_opaque_bridge);
+    effects.push_back(post_opaque_bridge);
+    default_compositor->set_compositor_effects(effects);
+    // 3) 通过 setter 注入核心
+    p_server->set_bridge(pre_opaque_bridge.ptr());
+    pre_opaque_bridge->install(p_server);
+    // 4) 连接 SceneTree::node_added + 每帧轮询 _viewports group 双路径兜底
+    SceneTree *st = SceneTree::get_singleton();
+    if (st) {
+        st->connect("node_added", callable_mp(this, &NaniteGDExtBridgeManager::_on_node_added));
+        st->connect("process_frame", callable_mp(this, &NaniteGDExtBridgeManager::_on_process_frame));
     }
-    ProjectSettings::get_singleton()->set_custom_property_info(
-        "nanite/bridge/active",
-        PropertyInfo(Variant::STRING, "nanite/bridge/active",
-                     PROPERTY_HINT_ENUM, "gdext,module,deep"));
+}
 
-    // 运行时选择
-    String active = GLOBAL_GET("nanite/bridge/active");
-
+// nanite/register_types.cpp — 模块加载时由 register_types 创建 Manager
+void initialize_nanite_module(ModuleInitializationLevel p_level) {
+    if (p_level == MODULE_INITIALIZATION_LEVEL_SERVERS) {
+        ClassDB::register_class<NaniteServer>();
+        // ...
+        NaniteServer::get_singleton()->init();  // 核心 init 不创建桥接
 #if defined(NANITE_BRIDGE_GDEXT)
-    if (active == "gdext") {
-        bridge = memnew(NaniteGDExtBridge);
-    }
+        memnew(NaniteGDExtBridgeManager);  // Manager 独立 singleton
+        NaniteGDExtBridgeManager::get_singleton()->init(NaniteServer::get_singleton());
 #endif
-#if defined(NANITE_BRIDGE_MODULE)
-    if (active == "module") {
-        bridge = memnew(NaniteModuleBridge);
-    }
-#endif
-#if defined(NANITE_BRIDGE_DEEP)
-    if (active == "deep") {
-        bridge = memnew(NaniteDeepBridge);
-    }
-#endif
-
-    if (bridge) {
-        bridge->install(this);
-    } else {
-        ERR_PRINT(vformat("Nanite: bridge '%s' not available (not compiled).", active));
     }
 }
 ```
+
+**关键变化**：
+
+| 维度 | 旧设计（S1-08 前） | 新设计（S1-08 重构后） |
+|------|-------------------|----------------------|
+| 桥接实例化位置 | `NaniteServer::init()` 内 `memnew(NaniteGDExtBridge)` | `NaniteGDExtBridgeManager::init()` 内 |
+| 核心持有的类型 | `Ref<NaniteGDExtBridge>` 具体类型 | `INaniteBridge *` 抽象指针 |
+| Compositor 创建 | 核心创建（旧设计未实现，仅在文档规划中） | Manager 创建并持有 |
+| SceneTree 监听 | 核心监听（违反核心通用原则） | Manager 监听（桥接专属） |
+| Viewport 遍历 | 核心遍历（违反核心通用原则） | Manager 遍历（桥接专属） |
+| 核心对桥接具体类型的依赖 | 直接 `#include "nanite/bridge/nanite_gdext_bridge.h"` | 零依赖（仅 `INaniteBridge` 抽象接口） |
+| 多桥接共存能力 | 弱（核心代码内嵌具体桥接创建） | 强（Manager 独立，Stage 2/3 可平行实现自己的 Manager） |
 
 ### 4.4 切换机制流程
 
@@ -1818,7 +1852,7 @@ public:
 
 > **阶段目标**：在使用 GDExtension 桥接层（`CompositorEffect` 接入）的情况下，**完整实现 Nanite 渲染** —— 包括 Cull（BVH 遍历 + 视锥/背面/HZB 遮挡剔除 + LOD 选择）、Rasterize（meshlet 解码 + 三角形软光栅化 + VisBuffer 写入）、HZB Build（层次化深度降采样）、Material Resolve（barycentric 插值 + Lambert 着色）四个 Pass 的真实算法实现，使 Stage 1 完成后即可在场景中放置 `NaniteMeshInstance3D` 看到真实 Nanite 渲染输出。
 >
-> **实现状态（2026-07-25）**：Stage 1 已实现完成（作为 module 内子目录 `nanite/bridge/`，通过 `NANITE_BRIDGE_GDEXT` 宏条件编译，而非独立 GDExtension 插件）。Task 1.1-1.15 框架已跑通，Task 1.16 真实渲染补完已合入（替代 1.5/1.11 占位实现），Task 1.17 Compositor 自动挂接已合入（替代原 S1-08 推迟项），Stage 1 现为完整可渲染状态：场景中放置 `NaniteMeshInstance3D` 后引擎每帧自动触发 PRE_OPAQUE / POST_OPAQUE 回调并输出真实 Nanite 渲染。doctest/GDScript 测试已编写（部分需 Vulkan 后端运行时验证）。详见 `nanite_doc/spec/stage1-gdext-bridge/` 下的 spec.md / tasks.md / checklist.md。
+> **实现状态（2026-07-25）**：Stage 1 已实现完成（作为 module 内子目录 `nanite/bridge/`，通过 `NANITE_BRIDGE_GDEXT` 宏条件编译，而非独立 GDExtension 插件）。Task 1.1-1.15 框架已跑通，Task 1.16 真实渲染补完已合入（替代 1.5/1.11 占位实现）。Task 1.17 Compositor 自动挂接重构为 **`NaniteGDExtBridgeManager` 独立 singleton**（在桥接层）：核心 `NaniteServer` 不再持有 `Ref<NaniteGDExtBridge>`，改为只持有 `INaniteBridge *` 抽象指针；所有 gdext 专属逻辑（创建 Compositor / 监听 SceneTree / 遍历 `_viewports` group / 追加 effect 到用户 Compositor）集中在 `nanite/bridge/nanite_gdext_bridge_manager.h/cpp`，通过 `NaniteServer::set_bridge(INaniteBridge *)` setter 注入。覆盖三大目标 viewport：游戏运行时、Nanite preview 窗口、引擎 3D 工作区。doctest/GDScript 测试已编写（部分需 Vulkan 后端运行时验证）。详见 `nanite_doc/spec/stage1-gdext-bridge/` 下的 spec.md / tasks.md / checklist.md。
 >
 > **关键实现差异**（与下方原始设计的对照见 10.5 节，S1-05/S1-06/S1-07/S1-08 已在 Stage 1 内补完）。
 
@@ -1996,7 +2030,7 @@ Stage 1 实现过程中发现 Godot 4.7.1 真实 API 与本节 10.3 代码骨架
 | S1-05 | cull shader 完整 BVH 遍历 + 视锥剔除 + 背面剔除 + HZB 遮挡 + LOD 选择 | **已补完（Stage 1 内）**：完整实现 per-cluster parallel BVH-aware 测试（视锥 6 平面 / 法线锥背面 / HZB 最粗 mip 遮挡 / parent-fallback LOD 选择），详见 `stage1-gdext-bridge/spec.md` "补完：真实 Nanite 渲染" + Task 1.16.7 | 最初为验证管线连通性采用 pass-through；Task 1.16 在 Stage 1 内补完真实剔除算法，不再留待 Stage 2 |
 | S1-06 | rasterize shader 软光栅化写 Visibility Buffer | **已补完（Stage 1 内）**：完整实现 meshlet 解码 + 三角形 2D 重心坐标测试 + 深度插值 + 非原子 compare-then-store 深度测试（R32_SFLOAT 不支持 `imageAtomicCompSwap`，Stage 2 可改 R32_UINT + atomic 路径），详见 Task 1.16.8 | 最初为验证 GPU dispatch 路径占位（每 thread 写固定像素）；Task 1.16 在 Stage 1 内补完全软光栅化，Stage 2 可加大三角硬件光栅混合路径 |
 | S1-07 | material_resolve shader 绑定 vertex_ssbo + materials_ssbo，做 barycentric 插值 + BRDF 着色 | **已补完（Stage 1 内）**：绑定 materials_ssbo（binding 3）+ vertex_ssbo（binding 4 含 normal/uv），实现 barycentric 插值 + Lambert 着色 + 调试模式分支，详见 Task 1.16.9 | 最初因 `NaniteMeshResource::get_materials()` 未暴露、材质数据未上传 GPU 而简化为固定灰；Task 1.16 在 Stage 1 内补完材质访问器 + 上传 + Lambert 着色；完整 PBR BRDF 仍留待 Stage 2+ |
-| S1-08 | CompositorEffect 自动挂接到默认 Compositor | **已补完（Stage 1 内）**：`NaniteServer::init` 创建内部 `Ref<Compositor> default_compositor`，将两个 `NaniteGDExtBridge` Ref 加入 `set_compositor_effects(...)`；通过 ProjectSetting `nanite/bridge/auto_attach_compositor`（默认 true）+ `RenderingServer::scenario_set_compositor` 在 `World3D` 创建时自动挂接。同时 `render_visibility` / `render_material_resolve` 改读 `RenderData::get_render_scene_data()` 提供的真实 `get_cam_transform()` / `get_cam_projection()` + `get_render_scene_buffers()->get_internal_size()`。详见 Task 1.17 | Stage 1 最初为节省时间仅完成框架，挂接逻辑推迟；Task 1.17 在 Stage 1 内补完，让引擎每帧真正触发渲染回调 |
+| S1-08 | CompositorEffect 自动挂接到默认 Compositor | **已补完（Stage 1 内）**：所有 gdext 专属挂接逻辑移到桥接层 `NaniteGDExtBridgeManager`（独立 singleton），核心 `NaniteServer` 仅持有 `INaniteBridge *` 抽象指针并通过 `set_bridge()` setter 接收注入。Manager 创建内部 `Ref<Compositor> default_compositor`（持有 PRE_OPAQUE + POST_OPAQUE 两个 `NaniteGDExtBridge` Ref），通过 `SceneTree::node_added` 信号 + 每 60 帧轮询 `_viewports` group 的双路径兜底，将 default_compositor 注入到三类目标 viewport 的 `find_world_3d()`（无 compositor 时直接挂接，有 compositor 时调用 `attach_to_compositor()` 追加 nanite effect 到用户已有 Compositor）。用户也可在 inspector 把 `NaniteServer.get_default_compositor()` 返回的预制 Compositor 拖到 `WorldEnvironment.compositor` / `Camera3D.compositor` 属性。同时 `render_visibility` / `render_material_resolve` 改读 `RenderData::get_render_scene_data()` 真实 `get_cam_transform()` / `get_cam_projection()` + `get_render_scene_buffers()->get_internal_size()`。详见 Task 1.17 | Stage 1 最初为节省时间仅完成框架，挂接逻辑推迟；Task 1.17 在 Stage 1 内补完，让引擎每帧真正触发渲染回调。重构后核心模块保持纯净，桥接逻辑集中在 `nanite/bridge/`，为 Stage 2/3 桥接复用提供清晰边界 |
 | S1-09 | `get_render_data()` 获取相机/投影 | `get_render_scene_data()` (RenderDataExtension) | 调研文档 D02 已纠正 |
 | S1-10 | HZB 测试 `correct_mip_count_for_resolution` / `downsample_takes_max_of_2x2` / `resize_handles_resolution_change` | `compute_mip_count_for_common_resolutions` / `init_and_build_smoke_test` / `downsample_takes_max_of_2x2` | 测试用例名略有不同但功能覆盖等价；`resize_handles_resolution_change` 未单独编写，由 `init_and_build_smoke_test` 间接覆盖 |
 
@@ -2558,9 +2592,9 @@ public:
 
 **阶段一(GDExtension)验收标准**：
 
-> **状态（2026-07-25）**：除"独立 .gdextension 插件"项外，其余项均已实现。Task 1.16 真实渲染补完（S1-05/06/07）+ Task 1.17 Compositor 自动挂接（S1-08）已合入后，原 PARTIAL 项全部升级为完整实现：BVH 遍历 / 可见性缓冲 / 材质解析（Lambert + barycentric 插值）+ CompositorEffect 每帧自动触发。详见 10.5 节实现差异对照（S1-05/S1-06/S1-07/S1-08 已标注"已补完"）。
+> **状态（2026-07-25）**：除"独立 .gdextension 插件"项外，其余项均已实现。Task 1.16 真实渲染补完（S1-05/06/07）+ Task 1.17 Compositor 自动挂接（S1-08）已合入后，原 PARTIAL 项全部升级为完整实现：BVH 遍历 / 可见性缓冲 / 材质解析（Lambert + barycentric 插值）+ CompositorEffect 每帧自动触发。Task 1.17 重构为 `NaniteGDExtBridgeManager` 独立 singleton 模式后，核心 `NaniteServer` 保持纯净（仅持有 `INaniteBridge *` 抽象指针），所有 gdext 专属挂接逻辑集中在桥接层。详见 10.5 节实现差异对照（S1-05/S1-06/S1-07/S1-08 已标注"已补完"）。
 
-- [x] CompositorEffect PRE_OPAQUE 回调被正确触发 (Task 1.17 已补完：`NaniteServer::init` 创建 `default_compositor` 并通过 `scenario_set_compositor` 自动挂接；引擎每帧触发 `render_visibility` / `render_material_resolve`)
+- [x] CompositorEffect PRE_OPAQUE 回调被正确触发 (Task 1.17 已补完：`NaniteGDExtBridgeManager` 创建 `default_compositor` 并通过 `SceneTree::node_added` + `_viewports` group 轮询双路径注入到游戏运行时 / Nanite preview 窗口 / 引擎 3D 工作区；引擎每帧触发 `render_visibility` / `render_material_resolve`)
 - [x] BVH 遍历 + LOD 选择在 GPU 正确执行 (Task 1.16.7 已补完：per-cluster parallel BVH-aware 测试 + parent-fallback LOD)
 - [x] 可见性缓冲正确生成(调试可视化可观察) (Task 1.16.8 已补完：meshlet 解码 + 三角形软光栅化 + 深度测试。Stage 1 因 R32_SFLOAT 不支持 `imageAtomicCompSwap`，简化为非原子 compare-then-store，race-safe 由"last writer wins per pixel"保证；Stage 2 可改 R32_UINT + atomic 路径)
 - [x] 材质解析正确(与标准材质对比) (Task 1.16.9 已补完：barycentric 插值 + Lambert 着色 + 调试模式分支；完整 PBR 留待 Stage 2+)

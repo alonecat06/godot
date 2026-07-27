@@ -816,7 +816,7 @@ func _test_classdb_registration() -> void:
 
 **目标**：在使用 GDExtension 桥接层（`CompositorEffect` 接入）的情况下，**完整实现 Nanite 渲染** —— 包括 Cull（BVH 遍历 + 视锥/背面/HZB 遮挡剔除 + LOD 选择）、Rasterize（meshlet 解码 + 三角形软光栅化 + VisBuffer 写入）、HZB Build（层次化深度降采样）、Material Resolve（barycentric 插值 + Lambert 着色）四个 Pass 的真实算法实现，使 Stage 1 完成后即可在场景中放置 `NaniteMeshInstance3D` 看到真实 Nanite 渲染输出。使用粗 LOD 阴影方案。
 
-> **状态（2026-07-25）**：原 1.4/1.5/1.6 中 Cull / Rasterize / Material Resolve 三个 Pass 最初为占位实现（pass-through / 每线程写一像素 / 固定灰），仅 HZB downsample 为真实算法。Task 1.16 "真实 Nanite 渲染补完" 已在 Stage 1 内补完真实算法，使 Stage 1 现为完整可渲染状态。详细任务、子任务与验收清单见 Stage 1 spec 文档 [`nanite_doc/spec/stage1-gdext-bridge/`](spec/stage1-gdext-bridge/)（spec.md / tasks.md / checklist.md）。
+> **状态（2026-07-25）**：原 1.4/1.5/1.6 中 Cull / Rasterize / Material Resolve 三个 Pass 最初为占位实现（pass-through / 每线程写一像素 / 固定灰），仅 HZB downsample 为真实算法。Task 1.16 "真实 Nanite 渲染补完" 已在 Stage 1 内补完真实算法。Task 1.17 Compositor 自动挂接重构为 `NaniteGDExtBridgeManager` 独立 singleton 模式：所有 gdext 专属逻辑（创建 Compositor / 监听 SceneTree / 遍历 `_viewports` group / 追加 effect 到用户 Compositor）集中在桥接层，核心 `NaniteServer` 只持有 `INaniteBridge *` 抽象指针并通过 `set_bridge()` setter 接收注入。Stage 1 现为完整可渲染状态，覆盖游戏运行时 / Nanite preview 窗口 / 引擎 3D 工作区三大 viewport。详细任务、子任务与验收清单见 Stage 1 spec 文档 [`nanite_doc/spec/stage1-gdext-bridge/`](spec/stage1-gdext-bridge/)（spec.md / tasks.md / checklist.md）。
 
 ### 1.1 GDExtension 框架搭建
 
@@ -1248,7 +1248,7 @@ func test_gdext_performance_baseline():
 
 ### 1.10 阶段 1 验收标准
 
-> **状态（2026-07-25）**：除"独立 `.gdextension` 插件"项外，其余项均已实现。Task 1.16 真实渲染补完已合入后，原 PARTIAL 项（BVH 遍历 / 可见性缓冲 / 材质解析）从占位实现升级为完整算法实现（Lambert + barycentric 插值）。详细验收清单见 [`spec/stage1-gdext-bridge/checklist.md`](spec/stage1-gdext-bridge/checklist.md)，差异对照见 [总体设计 10.5 节](nanite-overall-design.md#105-实现差异对照)（S1-05/S1-06/S1-07 已标注"已补完"）。
+> **状态（2026-07-25）**：除"独立 `.gdextension` 插件"项外，其余项均已实现。Task 1.16 真实渲染补完已合入后，原 PARTIAL 项（BVH 遍历 / 可见性缓冲 / 材质解析）从占位实现升级为完整算法实现（Lambert + barycentric 插值）。Task 1.17 Compositor 自动挂接重构为 `NaniteGDExtBridgeManager` 独立 singleton 模式，核心 `NaniteServer` 保持纯净（仅 `INaniteBridge *` 抽象指针 + `set_bridge()` setter），桥接专属逻辑全部在 `nanite/bridge/`。详细验收清单见 [`spec/stage1-gdext-bridge/checklist.md`](spec/stage1-gdext-bridge/checklist.md)，差异对照见 [总体设计 10.5 节](nanite-overall-design.md#105-实现差异对照)（S1-05/S1-06/S1-07/S1-08 已标注"已补完"）。
 
 - [ ] ~~GDExtension 编译为 `.gdextension` 插件可独立加载~~ → **延后至 Stage 4**：Stage 1 当前以 C++ module + `CompositorEffect` 内嵌实现，不打包为独立 `.gdextension`
 - [x] `CompositorEffect` 使用 `PRE_OPAQUE` + `POST_OPAQUE` 正确回调
@@ -1982,10 +1982,12 @@ TEST_CASE("NaniteMeshResource save/load roundtrip from GDExt") {
 - shader 加载逻辑保持不变（`parse_versions_from_text` 解析嵌入字符串）
 - 替换 `RenderingDevice::get_singleton()` 为 `godot_cpp/classes/rendering_device.hpp` 的公开访问
 
-**任务 4.5.3**：迁移 `NaniteGDExtBridge`
+**任务 4.5.3**：迁移 `NaniteGDExtBridge` + `NaniteGDExtBridgeManager`
 - 当前代码已用 `NANITE_BRIDGE_GDEXT` 宏隔离，剥离时直接启用
 - 删除对 `scene/resources/compositor.h` 内部头文件的依赖
 - 改用 ClassDB 反射调用 `Compositor` 的 `add_compositor_effect` / `remove_compositor_effect`
+- **`NaniteGDExtBridgeManager`** 是独立 singleton，负责创建 `default_compositor`、监听 `SceneTree::node_added`、轮询 `_viewports` group、把 nanite effect 追加到用户已有 Compositor — 全部在桥接层完成，核心 `NaniteServer` 仅通过 `set_bridge(INaniteBridge *)` setter 接收注入
+- Manager 需迁移到 `addons/nanite/src/bridge/nanite_gdext_bridge_manager.h/cpp`，在 `register_types.cpp` 的 `MODULE_INITIALIZATION_LEVEL_SERVERS` 阶段创建实例并调用 `init(NaniteServer *)`
 
 **任务 4.5.4**：迁移 `NaniteMeshInstance3D`
 - 当前代码继承 `MeshInstance3D`，使用公开 API（`set_base` / `get_base`），可直接迁移
