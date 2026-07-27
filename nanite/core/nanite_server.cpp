@@ -69,10 +69,10 @@ void NaniteServer::init() {
 	singleton = this;
 
 	// Register the project setting that selects which bridge backend is
-	// active. GLOBAL_DEF is idempotent: it only registers the default
-	// the first time, so calling it here on every init() is safe.
-	GLOBAL_DEF(PropertyInfo(Variant::STRING, "nanite/bridge/active", PROPERTY_HINT_ENUM, "gdext,module,deep"), "gdext");
-
+	// active, and read its current value in one call. GLOBAL_DEF is
+	// idempotent and returns the registered value (existing or default);
+	// using its return value avoids a separate GLOBAL_GET, which can trip
+	// on ProjectSettings / OS initialization ordering at SERVERS level.
 	page_cache = memnew(NanitePageCache);
 	debug = memnew(NaniteDebug);
 
@@ -82,7 +82,7 @@ void NaniteServer::init() {
 	// via NaniteServer::set_bridge(). The active backend is selected by
 	// which Manager the bridge layer decides to construct; the
 	// `nanite/bridge/active` setting is informational only at this level.
-	String active_bridge = GLOBAL_GET("nanite/bridge/active");
+	String active_bridge = GLOBAL_DEF(PropertyInfo(Variant::STRING, "nanite/bridge/active", PROPERTY_HINT_ENUM, "gdext,module,deep"), "gdext");
 	if (!(active_bridge == "gdext" || active_bridge == "module" || active_bridge == "deep")) {
 		ERR_PRINT(vformat("NaniteServer: unknown bridge '%s'. Falling back to no bridge.", active_bridge));
 	}

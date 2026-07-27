@@ -44,11 +44,13 @@ NaniteGDExtBridgeManager *NaniteGDExtBridgeManager::singleton = nullptr;
 void NaniteGDExtBridgeManager::init(NaniteServer *p_server) {
 	singleton = this;
 
-	// Register the auto-attach toggle. GLOBAL_DEF is idempotent; default
-	// true so the manager wires itself up out of the box. Users can turn
-	// it off in the Project Settings to drive attachment manually.
-	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "nanite/bridge/auto_attach_compositor"), true);
-	auto_attach_enabled = GLOBAL_GET("nanite/bridge/auto_attach_compositor");
+	// Register the auto-attach toggle and read its current value in one
+	// call. GLOBAL_DEF is idempotent and returns the registered value
+	// (existing or default); using its return value avoids a separate
+	// GLOBAL_GET, which can trip on ProjectSettings / OS initialization
+	// ordering at SERVERS level (get_setting_with_override() calls
+	// OS::get_singleton()->has_feature() during feature-override lookup).
+	auto_attach_enabled = GLOBAL_DEF(PropertyInfo(Variant::BOOL, "nanite/bridge/auto_attach_compositor"), true);
 
 	// 1) Create two CompositorEffect instances (one per callback type).
 	//    The PRE_OPAQUE instance is also the "main" INaniteBridge handle
