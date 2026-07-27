@@ -77,6 +77,17 @@ void initialize_nanite_module(ModuleInitializationLevel p_level) {
 		ClassDB::register_class<NaniteBuilder>();
 		ClassDB::register_class<NaniteMeshResource>();
 		ClassDB::register_class<NaniteMeshInstance3D>();
+
+		// Phase-2 init for the core: RenderingDevice is now available
+		// (DisplayServer::create ran between SERVERS and SCENE module init
+		// in main.cpp setup2()). This is where gpu_pipeline gets created;
+		// doing it here — rather than lazily in set_bridge() — keeps
+		// pipeline init and bridge injection as independent concerns.
+		NaniteServer *ns = NaniteServer::get_singleton();
+		if (ns != nullptr) {
+			ns->init_engine_post();
+		}
+
 #if defined(NANITE_BRIDGE_GDEXT)
 		// CompositorEffect is itself registered at SCENE level (see
 		// scene/register_scene_types.cpp), so the gdext bridge must be
@@ -102,7 +113,6 @@ void initialize_nanite_module(ModuleInitializationLevel p_level) {
 		// INSIDE init() (singleton = this), so get_singleton() would
 		// return nullptr before init() runs. Calling init() on nullptr
 		// crashes on the first member write (e.g. auto_attach_enabled).
-		NaniteServer *ns = NaniteServer::get_singleton();
 		if (ns != nullptr) {
 			NaniteGDExtBridgeManager *mgr = memnew(NaniteGDExtBridgeManager);
 			mgr->init(ns);

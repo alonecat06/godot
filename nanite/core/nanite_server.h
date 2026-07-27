@@ -114,8 +114,11 @@ protected:
 public:
 	static NaniteServer *get_singleton() { return singleton; }
 
-	// Lifecycle — called from register_types at MODULE_INITIALIZATION_LEVEL_SERVERS.
+	// Lifecycle — split into two phases to respect Godot's init ordering:
+	//   - init()              runs at MODULE_INITIALIZATION_LEVEL_SERVERS (RS/RD NOT yet created).
+	//   - init_engine_post()  runs at MODULE_INITIALIZATION_LEVEL_SCENE    (RS/RD already created by DisplayServer).
 	void init();
+	void init_engine_post();
 	void finish();
 
 	// Mesh resource registration (ref-counted).
@@ -150,12 +153,10 @@ public:
 	// NaniteGDExtBridgeManager). Stores a raw pointer; the caller owns
 	// the bridge lifetime. Passing nullptr clears the link.
 	//
-	// Out-of-line: when a bridge is first injected at SCENE level (where
-	// RenderingDevice is finally available, unlike at SERVERS init() time),
-	// this is also where the GPU pipeline is lazily created and
-	// initialized. Moving the creation here avoids the RD-null branch in
-	// init() that left gpu_pipeline perpetually nullptr and caused
-	// render_visibility to early-out on every frame.
+	// NOTE: this only stores the pointer. GPU pipeline creation now lives
+	// in init_engine_post() (SCENE level, after RS/RD are up) — previously
+	// it was lazily created here, but that coupled bridge injection with
+	// pipeline init and made the ordering hard to reason about.
 	void set_bridge(INaniteBridge *p_bridge);
 	void set_shadow_mode(INaniteBridge::ShadowMode p_mode) { shadow_mode = p_mode; }
 	INaniteBridge::ShadowMode get_shadow_mode() const { return shadow_mode; }

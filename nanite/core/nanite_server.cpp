@@ -78,7 +78,7 @@ void NaniteServer::init() {
 
 	// Task 1.17.2 — core init no longer creates any concrete bridge.
 	// `bridge` stays nullptr here and is injected by the bridge layer's
-	// Manager (see register_types.cpp at MODULE_INITIALIZATION_LEVEL_SERVERS)
+	// Manager (see register_types.cpp at MODULE_INITIALIZATION_LEVEL_SCENE)
 	// via NaniteServer::set_bridge(). The active backend is selected by
 	// which Manager the bridge layer decides to construct; the
 	// `nanite/bridge/active` setting is informational only at this level.
@@ -87,31 +87,46 @@ void NaniteServer::init() {
 		ERR_PRINT(vformat("NaniteServer: unknown bridge '%s'. Falling back to no bridge.", active_bridge));
 	}
 
-	// Task 1.5 / 1.16.11 — GPU pipeline creation is deferred to
-	// set_bridge(). At SERVERS init() time RenderingDevice is not yet
-	// available (RenderingServer is created AFTER initialize_modules(SERVERS)
-	// in main.cpp setup2()), so creating the pipeline here would always
-	// hit the RD-null branch and leave gpu_pipeline perpetually nullptr —
-	// causing render_visibility to early-out every frame. set_bridge() is
-	// called by the bridge layer's Manager at SCENE level, where RS/RD
-	// are guaranteed ready.
+	// Task 1.5 / 1.16.11 — GPU pipeline creation happens in
+	// init_engine_post() (SCENE level). At SERVERS init() time
+	// RenderingDevice is not yet available: RenderingServer is created
+	// AFTER initialize_modules(SERVERS) in main.cpp setup2(), and
+	// RenderingDevice itself is only memnew'd inside DisplayServer::create()
+	// (which runs even later, between SERVERS and SCENE module init).
+	// Creating the pipeline here would always hit the RD-null branch and
+	// leave gpu_pipeline perpetually nullptr — causing render_visibility
+	// to early-out every frame.
+}
+
+void NaniteServer::init_engine_post() {
+	// Second-phase init — called at MODULE_INITIALIZATION_LEVEL_SCENE,
+	// where DisplayServer has already been created and RenderingDevice
+	// is available. Owns any subsystem that needs RS/RD.
+	//
+	// Idempotent: safe to call multiple times (e.g. if a future code path
+	// also wants to ensure post-RD init has run). The pipeline is created
+	// once and reused; subsequent calls are a no-op.
+	if (gpu_pipeline != nullptr) {
+		return;
+	}
+	RenderingDevice *rd = RenderingDevice::get_singleton();
+	if (rd == nullptr) {
+		// RD unavailable (headless / no RD backend). gpu_pipeline stays
+		// nullptr and render_visibility early-outs — same behavior as
+		// the previous set_bridge()-lazy-create code path.
+		ERR_PRINT_ONCE("NaniteServer::init_engine_post: RenderingDevice is null; GPU pipeline will not be created.");
+		return;
+	}
+	gpu_pipeline = memnew(NaniteGPUPipeline);
+	gpu_pipeline->init(rd);
 }
 
 void NaniteServer::set_bridge(INaniteBridge *p_bridge) {
+	// Only stores the pointer — pipeline creation is handled by
+	// init_engine_post() (called at SCENE level from register_types.cpp,
+	// before the bridge Manager injects itself). This decouples bridge
+	// injection from pipeline init and makes the ordering explicit.
 	bridge = p_bridge;
-	// Lazily create + init the GPU pipeline on first bridge injection.
-	// At SERVERS init() time RenderingDevice is not yet available, so
-	// we can't create it there. By the time a bridge is injected (SCENE
-	// level, via NaniteGDExtBridgeManager::init), RS/RD are ready.
-	// Also re-init if bridge is being re-set after a previous clear
-	// (gpu_pipeline may already exist — don't leak).
-	if (p_bridge != nullptr && gpu_pipeline == nullptr) {
-		RenderingDevice *rd = RenderingDevice::get_singleton();
-		if (rd) {
-			gpu_pipeline = memnew(NaniteGPUPipeline);
-			gpu_pipeline->init(rd);
-		}
-	}
 }
 
 void NaniteServer::finish() {
