@@ -77,8 +77,12 @@ void initialize_nanite_module(ModuleInitializationLevel p_level) {
 		// itself into NaniteServer via set_bridge() and wires SceneTree
 		// signals for automatic viewport attachment.
 		// The Manager is NOT a GDCLASS: lifetime is fully controlled here.
-		memnew(NaniteGDExtBridgeManager);
-		NaniteGDExtBridgeManager::get_singleton()->init(ns);
+		// NOTE: capture the pointer from memnew — `singleton` is only set
+		// INSIDE init() (singleton = this), so get_singleton() would
+		// return nullptr before init() runs. Calling init() on nullptr
+		// crashes on the first member write (e.g. auto_attach_enabled).
+		NaniteGDExtBridgeManager *mgr = memnew(NaniteGDExtBridgeManager);
+		mgr->init(ns);
 #endif
 		return;
 	}
@@ -120,9 +124,14 @@ void uninitialize_nanite_module(ModuleInitializationLevel p_level) {
 		// Task 1.17.9 — tear down the bridge layer's Manager BEFORE
 		// NaniteServer::finish() so the Manager can call
 		// set_bridge(nullptr) while NaniteServer is still alive.
-		if (NaniteGDExtBridgeManager::get_singleton() != nullptr) {
-			NaniteGDExtBridgeManager::get_singleton()->finish();
-			memdelete(NaniteGDExtBridgeManager::get_singleton());
+		// NOTE: capture the pointer before calling finish() — finish()
+		// clears `singleton` (singleton = nullptr) as its last step, so
+		// get_singleton() would return nullptr after finish() and
+		// memdelete(nullptr) would crash.
+		NaniteGDExtBridgeManager *mgr = NaniteGDExtBridgeManager::get_singleton();
+		if (mgr != nullptr) {
+			mgr->finish();
+			memdelete(mgr);
 		}
 #endif
 		// Tear down the singleton. Capture the pointer first because
