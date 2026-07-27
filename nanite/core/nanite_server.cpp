@@ -87,14 +87,30 @@ void NaniteServer::init() {
 		ERR_PRINT(vformat("NaniteServer: unknown bridge '%s'. Falling back to no bridge.", active_bridge));
 	}
 
-	// Task 1.5 / 1.16.11 — create + initialize the GPU pipeline when a
-	// RenderingDevice is available. Headless/test runs without a Vulkan
-	// backend leave gpu_pipeline nullptr; render_visibility /
-	// render_material_resolve early-out on the null check.
-	RenderingDevice *rd = RenderingDevice::get_singleton();
-	if (rd) {
-		gpu_pipeline = memnew(NaniteGPUPipeline);
-		gpu_pipeline->init(rd);
+	// Task 1.5 / 1.16.11 — GPU pipeline creation is deferred to
+	// set_bridge(). At SERVERS init() time RenderingDevice is not yet
+	// available (RenderingServer is created AFTER initialize_modules(SERVERS)
+	// in main.cpp setup2()), so creating the pipeline here would always
+	// hit the RD-null branch and leave gpu_pipeline perpetually nullptr —
+	// causing render_visibility to early-out every frame. set_bridge() is
+	// called by the bridge layer's Manager at SCENE level, where RS/RD
+	// are guaranteed ready.
+}
+
+void NaniteServer::set_bridge(INaniteBridge *p_bridge) {
+	bridge = p_bridge;
+	// Lazily create + init the GPU pipeline on first bridge injection.
+	// At SERVERS init() time RenderingDevice is not yet available, so
+	// we can't create it there. By the time a bridge is injected (SCENE
+	// level, via NaniteGDExtBridgeManager::init), RS/RD are ready.
+	// Also re-init if bridge is being re-set after a previous clear
+	// (gpu_pipeline may already exist — don't leak).
+	if (p_bridge != nullptr && gpu_pipeline == nullptr) {
+		RenderingDevice *rd = RenderingDevice::get_singleton();
+		if (rd) {
+			gpu_pipeline = memnew(NaniteGPUPipeline);
+			gpu_pipeline->init(rd);
+		}
 	}
 }
 

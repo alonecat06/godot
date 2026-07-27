@@ -149,7 +149,14 @@ public:
 	// Task 1.17.2 — injected by the bridge layer's Manager (e.g.
 	// NaniteGDExtBridgeManager). Stores a raw pointer; the caller owns
 	// the bridge lifetime. Passing nullptr clears the link.
-	void set_bridge(INaniteBridge *p_bridge) { bridge = p_bridge; }
+	//
+	// Out-of-line: when a bridge is first injected at SCENE level (where
+	// RenderingDevice is finally available, unlike at SERVERS init() time),
+	// this is also where the GPU pipeline is lazily created and
+	// initialized. Moving the creation here avoids the RD-null branch in
+	// init() that left gpu_pipeline perpetually nullptr and caused
+	// render_visibility to early-out on every frame.
+	void set_bridge(INaniteBridge *p_bridge);
 	void set_shadow_mode(INaniteBridge::ShadowMode p_mode) { shadow_mode = p_mode; }
 	INaniteBridge::ShadowMode get_shadow_mode() const { return shadow_mode; }
 
