@@ -36,6 +36,10 @@
 #include "nanite/core/nanite_server.h"
 #include "nanite/scene/nanite_mesh_instance_3d.h"
 
+#if defined(NANITE_BRIDGE_GDEXT)
+#include "nanite/bridge/nanite_gdext_bridge_manager.h"
+#endif
+
 #include "core/math/math_funcs.h"
 #include "core/object/callable_mp.h"
 #include "core/object/class_db.h"
@@ -186,6 +190,16 @@ NaniteMeshEditor::NaniteMeshEditor() {
 	viewport->set_disable_input(true);
 	viewport->set_msaa_3d(Viewport::MSAA_4X);
 	set_stretch(true);
+
+#if defined(NANITE_BRIDGE_GDEXT)
+	// Task 1.17.6 — attach the nanite compositor to the preview viewport so
+	// PRE_OPAQUE / POST_OPAQUE callbacks fire every frame while the
+	// NaniteMeshEditor is open. attach_to_viewport defers the actual
+	// World3D wiring until the SubViewport is inside the tree.
+	if (NaniteGDExtBridgeManager::get_singleton() != nullptr) {
+		NaniteGDExtBridgeManager::get_singleton()->attach_to_viewport(viewport);
+	}
+#endif
 
 	camera = memnew(Camera3D);
 	camera->set_transform(Transform3D(Basis(), Vector3(0, 0, 3)));

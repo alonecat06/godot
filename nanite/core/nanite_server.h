@@ -32,11 +32,10 @@
 
 #include "core/object/object.h"
 #include "core/object/object_id.h"
-#include "nanite/core/nanite_bridge.h" // INaniteBridge
+#include "nanite/core/nanite_bridge.h" // INaniteBridge (abstract pointer; no concrete bridge header needed)
 #include "core/templates/hash_map.h"
 #include "core/templates/rid.h"
 #include "core/templates/rid_owner.h"
-#include "nanite/bridge/nanite_gdext_bridge.h" // NaniteGDExtBridge (Ref<> member needs complete type)
 
 class NaniteMeshResource;
 class NaniteGPUPipeline;
@@ -54,34 +53,32 @@ class RenderingDevice;
 // (see register_types.cpp) and exposed as the "NaniteServer" engine
 // singleton so GDScript / C# can reach it via `Engine.get_singleton`.
 //
+// Task 1.17 (S1-08 补完) — the core no longer instantiates any concrete
+// bridge type. It holds an `INaniteBridge *` abstract pointer that is
+// injected by the gdext bridge layer's `NaniteGDExtBridgeManager` via
+// `set_bridge()`. This keeps `nanite/core/` free of CompositorEffect /
+// Compositor includes; the bridge lifecycle is fully owned by the
+// bridge layer's own singleton.
+//
 // Stage 1 status:
 //   - Mesh registration is ref-counted; on first reference the resource's
 //     encoded blobs are uploaded to GPU SSBOs via NaniteMeshData
 //     (Task 1.4). Requires a RenderingDevice — in headless mode data
 //     stays null and only the RID token is handed back.
-//   - render_visibility / render_material_resolve are no-ops until
-//     the GPU pipeline (Task 1.5) is wired in.
-//   - The bridge is selected via the `nanite/bridge/active` project
-//     setting; the gdext backend (Task 1.7) instantiates two
-//     NaniteGDExtBridge CompositorEffects in init() when active == "gdext".
-//     The effect RIDs are created but not yet attached to the default
-//     Compositor (Stage 2 TODO).
+//   - render_visibility / render_material_resolve read real camera
+//     matrices + render-target size from RenderData (Task 1.17.7).
 class NaniteServer : public Object {
 	GDCLASS(NaniteServer, Object);
 
 private:
 	static NaniteServer *singleton;
 
+	// Abstract bridge pointer injected by the bridge layer's Manager
+	// (e.g. NaniteGDExtBridgeManager). Raw pointer — the bridge is owned
+	// by the Manager, not by NaniteServer. nullptr means no bridge is
+	// active (headless / no backend compiled in).
 	INaniteBridge *bridge = nullptr;
 	INaniteBridge::ShadowMode shadow_mode = INaniteBridge::SHADOW_COARSE_LOD;
-
-	// Stage 1 gdext bridge is split across two CompositorEffect instances
-	// (one callback type each): PRE_OPAQUE drives render_visibility,
-	// POST_OPAQUE drives render_material_resolve. `bridge` above aliases
-	// pre_opaque_bridge.ptr() for the INaniteBridge interface. Both Refs
-	// are released in finish(); bridge aliases pre_opaque_bridge.ptr().
-	Ref<NaniteGDExtBridge> pre_opaque_bridge;
-	Ref<NaniteGDExtBridge> post_opaque_bridge;
 
 	NaniteGPUPipeline *gpu_pipeline = nullptr; // nullptr until Task 1.5.
 	NanitePageCache *page_cache = nullptr;
@@ -149,6 +146,10 @@ public:
 
 	// Bridge.
 	INaniteBridge *get_bridge() const { return bridge; }
+	// Task 1.17.2 — injected by the bridge layer's Manager (e.g.
+	// NaniteGDExtBridgeManager). Stores a raw pointer; the caller owns
+	// the bridge lifetime. Passing nullptr clears the link.
+	void set_bridge(INaniteBridge *p_bridge) { bridge = p_bridge; }
 	void set_shadow_mode(INaniteBridge::ShadowMode p_mode) { shadow_mode = p_mode; }
 	INaniteBridge::ShadowMode get_shadow_mode() const { return shadow_mode; }
 

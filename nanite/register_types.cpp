@@ -42,6 +42,7 @@
 
 #if defined(NANITE_BRIDGE_GDEXT)
 #include "nanite/bridge/nanite_gdext_bridge.h"
+#include "nanite/bridge/nanite_gdext_bridge_manager.h" // Task 1.17.9
 #endif
 
 #ifdef TOOLS_ENABLED
@@ -64,7 +65,21 @@ void initialize_nanite_module(ModuleInitializationLevel p_level) {
 
 		NaniteServer *ns = memnew(NaniteServer);
 		Engine::get_singleton()->add_singleton(Engine::Singleton("NaniteServer", ns));
+		// Task 1.17.2 — core init no longer creates any concrete bridge;
+		// `bridge` stays nullptr until the bridge layer's Manager injects
+		// it via set_bridge().
 		ns->init();
+
+#if defined(NANITE_BRIDGE_GDEXT)
+		// Task 1.17.9 — bridge layer's Manager singleton. Lives in
+		// nanite/bridge/ and owns the two NaniteGDExtBridge CompositorEffects
+		// + the pre-baked default_compositor Resource. The Manager injects
+		// itself into NaniteServer via set_bridge() and wires SceneTree
+		// signals for automatic viewport attachment.
+		// The Manager is NOT a GDCLASS: lifetime is fully controlled here.
+		memnew(NaniteGDExtBridgeManager);
+		NaniteGDExtBridgeManager::get_singleton()->init(ns);
+#endif
 		return;
 	}
 
@@ -101,6 +116,15 @@ void initialize_nanite_module(ModuleInitializationLevel p_level) {
 
 void uninitialize_nanite_module(ModuleInitializationLevel p_level) {
 	if (p_level == MODULE_INITIALIZATION_LEVEL_SERVERS) {
+#if defined(NANITE_BRIDGE_GDEXT)
+		// Task 1.17.9 — tear down the bridge layer's Manager BEFORE
+		// NaniteServer::finish() so the Manager can call
+		// set_bridge(nullptr) while NaniteServer is still alive.
+		if (NaniteGDExtBridgeManager::get_singleton() != nullptr) {
+			NaniteGDExtBridgeManager::get_singleton()->finish();
+			memdelete(NaniteGDExtBridgeManager::get_singleton());
+		}
+#endif
 		// Tear down the singleton. Capture the pointer first because
 		// finish() clears NaniteServer::singleton.
 		NaniteServer *ns = NaniteServer::get_singleton();

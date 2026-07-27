@@ -39,13 +39,18 @@
 
 #include "core/config/project_settings.h"
 #include "core/error/error_macros.h"
+#include "core/math/projection.h"
+#include "core/math/transform_3d.h"
 #include "core/object/class_db.h"
+#include "core/string/string_name.h"
 #include "servers/rendering/rendering_device.h"
+#include "servers/rendering/storage/render_data.h"
+#include "servers/rendering/storage/render_scene_data.h"
 
-#if defined(NANITE_BRIDGE_GDEXT)
-#include "nanite/bridge/nanite_gdext_bridge.h"
-#include "scene/resources/compositor.h" // CompositorEffect::EffectCallbackType
-#endif
+// Task 1.17.2 — core must NOT include nanite/bridge/nanite_gdext_bridge.h
+// (or any concrete bridge header). The bridge is injected via set_bridge()
+// from the bridge layer's Manager. Only abstract INaniteBridge (already
+// pulled in via nanite_server.h) is visible here.
 
 // Static singleton pointer; set in init(), cleared in finish().
 NaniteServer *NaniteServer::singleton = nullptr;
@@ -71,33 +76,16 @@ void NaniteServer::init() {
 	page_cache = memnew(NanitePageCache);
 	debug = memnew(NaniteDebug);
 
+	// Task 1.17.2 — core init no longer creates any concrete bridge.
+	// `bridge` stays nullptr here and is injected by the bridge layer's
+	// Manager (see register_types.cpp at MODULE_INITIALIZATION_LEVEL_SERVERS)
+	// via NaniteServer::set_bridge(). The active backend is selected by
+	// which Manager the bridge layer decides to construct; the
+	// `nanite/bridge/active` setting is informational only at this level.
 	String active_bridge = GLOBAL_GET("nanite/bridge/active");
-
-#if defined(NANITE_BRIDGE_GDEXT)
-	if (active_bridge == "gdext") {
-		// Two CompositorEffect instances, one per callback type. The
-		// PRE_OPAQUE instance is also the "main" INaniteBridge handle
-		// (install() sets the shadow mode on the server). Both Refs are
-		// released in finish(); bridge aliases pre_opaque_bridge.ptr().
-		pre_opaque_bridge = Ref<NaniteGDExtBridge>(memnew(NaniteGDExtBridge(CompositorEffect::EFFECT_CALLBACK_TYPE_PRE_OPAQUE)));
-		post_opaque_bridge = Ref<NaniteGDExtBridge>(memnew(NaniteGDExtBridge(CompositorEffect::EFFECT_CALLBACK_TYPE_POST_OPAQUE)));
-		bridge = pre_opaque_bridge.ptr();
-		if (bridge) {
-			bridge->install(this);
-		}
-		// NOTE: the effect RIDs exist on the RenderingServer but are not
-		// yet attached to any Compositor resource, so the renderer will
-		// not invoke them until Stage 2 wires them into the default
-		// Compositor's effects list.
-	} else if (active_bridge == "module" || active_bridge == "deep") {
-		ERR_PRINT(vformat("NaniteServer: bridge '%s' is not available in Stage 1 (only 'gdext' is compiled). Falling back to no bridge.", active_bridge));
-	} else {
+	if (!(active_bridge == "gdext" || active_bridge == "module" || active_bridge == "deep")) {
 		ERR_PRINT(vformat("NaniteServer: unknown bridge '%s'. Falling back to no bridge.", active_bridge));
 	}
-#else
-	ERR_PRINT("NaniteServer: no Nanite bridge compiled in (set nanite_bridge=gdext to enable).");
-	(void)active_bridge;
-#endif
 
 	// Task 1.5 / 1.16.11 — create + initialize the GPU pipeline when a
 	// RenderingDevice is available. Headless/test runs without a Vulkan
@@ -127,16 +115,11 @@ void NaniteServer::finish() {
 		memdelete(gpu_pipeline);
 		gpu_pipeline = nullptr;
 	}
-	// Stage 1 gdext bridges are RefCounted (CompositorEffect is a Resource),
-	// so they are managed by Ref<> — NOT memdelete'd. Clear the raw `bridge`
-	// alias first (it points into pre_opaque_bridge) before dropping the Refs.
+	// Task 1.17.2 — bridge is owned by the bridge layer's Manager
+	// (NaniteGDExtBridgeManager), not by NaniteServer. Just drop the raw
+	// pointer; the Manager clears it via set_bridge(nullptr) before
+	// releasing its Refs.
 	bridge = nullptr;
-	if (pre_opaque_bridge.is_valid()) {
-		pre_opaque_bridge.unref();
-	}
-	if (post_opaque_bridge.is_valid()) {
-		post_opaque_bridge.unref();
-	}
 
 	// Free any leaked RIDs / mesh entries (should be empty if callers
 	// behaved). Free NaniteMeshData GPU resources + the owning object for
@@ -243,7 +226,6 @@ void NaniteServer::update_instance_transform(NaniteMeshInstance3D *p_instance, c
 }
 
 void NaniteServer::render_visibility(const RenderData *p_render_data) {
-	(void)p_render_data; // Stage 1 doesn't read camera/render-target info yet.
 	if (!gpu_pipeline || instance_map.size() == 0) {
 		return;
 	}
@@ -252,21 +234,69 @@ void NaniteServer::render_visibility(const RenderData *p_render_data) {
 		return;
 	}
 
-	// Stage 1: identity camera + fixed screen size. The bridge will provide
-	// real view/projection matrices and the render-target size in a later
-	// task; for now use identity so dispatches don't crash.
-	static const float identity[16] = {
+	// Task 1.17.7 — read the real camera matrices + render-target size
+	// from RenderData instead of using identity / fixed 1280×720. If the
+	// RenderData is null (e.g. test path) we fall back to identity +
+	// 1280×720 so the dispatches don't crash.
+	float view_matrix[16] = {
 		1, 0, 0, 0,
 		0, 1, 0, 0,
 		0, 0, 1, 0,
 		0, 0, 0, 1
 	};
+	float projection[16] = {
+		1, 0, 0, 0,
+		0, 1, 0, 0,
+		0, 0, 1, 0,
+		0, 0, 0, 1
+	};
+	int screen_w = 1280;
+	int screen_h = 720;
 
-	// Stage 1: fixed screen size. The bridge will provide the real
-	// render-target size in a later task; for now use a constant so
-	// ensure_screen_buffers + dispatches don't crash.
-	const int screen_w = 1280;
-	const int screen_h = 720;
+	if (p_render_data != nullptr) {
+		RenderSceneData *rsd = p_render_data->get_render_scene_data();
+		if (rsd != nullptr) {
+			// Godot's Projection stores columns[4] (each a Vector4). Column
+			// i, row j -> projection[col*4 + row].
+			const Projection proj = rsd->get_cam_projection();
+			for (int col = 0; col < 4; ++col) {
+				for (int row = 0; row < 4; ++row) {
+					projection[col * 4 + row] = proj.columns[col][row];
+				}
+			}
+			// View matrix from the camera's world transform: we want
+			// view = inverse(world). For a Transform3D `t`, the inverse is
+			// (basis.inverse, basis.inverse * -origin), but Godot's Basis
+			// is orthonormal for cameras so we use Basis::transposed() to
+			// invert the rotation and recompute the translation.
+			const Transform3D cam_xf = rsd->get_cam_transform();
+			const Basis inv_basis = cam_xf.basis.transposed();
+			const Vector3 inv_origin = inv_basis.xform(-cam_xf.origin);
+			// Column-major float[16] from the inverse transform.
+			view_matrix[0] = inv_basis.rows[0].x; view_matrix[1] = inv_basis.rows[0].y; view_matrix[2] = inv_basis.rows[0].z; view_matrix[3] = 0.0f;
+			view_matrix[4] = inv_basis.rows[1].x; view_matrix[5] = inv_basis.rows[1].y; view_matrix[6] = inv_basis.rows[1].z; view_matrix[7] = 0.0f;
+			view_matrix[8] = inv_basis.rows[2].x; view_matrix[9] = inv_basis.rows[2].y; view_matrix[10] = inv_basis.rows[2].z; view_matrix[11] = 0.0f;
+			view_matrix[12] = inv_origin.x; view_matrix[13] = inv_origin.y; view_matrix[14] = inv_origin.z; view_matrix[15] = 1.0f;
+		}
+
+		// Render-target size from the render-scene buffers. The abstract
+		// RenderSceneBuffers base class doesn't expose get_internal_size
+		// (it's defined on the concrete RenderSceneBuffersRD subclass), so
+		// dispatch via Variant. Returns a Vector2i for the engine's
+		// internal-size accessor.
+		Ref<RenderSceneBuffers> buffers = p_render_data->get_render_scene_buffers();
+		if (buffers.is_valid()) {
+			const Variant szv = buffers->call(SNAME("get_internal_size"));
+			if (szv.get_type() == Variant::VECTOR2I) {
+				const Vector2i sz = szv;
+				if (sz.width > 0 && sz.height > 0) {
+					screen_w = sz.width;
+					screen_h = sz.height;
+				}
+			}
+		}
+	}
+
 	gpu_pipeline->ensure_screen_buffers(rd, screen_w, screen_h);
 
 	// Reset accumulated visible-cluster count. Each instance's dispatch
@@ -322,8 +352,8 @@ void NaniteServer::render_visibility(const RenderData *p_render_data) {
 		model_matrix[12] = o.x; model_matrix[13] = o.y; model_matrix[14] = o.z; model_matrix[15] = 1.0f;
 
 		NaniteGPUPipeline::CullParams params;
-		memcpy(params.view_matrix, identity, sizeof(identity));
-		memcpy(params.projection, identity, sizeof(identity));
+		memcpy(params.view_matrix, view_matrix, sizeof(view_matrix));
+		memcpy(params.projection, projection, sizeof(projection));
 		memcpy(params.model_matrix, model_matrix, sizeof(model_matrix));
 		params.screen_size[0] = screen_w;
 		params.screen_size[1] = screen_h;
