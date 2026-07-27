@@ -594,7 +594,135 @@
 
 ---
 
-## 17. 全局验收标准
+## 17. Compositor 自动挂接 (Task 1.17)
+
+> 对应 [spec.md "补完：Compositor 自动挂接（S1-08）"](spec.md#补完compositor-自动挂接s1-08) 与 [tasks.md 1.17 节](tasks.md#117-compositor-自动挂接s1-08-补完)。
+>
+> **状态（2026-07-25）**：Task 1.17 子项待实现。本节检查点对应 T1.17.1 ~ T1.17.10 共 10 个子任务，覆盖 `NaniteGDExtBridgeManager` 独立 singleton 的创建、核心 `NaniteServer` 净化（`set_bridge` setter）、三种 viewport 挂接路径（游戏运行时 / Nanite preview 窗口 / 引擎 3D 工作区）、`render_visibility` 改读真实 RenderData、ProjectSetting `auto_attach_compositor` 开关、`register_types` 生命周期管理、端到端测试与文档同步。
+
+### T1.17.1: NaniteGDExtBridgeManager 类骨架
+
+- [ ] `nanite/bridge/nanite_gdext_bridge_manager.h` 存在，定义非 GDCLASS 纯 C++ singleton 类
+  - 类成员：`static singleton` / `Ref<NaniteGDExtBridge> pre_opaque_bridge, post_opaque_bridge` / `Ref<Compositor> default_compositor` / `bool auto_attach_enabled` / `int frame_counter`
+  - 公有方法：`init(NaniteServer *)` / `finish()` / `get_default_compositor()` / `attach_to_viewport(Viewport *)` / `attach_to_compositor(const Ref<Compositor> &)`
+  - 私有方法：`_on_node_added(Node *)` / `_on_process_frame()` / `_attach_viewport(Viewport *)` / `_attach_viewport_deferred(Viewport *)`
+- [ ] `nanite/bridge/nanite_gdext_bridge_manager.cpp` 空实现编译通过
+- [ ] `nanite/SCsub` 的 `bridge/*.cpp` glob 通配已包含新文件（Task 1.1.1 已配置）
+- [ ] `scons platform=windows target=editor nanite_bridge=gdext accesskit=no angle=no -j8` 编译通过
+
+### T1.17.2: 核心净化 — NaniteServer 改用 INaniteBridge * + set_bridge setter
+
+- [ ] `nanite/core/nanite_server.h` 不再 `#include "nanite/bridge/nanite_gdext_bridge.h"`
+- [ ] `nanite/core/nanite_server.h` 移除 `Ref<NaniteGDExtBridge> pre_opaque_bridge, post_opaque_bridge` 成员
+- [ ] `nanite/core/nanite_server.h` 添加 `INaniteBridge *bridge = nullptr;`（抽象指针）
+- [ ] `nanite/core/nanite_server.h` 添加公有方法 `void set_bridge(INaniteBridge *p_bridge);`
+- [ ] `nanite/core/nanite_server.cpp` 的 `init()` 移除 `#if defined(NANITE_BRIDGE_GDEXT) ... memnew(NaniteGDExtBridge) ...` 块
+- [ ] `nanite/core/nanite_server.cpp` 实现 `set_bridge(INaniteBridge *p_bridge)`（仅赋值，不持 Ref）
+- [ ] `nanite/core/nanite_server.cpp` 的 `finish()` 移除 `pre_opaque_bridge.unref() / post_opaque_bridge.unref()`（由 Manager 负责）
+- [ ] `nanite/core/nanite_server.cpp` 不再 `#include "nanite/bridge/nanite_gdext_bridge.h"`
+- [ ] 编译通过，核心模块零桥接具体类型依赖
+
+### T1.17.3: NaniteGDExtBridgeManager::init — 创建 bridge + default_compositor
+
+- [ ] `init(NaniteServer *)` 创建两个 `Ref<NaniteGDExtBridge>`（PRE_OPAQUE + POST_OPAQUE）
+- [ ] `init(NaniteServer *)` 创建 `Ref<Compositor> default_compositor`
+- [ ] `init(NaniteServer *)` 构造 `TypedArray<CompositorEffect>` 并 push_back 两个 bridge
+- [ ] `init(NaniteServer *)` 调用 `default_compositor->set_compositor_effects(effects)`
+- [ ] `init(NaniteServer *)` 调用 `pre_opaque_bridge->install(server)` 设置 shadow_mode
+- [ ] `init(NaniteServer *)` 调用 `server->set_bridge(pre_opaque_bridge.ptr())` 注入核心
+- [ ] `finish()` 断开 SceneTree 信号连接
+- [ ] `finish()` 调用 `server->set_bridge(nullptr)` 清除核心指针
+- [ ] `finish()` 释放 `default_compositor` + 两个 bridge Ref
+- [ ] `get_default_compositor()` 返回 `default_compositor`
+- [ ] `NaniteServer::get_bridge()` 返回 `pre_opaque_bridge.ptr()`，类型为 `INaniteBridge *`
+
+### T1.17.4: attach_to_viewport / attach_to_compositor API
+
+- [ ] `attach_to_viewport(Viewport *)` 调用 `_attach_viewport(Viewport *)`
+- [ ] `_attach_viewport` 读取 `vp->find_world_3d()`（含继承逻辑）
+- [ ] `_attach_viewport` 检查 compositor 是否已是 default_compositor（ptr 比较），是则 return
+- [ ] `_attach_viewport` 检测用户已有 Compositor 时调用 `attach_to_compositor`
+- [ ] `_attach_viewport` 无 Compositor 时调用 `w->set_compositor(default_compositor)`
+- [ ] `attach_to_compositor(Ref<Compositor>)` 遍历 `get_compositor_effects()` 检查去重
+- [ ] `attach_to_compositor` 未包含则 push_back 并 `set_compositor_effects` 写回
+- [ ] 单测 `test_attach_to_compositor`：先创建用户 Compositor，调用 attach 后 effects 数组包含 2 个 nanite bridge
+
+### T1.17.5: node_added + 60 帧轮询自动注入
+
+- [ ] `_on_node_added(Node *)` 检查 `auto_attach_enabled`
+- [ ] `_on_node_added(Node *)` `cast_to<Viewport>` 成功后 `call_deferred(_attach_viewport_deferred, vp)`
+- [ ] `_attach_viewport_deferred(Viewport *)` 检查节点有效性后调用 `_attach_viewport`
+- [ ] `_on_process_frame()` 检查 `auto_attach_enabled`
+- [ ] `_on_process_frame()` 每 60 帧（`frame_counter % 60 == 0`）遍历 `_viewports` group
+- [ ] `_on_process_frame()` 对每个 viewport 调用 `_attach_viewport` 兜底
+- [ ] `init(NaniteServer *)` 末尾连接 `SceneTree::node_added` + `SceneTree::process_frame` 信号
+- [ ] `finish()` 开头断开信号连接
+- [ ] 单测 `test_auto_attach_to_editor_viewport`：Manager init 后 SceneTree 已存在 root Window，60 帧后 root 的 `find_world_3d()->get_compositor() == default_compositor`
+- [ ] 单测 `test_node_added_triggers_attach`：动态 `memnew(SubViewport)` + `add_child`，deferred 后 viewport 的 world_3d 挂上 default_compositor
+
+### T1.17.6: NaniteMeshEditor 调用 attach_to_viewport
+
+- [ ] `nanite/editor/nanite_mesh_editor.cpp` 构造 SubViewport 后调用 `NaniteGDExtBridgeManager::get_singleton()->attach_to_viewport(subviewport)`
+- [ ] `nanite/editor/nanite_mesh_editor.h` 添加 `#include "nanite/bridge/nanite_gdext_bridge_manager.h"`（条件编译 `#if defined(NANITE_BRIDGE_GDEXT)`）
+- [ ] 手动测试：打开 NaniteMeshEditor 面板，SubViewport 的 world_3d 已挂上 default_compositor
+- [ ] [CANNOT_VERIFY] 编辑器中 NaniteMeshEditor preview 窗口渲染时触发 PRE_OPAQUE / POST_OPAQUE 回调（需手动 UI 验证）
+
+### T1.17.7: render_visibility / render_material_resolve 改读真实 RenderData
+
+- [ ] `render_visibility(p_render_data)` 检查 `p_render_data != nullptr`（headless 早退）
+- [ ] `render_visibility` 从 `p_render_data->get_render_scene_data()` 读取 `get_cam_transform()` / `get_cam_projection()`
+- [ ] `render_visibility` 从 `p_render_data->get_render_scene_buffers()->get_internal_size()` 读取屏幕尺寸
+- [ ] `render_visibility` 屏幕尺寸为 0 时早退
+- [ ] `render_visibility` 把 view/projection 矩阵转换为 column-major float[16] 填入 `CullParams`
+- [ ] `render_material_resolve(p_render_data)` 移除 `(void)p_render_data;`
+- [ ] `render_visibility` 在 headless 模式下（`p_render_data == nullptr` 或 `buffers.is_null()`）安全早退
+- [ ] 单测 `test_render_visibility_reads_real_camera`：构造 mock RenderData，验证 dispatch_cull 的 CullParams.view_matrix 与 mock 一致
+
+### T1.17.8: ProjectSetting auto_attach_compositor
+
+- [ ] `NaniteServer::init()` 注册 `GLOBAL_DEF(PropertyInfo(Variant::BOOL, "nanite/bridge/auto_attach_compositor"), true)`
+- [ ] `NaniteGDExtBridgeManager::init()` 读取 `GLOBAL_GET("nanite/bridge/auto_attach_compositor")` 赋值给 `auto_attach_enabled`
+- [ ] `auto_attach_enabled == false` 时跳过 SceneTree 信号连接
+- [ ] `auto_attach_enabled == false` 时 `attach_to_viewport` / `attach_to_compositor` 仍可手动调用
+- [ ] 单测 `test_auto_attach_disabled`：设为 false 后 Manager 不自动注入任何 viewport
+
+### T1.17.9: register_types 创建/销毁 Manager
+
+- [ ] `initialize_nanite_module(MODULE_INITIALIZATION_LEVEL_SERVERS)` 在 `NANITE_BRIDGE_GDEXT` 守卫下 `memnew(NaniteGDExtBridgeManager)` + 调用 `init(NaniteServer::get_singleton())`
+- [ ] `uninitialize_nanite_module(MODULE_INITIALIZATION_LEVEL_SERVERS)` 调用 `manager->finish()` + `memdelete(manager)`
+- [ ] `NaniteServer::init()` 不再创建任何具体桥接（由 Manager 接管）
+- [ ] 引擎启动/关闭无崩溃，无内存泄漏
+
+### T1.17.10: 端到端测试 + 文档更新
+
+- [ ] `nanite/tests/test_bridge_manager.h`（doctest）新增：
+  - `test_manager_singleton_initialized`
+  - `test_default_compositor_has_two_effects`
+  - `test_attach_to_compositor_dedup`
+  - `test_set_bridge_injection`
+- [ ] `nanite/tests/test_compositor_auto_attach.gd`（GDScript 端到端）新增：
+  - `test_editor_viewport_attached`
+  - `test_subviewport_dynamic_attach`
+  - `test_auto_attach_disabled`
+- [ ] 更新 `checklist.md`（本节）
+- [ ] 更新 `nanite_doc/nanite-overall-design.md` 10.5 节 S1-08 行：标注"已补完（Stage 1 内）"
+- [ ] 更新 `nanite_doc/nanite-implementation-tasks.md` Stage 1 验收标准：S1-08 标注 PASS
+- [ ] 文档无矛盾：
+  - 总体设计 §10.5 S1-08 = Stage 1 内补完 ✓
+  - 总体设计 §14.3 "CompositorEffect PRE_OPAQUE 回调被正确触发" = ✓
+  - implementation-tasks.md Stage 1 = 包含 S1-08 ✓
+  - spec.md "补完：Compositor 自动挂接（S1-08）" section ✓
+  - tasks.md Task 1.17 子项 ✓
+  - checklist.md Task 1.17 检查点 ✓（本节）
+- [ ] 所有测试通过 + 文档无矛盾
+- [ ] [CANNOT_VERIFY] 手动验证三大 viewport 都能触发 Nanite 渲染：
+  - 游戏运行时（F5 弹出窗口）— 需用户在 WorldEnvironment 上配置 default_compositor
+  - Nanite preview 窗口（NaniteMeshEditor）— 自动挂接
+  - 引擎 3D 工作区（Node3DEditor SubViewport）— 自动注入
+
+---
+
+## 18. 全局验收标准
 
 - [PARTIAL] `scons platform=windows target=editor` 编译成功，0 error 0 warning
   - 代码审查无语法错误；按任务要求未实际运行 scons 构建

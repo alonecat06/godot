@@ -199,11 +199,14 @@ Stage 1 的目标是用最小侵入方式接入 Godot 渲染管线：通过 `Com
 
 系统 SHALL 提供 `NaniteGDExtBridge : CompositorEffect`，实现 `INaniteBridge`，通过 `set_effect_callback_type` 注册 PRE_OPAQUE 和 POST_OPAQUE 回调。
 
+> **S1-08 重构后**：`NaniteGDExtBridge` 的实例化、Compositor 创建、SceneTree 监听等全部移到桥接层独立的 `NaniteGDExtBridgeManager` singleton 中。核心 `NaniteServer` 不再 `memnew(NaniteGDExtBridge)`，仅持有 `INaniteBridge *` 抽象指针，通过 `set_bridge()` setter 接收注入。详见 [补完：Compositor 自动挂接（S1-08）](#补完compositor-自动挂接s1-08) section。
+
 #### Scenario: 桥接安装
 
-- **WHEN** `NaniteServer::init()` 创建 `NaniteGDExtBridge`
+- **WHEN** `NaniteGDExtBridgeManager::init(server)` 创建 `NaniteGDExtBridge`（PRE_OPAQUE + POST_OPAQUE 各一个实例）
 - **THEN** 构造函数调用 `set_effect_callback_type(EFFECT_CALLBACK_TYPE_PRE_OPAQUE)` 和 `set_effect_callback_type(EFFECT_CALLBACK_TYPE_POST_OPAQUE)`（通过 `add_effect_callback_type` API）
 - **AND** 调用 `install(NaniteServer*)` 设置 shadow_mode = `SHADOW_COARSE_LOD`
+- **AND** Manager 通过 `server->set_bridge(pre_opaque_bridge.ptr())` 将抽象指针注入核心
 
 #### Scenario: PRE_OPAQUE 回调
 
@@ -538,6 +541,217 @@ Stage 0 的 `NaniteMeshResource` 已有 `materials` 字段但未暴露。补完�
 #### Requirement: VertexSSBO 布局扩展
 
 `NaniteBuilder::encode_vertex_buffer` SHALL 输出 stride 8 floats 的顶点数据（position.xyz + normal.xyz + uv.xy，32 字节/顶点）。
+
+---
+
+## 补完：Compositor 自动挂接（S1-08）
+
+### Why
+
+Stage 1 最初的 Task 1.1-1.15 框架已跑通，`NaniteGDExtBridge`（`CompositorEffect` 子类）的 RID 已经在 `RenderingServer` 上创建，但**没有挂接到任何 `Compositor` 资源**——因此引擎每帧根本不会调用 `_render_callback`，`render_visibility` / `render_material_resolve` 都不会触发。原 S1-08 标记为"推迟到 Stage 2"，但 Stage 2 tasks 实际只覆盖 Module 桥接 + 动态 GPU 阴影，不包含自动挂接逻辑，造成文档自相矛盾。
+
+`NaniteServer::render_visibility` 当前用 identity 矩阵 + 固定 1280×720 屏幕尺寸（[nanite_server.cpp:255-269](file:///d:/Code/04_Engine/godot/nanite/core/nanite_server.cpp#L255-L269)），根本无法正确渲染。本 section 在 Stage 1 内补完 Compositor 自动挂接，让引擎每帧真正触发渲染回调。
+
+**重构动机**：原方案在 `NaniteServer::init` 中直接 `memnew(NaniteGDExtBridge)` 并持 `Ref<NaniteGDExtBridge>`，使核心模块依赖桥接具体类型，违反"核心通用"原则。重构为 `NaniteGDExtBridgeManager` 独立 singleton 后，核心 `NaniteServer` 仅持 `INaniteBridge *` 抽象指针，桥接专属逻辑全部在 `nanite/bridge/`。
+
+### What Changes
+
+- **ADDED** `nanite/bridge/nanite_gdext_bridge_manager.h/.cpp` — 独立 singleton，持有 `Ref<NaniteGDExtBridge>` (pre/post)、`Ref<Compositor> default_compositor`、`HashMap<RID, bool> attached_scenarios`
+- **MODIFIED** `nanite/core/nanite_server.h` — 移除 `Ref<NaniteGDExtBridge>` 成员，改为 `INaniteBridge *bridge` 抽象指针 + `set_bridge(INaniteBridge *)` setter
+- **MODIFIED** `nanite/core/nanite_server.cpp` — `init()` 不再创建任何具体桥接；`render_visibility` / `render_material_resolve` 改读 `p_render_data->get_render_scene_data()` 的真实相机参数
+- **MODIFIED** `nanite/register_types.cpp` — 在 `MODULE_INITIALIZATION_LEVEL_SERVERS` 阶段 `memnew(NaniteGDExtBridgeManager)` 并调用 `init(NaniteServer::get_singleton())`
+- **MODIFIED** `nanite/editor/nanite_mesh_editor.cpp` — 构造 SubViewport 后调用 `NaniteGDExtBridgeManager::get_singleton()->attach_to_viewport(subviewport)`
+- **ADDED** ProjectSetting `nanite/bridge/auto_attach_compositor`（bool，默认 true）— 控制 Manager 是否启用自动注入逻辑
+
+### 关键设计决策
+
+#### 决策 1：`NaniteGDExtBridgeManager` 作为桥接层独立 singleton
+
+- **方案**：Manager 不在 `nanite/core/` 中，而在 `nanite/bridge/` 中，通过 `register_types.cpp` 在 `MODULE_INITIALIZATION_LEVEL_SERVERS` 阶段创建
+- **理由**：核心 `NaniteServer` 只负责 mesh/instance/GPU pipeline 调度，不关心"何时被引擎触发"；桥接专属的 Compositor / Viewport / SceneTree 逻辑全部由 Manager 承担
+- **收益**：核心保持纯净，Stage 2/3 桥接可平行实现各自的 Manager（如 `NaniteModuleBridgeManager`），互不干扰
+- **注入方式**：Manager 调用 `server->set_bridge(pre_opaque_bridge.ptr())`，核心通过抽象指针访问桥接
+
+#### 决策 2：三种 viewport 目标采用不同挂接路径
+
+| 目标 | 挂接路径 | 实现位置 |
+|------|---------|---------|
+| **1. 游戏运行时**（F5 弹出窗口） | 用户在 inspector 把 `default_compositor` 拖到 `WorldEnvironment.compositor` 或 `Camera3D.compositor` 属性 | 零代码（用户配置） |
+| **2. Nanite preview 窗口**（`NaniteMeshEditor` 内嵌 SubViewport） | `NaniteMeshEditor` 构造时调用 `attach_to_viewport(subviewport)` | 1 行代码 |
+| **3. 引擎 3D 工作区**（Node3DEditor 的 SubViewport） | Manager 监听 `SceneTree::node_added` + 每 60 帧轮询 `_viewports` group 双路径兜底，自动给 `find_world_3d()` 挂接 | Manager 内部 |
+
+- **理由**：三个目标的 viewport 创建时机和可控性不同，采用不同路径可以最小化代码复杂度
+- **游戏运行时**完全由用户配置，避免越权
+- **Nanite preview 窗口**是我们自己的代码，直接调用最简单
+- **引擎 3D 工作区**用户无法配置，必须自动注入
+
+#### 决策 3：双路径兜底（node_added + 60 帧轮询）
+
+- **方案**：
+  - **快速路径**：Manager 连接 `SceneTree::node_added` 信号，回调里 `cast_to<Viewport>` 成功就 `call_deferred(_attach_viewport)`，覆盖动态创建的 viewport
+  - **兜底路径**：Manager 连接 `SceneTree::process_frame` 信号，每 60 帧（~1s）遍历 `_viewports` group 中的所有 viewport，对每个调用 `_attach_viewport` 兜底
+- **理由**：`node_added` 时机 viewport 可能还没设 `world_3d`，需要 deferred；信号也可能因 NaniteServer 启动晚于 viewport 创建而错过；轮询兜底确保覆盖所有情况
+- **`_attach_viewport` 逻辑**（无状态，幂等）：
+  ```
+  Ref<World3D> w = vp->find_world_3d();  // 含继承逻辑
+  if (w.is_null()) return;
+  if (w->get_compositor().ptr() == default_compositor.ptr()) return;  // 已是我们的
+  if (w->get_compositor().is_valid()) {
+      attach_to_compositor(w->get_compositor());  // 追加到用户已有 Compositor
+      return;
+  }
+  w->set_compositor(default_compositor);  // 直接注入
+  ```
+
+#### 决策 4：用户已有 Compositor 时追加而非覆盖
+
+- **方案**：Manager 提供 `attach_to_compositor(Ref<Compositor> p_user_compositor)` API，将两个 nanite bridge effect 追加到用户 Compositor 的 `compositor_effects` 数组（带去重检查）
+- **理由**：用户可能已有自己的 CompositorEffect（如自定义后处理），覆盖会破坏用户配置；追加保证两者共存
+- **去重检查**：遍历 `p_user_compositor->get_compositor_effects()`，若已包含我们的 bridge Ref 则跳过
+
+#### 决策 5：`render_visibility` / `render_material_resolve` 改读真实 RenderData
+
+- **方案**：两个函数从 `p_render_data->get_render_scene_data()` 读取 `get_cam_transform()` / `get_cam_projection()`，从 `p_render_data->get_render_scene_buffers()->get_internal_size()` 读取屏幕尺寸
+- **理由**：原 identity 矩阵 + 固定 1280×720 是占位实现，无法正确渲染
+- **Stage 1 限制**：不支持多 view（XR），只读 view 0；不支持动态分辨率（每帧 ensure_screen_buffers 会按实际尺寸重建纹理）
+
+### ADDED Requirements
+
+#### Requirement: NaniteGDExtBridgeManager 独立 singleton
+
+系统 SHALL 在桥接层提供 `NaniteGDExtBridgeManager` 独立 singleton，负责创建 `NaniteGDExtBridge` 实例、`default_compositor`、SceneTree 信号连接、viewport 自动挂接。
+
+##### Scenario: Manager 初始化
+
+- **WHEN** `register_types.cpp` 在 `MODULE_INITIALIZATION_LEVEL_SERVERS` 阶段 `memnew(NaniteGDExtBridgeManager)` 并调用 `init(NaniteServer *)`
+- **THEN** Manager 创建两个 `Ref<NaniteGDExtBridge>`（PRE_OPAQUE + POST_OPAQUE）
+- **AND** 创建 `Ref<Compositor> default_compositor` 并通过 `set_compositor_effects` 注入两个 bridge
+- **AND** 调用 `pre_opaque_bridge->install(server)` 设置 shadow_mode
+- **AND** 通过 `server->set_bridge(pre_opaque_bridge.ptr())` 注入核心
+- **AND** 连接 `SceneTree::node_added` 与 `SceneTree::process_frame` 信号
+
+##### Scenario: Manager 清理
+
+- **WHEN** `register_types.cpp` 在 `MODULE_INITIALIZATION_LEVEL_SERVERS` 阶段 `uninitialize_nanite_module` 调用 `manager->finish()`
+- **THEN** Manager 断开所有 SceneTree 信号连接
+- **AND** 释放 `default_compositor` Ref（CompositorEffect Ref 由 default_compositor 间接持有）
+- **AND** 调用 `server->set_bridge(nullptr)` 清除核心的 bridge 指针
+- **AND** `memdelete(manager)` 并清空 singleton
+
+#### Requirement: default_compositor 预制资源
+
+系统 SHALL 提供 `NaniteGDExtBridgeManager::get_default_compositor()` 返回持有两个 nanite bridge effect 的预制 Compositor。
+
+##### Scenario: 用户在 inspector 配置
+
+- **WHEN** 用户在场景中放 `WorldEnvironment` 节点
+- **AND** 在 inspector 创建 `Compositor` 资源（或调用 `NaniteServer.get_default_compositor()` 获取预制资源）
+- **AND** 把 Compositor 拖到 `WorldEnvironment.compositor` 属性
+- **THEN** 引擎自动调用 `World3D::set_compositor()` → `RS::scenario_set_compositor()`
+- **AND** 引擎每帧调用 Compositor 的 `_render_callback`
+
+##### Scenario: Camera3D 直接挂接
+
+- **WHEN** 用户把 `default_compositor` 拖到 `Camera3D.compositor` 属性
+- **THEN** 引擎优先使用 Camera3D 的 Compositor（覆盖 World3D 的）
+- **AND** 该 camera 的 viewport 每帧触发 nanite 回调
+
+#### Requirement: NaniteMeshEditor preview 窗口挂接
+
+`NaniteMeshEditor` 构造 SubViewport 后 SHALL 调用 `NaniteGDExtBridgeManager::attach_to_viewport(subviewport)` 挂接 default_compositor。
+
+##### Scenario: preview 窗口创建时挂接
+
+- **WHEN** `NaniteMeshEditor` 构造函数创建内部 `SubViewport`
+- **THEN** 调用 `NaniteGDExtBridgeManager::get_singleton()->attach_to_viewport(subviewport)`
+- **AND** SubViewport 的 `find_world_3d()` 的 compositor 被设为 default_compositor（或追加到用户已有 Compositor）
+- **AND** preview 窗口渲染时 PRE_OPAQUE / POST_OPAQUE 回调被触发
+
+#### Requirement: 引擎 3D 工作区自动注入
+
+Manager SHALL 通过 `SceneTree::node_added` + 每 60 帧轮询 `_viewports` group 双路径兜底，自动给所有 viewport 的 `find_world_3d()` 挂接 default_compositor。
+
+##### Scenario: node_added 快速路径
+
+- **WHEN** 任意 `Viewport` 子类节点加入 SceneTree
+- **THEN** Manager 的 `_on_node_added` 回调被触发
+- **AND** `cast_to<Viewport>` 成功后 `call_deferred(_attach_viewport_deferred, vp)`
+- **AND** deferred 调用中读取 `vp->find_world_3d()` 并挂接 default_compositor（若 compositor 为 null）或调用 `attach_to_compositor`（若已有用户 Compositor）
+
+##### Scenario: 60 帧轮询兜底
+
+- **WHEN** `SceneTree::process_frame` 信号触发
+- **AND** Manager 内部 `frame_counter % 60 == 0`
+- **THEN** 遍历 `_viewports` group 中的所有 viewport
+- **AND** 对每个调用 `_attach_viewport` 兜底（幂等，已挂接的会跳过）
+
+##### Scenario: 用户已有 Compositor 时追加
+
+- **WHEN** `_attach_viewport` 检测到 `find_world_3d()->get_compositor()` 不为 null 且不是我们的 default_compositor
+- **THEN** 调用 `attach_to_compositor(user_compositor)`
+- **AND** `attach_to_compositor` 检查 `user_compositor->get_compositor_effects()` 是否已包含我们的 bridge Ref
+- **AND** 若未包含则 push_back 追加，调用 `set_compositor_effects` 写回
+
+##### Scenario: auto_attach_compositor 开关关闭
+
+- **WHEN** ProjectSetting `nanite/bridge/auto_attach_compositor == false`
+- **THEN** Manager 不连接 `SceneTree::node_added` / `process_frame` 信号
+- **AND** 不自动注入到任何 viewport
+- **AND** 仅 `attach_to_viewport`（preview 窗口）和 `attach_to_compositor`（用户显式调用）两条路径生效
+
+#### Requirement: 真实相机参数读取
+
+`NaniteServer::render_visibility` 与 `render_material_resolve` SHALL 从 `p_render_data` 读取真实相机参数，替代原 identity 矩阵 + 固定 1280×720 占位。
+
+##### Scenario: 读取 view/projection 矩阵
+
+- **WHEN** `render_visibility(p_render_data)` 执行
+- **THEN** 从 `p_render_data->get_render_scene_data()->get_cam_transform()` 读取 view matrix
+- **AND** 从 `p_render_data->get_render_scene_data()->get_cam_projection()` 读取 projection matrix
+- **AND** 通过 `Transform3D::inverse()` 将 view 拆解为 inverse view matrix
+
+##### Scenario: 读取屏幕尺寸
+
+- **WHEN** `render_visibility(p_render_data)` 执行
+- **THEN** 从 `p_render_data->get_render_scene_buffers()->get_internal_size()` 读取 `Vector2i`
+- **AND** 用其 x/y 作为 `ensure_screen_buffers` 的宽高
+- **AND** 若宽高为 0（headless / 未配置）则早退
+
+#### Requirement: ProjectSetting auto_attach_compositor
+
+系统 SHALL 在 ProjectSettings 中注册 `nanite/bridge/auto_attach_compositor`（bool，默认 true），控制 Manager 的自动注入逻辑。
+
+##### Scenario: 默认启用
+
+- **WHEN** 系统初始化且配置项不存在
+- **THEN** 设置默认值 `true`
+- **AND** Manager 自动注入到引擎 3D 工作区与动态创建的 viewport
+
+##### Scenario: 用户关闭
+
+- **WHEN** 用户在 ProjectSettings UI 把 `nanite/bridge/auto_attach_compositor` 设为 `false`
+- **THEN** 下次引擎启动时 Manager 不自动注入
+- **AND** 用户必须通过 `attach_to_viewport` / `attach_to_compositor` 或在 inspector 手动挂接
+
+### MODIFIED Requirements
+
+#### Requirement: NaniteServer 桥接持有方式
+
+Stage 1 最初 `NaniteServer` 直接持有 `Ref<NaniteGDExtBridge>`（具体类型）。S1-08 重构后改为 `INaniteBridge *` 抽象指针 + `set_bridge()` setter。
+
+##### Scenario: set_bridge 注入
+
+- **WHEN** `NaniteGDExtBridgeManager::init(server)` 完成 bridge 创建
+- **THEN** 调用 `server->set_bridge(pre_opaque_bridge.ptr())`
+- **AND** `NaniteServer` 内部 `bridge = p_bridge`（不持有 Ref，不增加引用计数）
+- **AND** Manager 生命周期内 bridge 指针有效
+
+##### Scenario: 核心不依赖桥接具体类型
+
+- **WHEN** 编译 `nanite/core/nanite_server.cpp`
+- **THEN** 不 `#include "nanite/bridge/nanite_gdext_bridge.h"`
+- **AND** 仅 `#include "nanite/core/nanite_bridge.h"`（抽象接口）
+- **AND** 通过 `INaniteBridge *` 调用 `install` / `get_shadow_mode` 等方法
 
 ---
 
