@@ -34,6 +34,7 @@
 
 #include "core/config/project_settings.h"
 #include "core/object/callable_mp.h"
+#include "core/object/object_id.h" // ObjectID (deferred-call parameter)
 #include "core/variant/variant.h"
 #include "scene/main/scene_tree.h"
 #include "scene/main/viewport.h"
@@ -121,8 +122,10 @@ void NaniteGDExtBridgeManager::attach_to_viewport(Viewport *p_vp) {
 	if (p_vp == nullptr) {
 		return;
 	}
-	// call_deferred on a Callable bound to a Viewport* arg.
-	callable_mp(this, &NaniteGDExtBridgeManager::_attach_viewport_deferred).call_deferred(p_vp);
+	// call_deferred bound to an ObjectID arg. Using ObjectID (rather than
+	// Viewport*) avoids a dangling pointer if the Viewport is freed before
+	// the deferred call fires — see _attach_viewport_deferred for details.
+	callable_mp(this, &NaniteGDExtBridgeManager::_attach_viewport_deferred).call_deferred(p_vp->get_instance_id());
 }
 
 void NaniteGDExtBridgeManager::attach_to_compositor(const Ref<Compositor> &p_compositor) {
@@ -155,15 +158,24 @@ void NaniteGDExtBridgeManager::attach_to_compositor(const Ref<Compositor> &p_com
 	p_compositor->set_compositor_effects(effects);
 }
 
-void NaniteGDExtBridgeManager::_attach_viewport_deferred(Viewport *p_vp) {
-	if (p_vp == nullptr) {
+void NaniteGDExtBridgeManager::_attach_viewport_deferred(ObjectID p_vp_id) {
+	// Resolve the ObjectID back to an Object* at the moment the deferred
+	// call fires. If the Viewport was freed between queueing and now,
+	// ObjectDB::get_instance() returns nullptr and we bail out cleanly —
+	// no dangling pointer dereference.
+	Object *obj = ObjectDB::get_instance(p_vp_id);
+	if (obj == nullptr) {
 		return;
 	}
-	if (!p_vp->is_inside_tree()) {
+	Viewport *vp = Object::cast_to<Viewport>(obj);
+	if (vp == nullptr) {
+		return;
+	}
+	if (!vp->is_inside_tree()) {
 		// Viewport isn't in the tree yet — wait for the next poll.
 		return;
 	}
-	_attach_viewport(p_vp);
+	_attach_viewport(vp);
 }
 
 void NaniteGDExtBridgeManager::_attach_viewport(Viewport *p_vp) {
@@ -203,7 +215,9 @@ void NaniteGDExtBridgeManager::_on_node_added(Node *p_node) {
 	// world_3d assigned (e.g. SubViewport children added via add_child
 	// before set_world_3d). Deferring lets the next message-queue flush
 	// pick up the final world_3d.
-	callable_mp(this, &NaniteGDExtBridgeManager::_attach_viewport_deferred).call_deferred(vp);
+	// Pass ObjectID (not Viewport*) so a Viewport freed before the
+	// deferred call fires doesn't crash the message-queue dispatcher.
+	callable_mp(this, &NaniteGDExtBridgeManager::_attach_viewport_deferred).call_deferred(vp->get_instance_id());
 }
 
 void NaniteGDExtBridgeManager::_on_process_frame() {

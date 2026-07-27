@@ -83,7 +83,16 @@ class NaniteGDExtBridgeManager : public Object {
 	// Idempotent: ensures the viewport's find_world_3d() has the nanite
 	// compositor attached (either directly or by appending effects).
 	void _attach_viewport(Viewport *p_vp);
-	void _attach_viewport_deferred(Viewport *p_vp);
+	// Deferred entry point takes ObjectID (trivially destructible, safe
+	// across message-queue boundary) rather than Viewport* — the latter
+	// is stored inside a Variant by call_deferred, which then calls
+	// VariantObjectClassChecker to validate the object's class info; if
+	// the Viewport has been freed by the time the deferred call fires
+	// (e.g. editor SubViewport torn down between frames), the dangling
+	// pointer dereference in derives_from<Viewport>() crashes the engine.
+	// ObjectID lookup via ObjectDB::get_instance() returns nullptr for
+	// freed objects, so we can bail out cleanly.
+	void _attach_viewport_deferred(ObjectID p_vp_id);
 
 public:
 	static NaniteGDExtBridgeManager *get_singleton() { return singleton; }
