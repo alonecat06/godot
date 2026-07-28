@@ -137,6 +137,13 @@ private:
 	bool collect_materials(const Ref<ArrayMesh> &p_mesh);
 	Ref<NaniteMeshResource> finalize_resource(); // Assembles the final NaniteMeshResource from m_clusters / m_nodes / m_meshlet_* / m_shadow_mesh.
 
+	// Clone a cluster to a new LOD level (group_id) and create a LEAF
+	// HierarchyNode pointing to the clone. Returns the new HierarchyNode
+	// index in m_hierarchy_tree. Used by build_hierarchy() when a cluster
+	// is promoted to the next level without merging (single-cluster
+	// partition or simplification bail-out).
+	uint32_t clone_cluster_for_lod(uint32_t p_cluster_idx, uint32_t p_new_group_id);
+
 	// BVH assembly helpers (Task 0.5.2). Each returns an index into m_nodes.
 	uint32_t linearize_bvh_recursive(uint32_t p_hierarchy_node_idx, uint32_t p_depth);
 	uint32_t build_binary_chain(const LocalVector<uint32_t> &p_hierarchy_indices, uint32_t p_depth);

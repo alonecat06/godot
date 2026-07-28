@@ -700,33 +700,53 @@ bool NaniteBuilder::build_leaf_clusters() {
 }
 
 // ---------------------------------------------------------------------------
+// clone_cluster_for_lod — promote a cluster to a higher LOD level
+// ---------------------------------------------------------------------------
+//
+// When build_hierarchy() promotes a cluster to the next level without merging
+// (single-cluster partition, or simplification bail-out), the original cluster
+// keeps its group_id (e.g. 0 for L0). To make the cluster visible at the
+// parent LOD level, we clone it with the new group_id and create a fresh LEAF
+// HierarchyNode. The clone shares the same meshlet vertex/triangle data
+// (same offsets/counts), so no new meshlet data is appended.
+//
+// Returns the new HierarchyNode index in m_hierarchy_tree.
+
+uint32_t NaniteBuilder::clone_cluster_for_lod(uint32_t p_cluster_idx, uint32_t p_new_group_id) {
+	ERR_FAIL_COND_V(p_cluster_idx >= m_clusters.size(), UINT32_MAX);
+
+	NaniteCluster clone = m_clusters[p_cluster_idx];
+	clone.group_id = p_new_group_id;
+	m_clusters.push_back(clone);
+
+	HierarchyNode new_leaf;
+	new_leaf.is_leaf = true;
+	new_leaf.cluster_idx = static_cast<uint32_t>(m_clusters.size() - 1);
+	m_hierarchy_tree.push_back(new_leaf);
+	return static_cast<uint32_t>(m_hierarchy_tree.size() - 1);
+}
+
+// ---------------------------------------------------------------------------
 // build_hierarchy — bottom-up hierarchical simplification (spec 0.5.1)
 // ---------------------------------------------------------------------------
 //
-// Approach: per-level partition merge using meshopt_partitionClusters.
+// Approach (Stage 0): global merge → simplify → partition → meshlet.
 // At each level:
-//   1. Decode every current-level cluster's meshlet micro-index into flat
-//      vertex-index arrays (one per cluster) and feed them to
-//      meshopt_partitionClusters(target=cfg.partition_size).
-//   2. For each partition with >1 cluster:
-//        - Build a partition-local vertex buffer + triangle index buffer
-//          (remap global vertex indices to partition-local 0..N-1).
-//        - Simplify to half the triangle count via meshopt_simplifyWithAttributes
-//          (options = LockBorder | Regularize, vertex_lock = NULL).
-//        - Re-cluster the simplified geometry with meshopt_buildMeshletsFlex.
-//        - Append parent meshlets + clusters to the global pools.
-//        - Create LEAF HierarchyNodes for each parent cluster, then a MERGE
-//          HierarchyNode linking source nodes ↔ parent leaves.
-//   3. For partitions with exactly 1 cluster: promote the source node
-//      directly to the next level (no simplification).
-//   4. Replace current level with the new MERGE HierarchyNodes and loop.
-// Stop when current level has <=1 node OR current_lod >= max_lod_levels.
-//
-// HierarchyNode tree shape:
-//   - LEAF nodes represent a single cluster (leaf or parent).
-//   - MERGE nodes represent a partition merge event; they carry both the
-//     source HierarchyNodes (input) and the parent-leaf HierarchyNodes
-//     (output). build_bvh walks this tree to produce the flat BVH.
+//   1. Decode all current-level clusters into a single global vertex/index
+//      buffer (deduplicating vertices across clusters).
+//   2. Simplify the global mesh to ~50% of the original triangle count using
+//      meshopt_simplify. Because the simplifier sees the FULL mesh, boundary
+//      vertices that were internal to the original mesh are correctly handled
+//      (no false border-vertex locking needed).
+//   3. If simplification fails (too few triangles), promote all current-level
+//      clusters to the parent LOD via clone_cluster_for_lod and stop.
+//   4. Partition the simplified mesh into spatial groups using
+//      meshopt_partition (target max_vertices per partition).
+//   5. For each partition, build meshlets via meshopt_buildMeshletsFlex,
+//      create parent NaniteClusters with group_id = parent_lod, and link
+//      them into the HierarchyNode tree.
+// Stop when current level has <=1 node OR current_lod >= max_lod_levels
+// OR simplification produces fewer than min_triangles.
 
 bool NaniteBuilder::build_hierarchy() {
 	m_hierarchy_tree.clear();
@@ -746,7 +766,6 @@ bool NaniteBuilder::build_hierarchy() {
 	const size_t max_triangles = static_cast<size_t>(m_cfg->max_triangles);
 	const float cone_weight = static_cast<float>(m_cfg->cone_weight);
 	const float split_factor = static_cast<float>(m_cfg->split_factor);
-	const float target_error = static_cast<float>(m_cfg->target_error);
 	const size_t partition_size = static_cast<size_t>(m_cfg->partition_size);
 	const uint32_t max_lod = static_cast<uint32_t>(m_cfg->max_lod_levels);
 	const int optimize_level = m_cfg->meshlet_optimize_level;
@@ -768,408 +787,263 @@ bool NaniteBuilder::build_hierarchy() {
 	}
 
 	uint32_t current_lod = 0;
-	// Note: meshopt_SimplifyLockBorder is intentionally NOT used. When a
-	// partition is extracted from the full mesh, every vertex on the
-	// partition's boundary becomes a topological "border" vertex (its link
-	// is incomplete because neighbouring triangles were excluded). Locking
-	// all those border vertices prevents meshopt from collapsing ANY edge,
-	// so simplification returns the input unchanged (result_error == 0,
-	// simplified_index_count == partition_index_count). That in turn makes
-	// build_hierarchy loop until max_lod_levels, each iteration duplicating
-	// the same triangles into m_clusters — causing parent_triangles to
-	// explode to ~10x the leaf count. Dropping the flag lets meshopt
-	// collapse border vertices (which is fine for Nanite: each LOD level
-	// is an independent representation, and runtime picks one LOD per
-	// region, so inter-partition seams within a single LOD are not a
-	// concern). meshopt_SimplifyRegularize is kept to produce cleaner
-	// topology.
-	const unsigned int simplify_options = meshopt_SimplifyRegularize;
+	// Stage 0: global merge → simplify → partition, avoiding per-partition
+	// boundary issues. The simplifier sees the full mesh so internal edges
+	// (which were partition boundaries in the old approach) are correctly
+	// collapsed without shrinking the overall AABB.
+	const unsigned int simplify_options = 0; // No Regularize — allow aggressive simplification.
+	const float target_error = static_cast<float>(m_cfg->target_error);
 
-	// Track ALL MERGE HierarchyNodes produced across every level. The root
-	// of the BVH must group over every MERGE (not just the last level's)
-	// so that linearize_bvh_recursive walks the full hierarchy: a MERGE
-	// node at LOD N carries the LOD-N source leaves in its left subtree,
-	// and those source leaves are NOT re-exported to the next level (only
-	// the simplified parent leaves are). If the root only grouped over the
-	// last level's MERGEs, every earlier level's source leaves (e.g. the
-	// L0 leaves from successful LOD-0 partitions) would be orphaned and
-	// their bounds lost from the root AABB.
+	// Compute the error scaling factor for diagnostic output.
+	const float error_scale = meshopt_simplifyScale(m_verts_pos.ptr(), vertex_count, vertex_stride);
+
+	// Track ALL MERGE HierarchyNodes produced across every level.
 	LocalVector<uint32_t> all_merges;
 
 	while (current_level_nodes.size() > 1 && current_lod < max_lod) {
 		const uint32_t cluster_count = static_cast<uint32_t>(current_level_nodes.size());
+		const uint32_t parent_lod = current_lod + 1;
 
-		// MERGE HierarchyNodes created at THIS iteration. Appended to
-		// all_merges so the root can reference every MERGE across all
-		// levels (see the comment on all_merges for why).
-		LocalVector<uint32_t> current_level_merges;
-
-		// 2) Build flat_cluster_indices (vertex indices per cluster, concatenated)
-		//    and cluster_index_counts (triangle_count*3 per cluster).
-		LocalVector<unsigned int> flat_cluster_indices;
-		LocalVector<unsigned int> cluster_index_counts;
-		cluster_index_counts.resize(cluster_count);
-		size_t total_index_count = 0;
-
+		// 1) Build a global index buffer from all current-level clusters.
+		//    Indices are global vertex indices into m_verts_pos (no dedup needed).
+		LocalVector<unsigned int> global_indices;
 		for (uint32_t c = 0; c < cluster_count; ++c) {
 			const HierarchyNode &hn = m_hierarchy_tree[current_level_nodes[c]];
 			const NaniteCluster &cluster = m_clusters[hn.cluster_idx];
-
 			for (uint32_t t = 0; t < cluster.triangle_count; ++t) {
 				uint32_t tri_offset = cluster.triangle_offset + t * 3;
 				for (int k = 0; k < 3; ++k) {
 					unsigned char local_idx = m_meshlet_triangles[tri_offset + k];
 					unsigned int global_v = m_meshlet_vertices[cluster.vertex_offset + local_idx];
-					flat_cluster_indices.push_back(global_v);
+					global_indices.push_back(global_v);
 				}
 			}
-			cluster_index_counts[c] = cluster.triangle_count * 3;
-			total_index_count += cluster.triangle_count * 3;
 		}
+		const size_t global_index_count = global_indices.size();
+		const size_t global_triangle_count = global_index_count / 3;
 
-		// 3) Partition.
-		LocalVector<unsigned int> partition_ids;
-		partition_ids.resize(cluster_count);
-		size_t partition_count = meshopt_partitionClusters(
-				partition_ids.ptr(),
-				flat_cluster_indices.ptr(),
-				total_index_count,
-				cluster_index_counts.ptr(),
-				cluster_count,
+		// 2) Simplify the global mesh to ~50% of the original triangle count.
+		const size_t target_index_count = global_index_count / 2;
+		LocalVector<unsigned int> simplified_indices;
+		simplified_indices.resize(global_index_count);
+		float result_error = 0.0f;
+		size_t simplified_index_count = meshopt_simplify(
+				simplified_indices.ptr(),
+				global_indices.ptr(),
+				global_index_count,
 				m_verts_pos.ptr(),
 				vertex_count,
 				vertex_stride,
-				partition_size);
+				target_index_count,
+				target_error,
+				simplify_options,
+				&result_error);
 
-		if (partition_count == 0) {
-			break; // Defensive — should not happen.
+		print_line(vformat("[nanite-build] LOD %d -> %d: clusters=%d tris=%d -> %d (target=%d) error=%.4f (rel) / %.4f (abs) scale=%.2f",
+				current_lod, parent_lod,
+				cluster_count,
+				(uint64_t)global_triangle_count,
+				(uint64_t)(simplified_index_count / 3),
+				(uint64_t)(target_index_count / 3),
+				result_error, result_error * error_scale, error_scale));
+
+		// 3) Bail out if simplification produced too few triangles.
+		//    Promote all current-level clusters to parent LOD and stop.
+		if (simplified_index_count < min_triangles * 3 || simplified_index_count == 0) {
+			print_line(vformat("[nanite-build] LOD %d -> %d: bail-out (simplified too few tris=%d), promoting %d clusters via clone",
+					current_lod, parent_lod, (uint64_t)(simplified_index_count / 3), cluster_count));
+			LocalVector<uint32_t> next_level_nodes;
+			for (uint32_t c = 0; c < cluster_count; ++c) {
+				const uint32_t orig_cluster = m_hierarchy_tree[current_level_nodes[c]].cluster_idx;
+				uint32_t cloned_node = clone_cluster_for_lod(orig_cluster, parent_lod);
+				next_level_nodes.push_back(cloned_node);
+			}
+			// Create a MERGE node for this level's promotion.
+			HierarchyNode merge_node;
+			merge_node.is_leaf = false;
+			merge_node.cluster_idx = UINT32_MAX;
+			merge_node.source_node_indices = current_level_nodes;
+			merge_node.parent_leaf_node_indices = next_level_nodes;
+			m_hierarchy_tree.push_back(merge_node);
+			all_merges.push_back(static_cast<uint32_t>(m_hierarchy_tree.size() - 1));
+			current_level_nodes = next_level_nodes;
+			current_lod = parent_lod;
+			continue;
 		}
 
-		// 4) Group clusters by partition_id (some IDs may be unused).
-		uint32_t max_pid = 0;
+		// 4) Track max child error for monotonicity enforcement.
+		float max_child_error = 0.0f;
 		for (uint32_t c = 0; c < cluster_count; ++c) {
-			if (partition_ids[c] > max_pid) {
-				max_pid = partition_ids[c];
+			const HierarchyNode &hn = m_hierarchy_tree[current_level_nodes[c]];
+			const NaniteCluster &cluster = m_clusters[hn.cluster_idx];
+			if (cluster.error > max_child_error) {
+				max_child_error = cluster.error;
 			}
 		}
-		LocalVector<LocalVector<uint32_t>> partition_to_local; // partition -> local indices into current_level_nodes
-		partition_to_local.resize(max_pid + 1);
-		for (uint32_t c = 0; c < cluster_count; ++c) {
-			partition_to_local[partition_ids[c]].push_back(c);
+
+		// 5) Build spatial meshlets directly from the simplified mesh.
+		//    meshopt_buildMeshletsSpatial handles spatial partitioning internally.
+		const size_t max_meshlets = meshopt_buildMeshletsBound(simplified_index_count, max_vertices, min_triangles);
+		LocalVector<struct meshopt_Meshlet> parent_meshlets;
+		parent_meshlets.resize(max_meshlets);
+		LocalVector<unsigned int> parent_meshlet_vertices;
+		parent_meshlet_vertices.resize(simplified_index_count);
+		LocalVector<unsigned char> parent_meshlet_triangles;
+		parent_meshlet_triangles.resize(simplified_index_count);
+
+		// fill_weight: 0.0 = pure connectivity, 1.0 = pure spatial. 0.5 is a balanced default.
+		const float fill_weight = 0.5f;
+		size_t parent_meshlet_count = meshopt_buildMeshletsSpatial(
+				parent_meshlets.ptr(),
+				parent_meshlet_vertices.ptr(),
+				parent_meshlet_triangles.ptr(),
+				simplified_indices.ptr(),
+				simplified_index_count,
+				m_verts_pos.ptr(),
+				vertex_count,
+				vertex_stride,
+				max_vertices,
+				min_triangles,
+				max_triangles,
+				fill_weight);
+
+		print_line(vformat("[nanite-build] LOD %d -> %d: meshlets=%d", current_lod, parent_lod, (uint64_t)parent_meshlet_count));
+
+		if (parent_meshlet_count == 0) {
+			// No meshlets produced — promote all and stop.
+			print_line(vformat("[nanite-build] LOD %d -> %d: no meshlets, promoting %d clusters", current_lod, parent_lod, cluster_count));
+			LocalVector<uint32_t> promoted_nodes;
+			for (uint32_t c = 0; c < cluster_count; ++c) {
+				const uint32_t orig_cluster = m_hierarchy_tree[current_level_nodes[c]].cluster_idx;
+				uint32_t cloned_node = clone_cluster_for_lod(orig_cluster, parent_lod);
+				promoted_nodes.push_back(cloned_node);
+			}
+			HierarchyNode merge_node;
+			merge_node.is_leaf = false;
+			merge_node.cluster_idx = UINT32_MAX;
+			merge_node.source_node_indices = current_level_nodes;
+			merge_node.parent_leaf_node_indices = promoted_nodes;
+			m_hierarchy_tree.push_back(merge_node);
+			all_merges.push_back(static_cast<uint32_t>(m_hierarchy_tree.size() - 1));
+			current_level_nodes = promoted_nodes;
+			current_lod = parent_lod;
+			continue;
 		}
 
-		// 5) For each non-empty partition, simplify + recluster.
+		// 6) Append parent meshlet data to global pools.
+		const uint32_t meshlet_vertices_offset = static_cast<uint32_t>(m_meshlet_vertices.size());
+		const uint32_t meshlet_triangles_offset = static_cast<uint32_t>(m_meshlet_triangles.size());
+		const uint32_t meshlet_offset = static_cast<uint32_t>(m_meshlets.size());
+
+		LocalVector<uint32_t> new_vertex_offsets;
+		LocalVector<uint32_t> new_triangle_offsets;
+		new_vertex_offsets.resize(parent_meshlet_count);
+		new_triangle_offsets.resize(parent_meshlet_count);
+		{
+			uint32_t cur_v = meshlet_vertices_offset;
+			uint32_t cur_t = meshlet_triangles_offset;
+			for (size_t i = 0; i < parent_meshlet_count; ++i) {
+				const struct meshopt_Meshlet &src = parent_meshlets[i];
+				new_vertex_offsets[i] = cur_v;
+				new_triangle_offsets[i] = cur_t;
+				cur_v += src.vertex_count;
+				cur_t += src.triangle_count * 3;
+			}
+		}
+
+		for (size_t i = 0; i < parent_meshlet_count; ++i) {
+			const struct meshopt_Meshlet &src = parent_meshlets[i];
+			for (uint32_t v = 0; v < src.vertex_count; ++v) {
+				unsigned int local_v = parent_meshlet_vertices[src.vertex_offset + v];
+				m_meshlet_vertices.push_back(local_v);
+			}
+		}
+		for (size_t i = 0; i < parent_meshlet_count; ++i) {
+			const struct meshopt_Meshlet &src = parent_meshlets[i];
+			for (uint32_t t = 0; t < src.triangle_count * 3; ++t) {
+				m_meshlet_triangles.push_back(parent_meshlet_triangles[src.triangle_offset + t]);
+			}
+		}
+		for (size_t i = 0; i < parent_meshlet_count; ++i) {
+			const struct meshopt_Meshlet &src = parent_meshlets[i];
+			struct meshopt_Meshlet dst;
+			dst.vertex_offset = new_vertex_offsets[i];
+			dst.triangle_offset = new_triangle_offsets[i];
+			dst.vertex_count = src.vertex_count;
+			dst.triangle_count = src.triangle_count;
+			m_meshlets.push_back(dst);
+		}
+
+		// 7) Create parent NaniteClusters and LEAF HierarchyNodes.
+		const float parent_error = MAX(result_error, max_child_error);
 		LocalVector<uint32_t> next_level_nodes;
-		const uint32_t parent_lod = current_lod + 1;
-		bool any_merge_happened = false;
+		LocalVector<uint32_t> all_parent_leaf_indices;
 
-		for (uint32_t p = 0; p < partition_to_local.size(); ++p) {
-			const LocalVector<uint32_t> &partition = partition_to_local[p];
-			if (partition.is_empty()) {
-				continue;
-			}
+		for (size_t i = 0; i < parent_meshlet_count; ++i) {
+			const struct meshopt_Meshlet &m = m_meshlets[meshlet_offset + i];
+			unsigned int *ml_verts = m_meshlet_vertices.ptr() + m.vertex_offset;
+			unsigned char *ml_tris = m_meshlet_triangles.ptr() + m.triangle_offset;
 
-			if (partition.size() == 1) {
-				// Single-cluster partition: promote directly, no simplification.
-				next_level_nodes.push_back(current_level_nodes[partition[0]]);
-				continue;
-			}
+			meshopt_optimizeMeshletLevel(
+					ml_verts,
+					m.vertex_count,
+					ml_tris,
+					m.triangle_count,
+					optimize_level);
 
-			// 5a) Collect unique vertices referenced by this partition's clusters.
-			// Build global -> partition-local remap.
-			LocalVector<unsigned int> global_to_local;
-			global_to_local.resize(vertex_count);
-			for (size_t i = 0; i < vertex_count; ++i) {
-				global_to_local[i] = UINT32_MAX;
-			}
-			LocalVector<unsigned int> local_to_global;
+			meshopt_Bounds b = meshopt_computeMeshletBounds(
+					ml_verts,
+					ml_tris,
+					m.triangle_count,
+					m_verts_pos.ptr(),
+					vertex_count,
+					vertex_stride);
 
-			for (uint32_t ci = 0; ci < partition.size(); ++ci) {
-				uint32_t c = partition[ci];
-				const HierarchyNode &hn = m_hierarchy_tree[current_level_nodes[c]];
-				const NaniteCluster &cluster = m_clusters[hn.cluster_idx];
-				for (uint32_t v = 0; v < cluster.vertex_count; ++v) {
-					unsigned int global_v = m_meshlet_vertices[cluster.vertex_offset + v];
-					if (global_v < vertex_count && global_to_local[global_v] == UINT32_MAX) {
-						global_to_local[global_v] = static_cast<unsigned int>(local_to_global.size());
-						local_to_global.push_back(global_v);
-					}
-				}
-			}
-
-			const size_t partition_vertex_count = local_to_global.size();
-			if (partition_vertex_count == 0) {
-				// Degenerate partition — promote originals.
-				for (uint32_t ci = 0; ci < partition.size(); ++ci) {
-					next_level_nodes.push_back(current_level_nodes[partition[ci]]);
-				}
-				continue;
-			}
-
-			// 5b) Build partition-local vertex buffer (3 floats per vertex).
-			LocalVector<float> partition_verts;
-			partition_verts.resize(partition_vertex_count * 3);
-			for (size_t v = 0; v < partition_vertex_count; ++v) {
-				unsigned int global_v = local_to_global[v];
-				memcpy(partition_verts.ptr() + v * 3,
-						m_verts_pos.ptr() + global_v * 3,
-						sizeof(float) * 3);
-			}
-
-			// 5c) Build partition-local triangle index buffer by decoding each
-			//     cluster's meshlet micro-index through the global->local remap.
-			LocalVector<unsigned int> partition_indices;
-			for (uint32_t ci = 0; ci < partition.size(); ++ci) {
-				uint32_t c = partition[ci];
-				const HierarchyNode &hn = m_hierarchy_tree[current_level_nodes[c]];
-				const NaniteCluster &cluster = m_clusters[hn.cluster_idx];
-				for (uint32_t t = 0; t < cluster.triangle_count; ++t) {
-					uint32_t tri_offset = cluster.triangle_offset + t * 3;
-					for (int k = 0; k < 3; ++k) {
-						unsigned char local_idx = m_meshlet_triangles[tri_offset + k];
-						unsigned int global_v = m_meshlet_vertices[cluster.vertex_offset + local_idx];
-						partition_indices.push_back(global_to_local[global_v]);
-					}
-				}
-			}
-			const size_t partition_index_count = partition_indices.size();
-
-			// 5d) Track max child error for monotonicity enforcement.
-			float max_child_error = 0.0f;
-			for (uint32_t ci = 0; ci < partition.size(); ++ci) {
-				uint32_t c = partition[ci];
-				const HierarchyNode &hn = m_hierarchy_tree[current_level_nodes[c]];
-				const NaniteCluster &cluster = m_clusters[hn.cluster_idx];
-				if (cluster.error > max_child_error) {
-					max_child_error = cluster.error;
-				}
-			}
-
-			// 5e) Simplify to half the triangle count.
-			const size_t target_index_count = partition_index_count / 2;
-			LocalVector<unsigned int> simplified_indices;
-			simplified_indices.resize(partition_index_count); // upper bound for output.
-
-			float result_error = 0.0f;
-			size_t simplified_index_count = meshopt_simplifyWithAttributes(
-					simplified_indices.ptr(),
-					partition_indices.ptr(),
-					partition_index_count,
-					partition_verts.ptr(),
-					partition_vertex_count,
-					vertex_stride,
-					nullptr, // vertex_attributes
-					0, // vertex_attributes_stride
-					nullptr, // attribute_weights
-					0, // attribute_count
-					nullptr, // vertex_lock — borders are not locked (see simplify_options note).
-					target_index_count,
-					target_error,
-					simplify_options,
-					&result_error);
-
-			// Bail out if simplification collapsed the geometry below the
-			// minimum cluster floor; promote the originals instead.
-			if (simplified_index_count < min_triangles * 3 || simplified_index_count == 0) {
-				for (uint32_t ci = 0; ci < partition.size(); ++ci) {
-					next_level_nodes.push_back(current_level_nodes[partition[ci]]);
-				}
-				continue;
-			}
-
-			// Bail out if simplification barely reduced the geometry (less
-			// than 10% reduction). Creating a parent level with essentially
-			// the same triangles would duplicate geometry and — across many
-			// levels — cause parent_triangles to explode. Promote the
-			// originals instead so the next level can try again or the loop
-			// terminates via the no-merge stop condition.
-			if (simplified_index_count >= partition_index_count * 9 / 10) {
-				for (uint32_t ci = 0; ci < partition.size(); ++ci) {
-					next_level_nodes.push_back(current_level_nodes[partition[ci]]);
-				}
-				continue;
-			}
-
-			// 5f) Re-cluster the simplified geometry.
-			const size_t max_meshlets = meshopt_buildMeshletsBound(simplified_index_count, max_vertices, min_triangles);
-			LocalVector<struct meshopt_Meshlet> parent_meshlets;
-			parent_meshlets.resize(max_meshlets);
-			LocalVector<unsigned int> parent_meshlet_vertices;
-			parent_meshlet_vertices.resize(simplified_index_count);
-			LocalVector<unsigned char> parent_meshlet_triangles;
-			parent_meshlet_triangles.resize(simplified_index_count);
-
-			size_t parent_meshlet_count = meshopt_buildMeshletsFlex(
-					parent_meshlets.ptr(),
-					parent_meshlet_vertices.ptr(),
-					parent_meshlet_triangles.ptr(),
-					simplified_indices.ptr(),
-					simplified_index_count,
-					partition_verts.ptr(),
-					partition_vertex_count,
-					vertex_stride,
-					max_vertices,
-					min_triangles,
-					max_triangles,
-					cone_weight,
-					split_factor);
-
-			if (parent_meshlet_count == 0) {
-				for (uint32_t ci = 0; ci < partition.size(); ++ci) {
-					next_level_nodes.push_back(current_level_nodes[partition[ci]]);
-				}
-				continue;
-			}
-
-			// 5g) Append parent meshlet data to the global pools. We compute
-			//     fresh vertex/triangle offsets rather than relying on tight
-			//     packing inside parent_meshlet_vertices/_triangles.
-			const uint32_t meshlet_vertices_offset = static_cast<uint32_t>(m_meshlet_vertices.size());
-			const uint32_t meshlet_triangles_offset = static_cast<uint32_t>(m_meshlet_triangles.size());
-			const uint32_t meshlet_offset = static_cast<uint32_t>(m_meshlets.size());
-
-			LocalVector<uint32_t> new_vertex_offsets;
-			LocalVector<uint32_t> new_triangle_offsets;
-			new_vertex_offsets.resize(parent_meshlet_count);
-			new_triangle_offsets.resize(parent_meshlet_count);
-			{
-				uint32_t cur_v = meshlet_vertices_offset;
-				uint32_t cur_t = meshlet_triangles_offset;
-				for (size_t i = 0; i < parent_meshlet_count; ++i) {
-					const struct meshopt_Meshlet &src = parent_meshlets[i];
-					new_vertex_offsets[i] = cur_v;
-					new_triangle_offsets[i] = cur_t;
-					cur_v += src.vertex_count;
-					cur_t += src.triangle_count * 3;
-				}
-			}
-
-			// Append vertices (remap partition-local → global).
-			for (size_t i = 0; i < parent_meshlet_count; ++i) {
-				const struct meshopt_Meshlet &src = parent_meshlets[i];
-				for (uint32_t v = 0; v < src.vertex_count; ++v) {
-					unsigned int local_v = parent_meshlet_vertices[src.vertex_offset + v];
-					unsigned int global_v = local_to_global[local_v];
-					m_meshlet_vertices.push_back(global_v);
-				}
-			}
-			// Append triangle bytes (micro-indices are meshlet-local, copy as-is).
-			for (size_t i = 0; i < parent_meshlet_count; ++i) {
-				const struct meshopt_Meshlet &src = parent_meshlets[i];
-				for (uint32_t t = 0; t < src.triangle_count * 3; ++t) {
-					m_meshlet_triangles.push_back(parent_meshlet_triangles[src.triangle_offset + t]);
-				}
-			}
-			// Append meshlet descriptors with rebased offsets.
-			for (size_t i = 0; i < parent_meshlet_count; ++i) {
-				const struct meshopt_Meshlet &src = parent_meshlets[i];
-				struct meshopt_Meshlet dst;
-				dst.vertex_offset = new_vertex_offsets[i];
-				dst.triangle_offset = new_triangle_offsets[i];
-				dst.vertex_count = src.vertex_count;
-				dst.triangle_count = src.triangle_count;
-				m_meshlets.push_back(dst);
-			}
-
-			// 5h) Per-parent-meshlet: optimize + compute bounds + fill NaniteCluster.
-			// Enforce error monotonicity: parent error >= max child error.
-			const float parent_error = MAX(result_error, max_child_error);
-
-			LocalVector<uint32_t> parent_leaf_node_indices;
-			for (size_t i = 0; i < parent_meshlet_count; ++i) {
-				const struct meshopt_Meshlet &m = m_meshlets[meshlet_offset + i];
-				unsigned int *ml_verts = m_meshlet_vertices.ptr() + m.vertex_offset;
-				unsigned char *ml_tris = m_meshlet_triangles.ptr() + m.triangle_offset;
-
-				meshopt_optimizeMeshletLevel(
-						ml_verts,
-						m.vertex_count,
-						ml_tris,
-						m.triangle_count,
-						optimize_level);
-
-				meshopt_Bounds b = meshopt_computeMeshletBounds(
-						ml_verts,
-						ml_tris,
-						m.triangle_count,
-						m_verts_pos.ptr(),
-						vertex_count,
-						vertex_stride);
-
-				NaniteCluster c;
+			NaniteCluster c;
 			c.vertex_offset = m.vertex_offset;
 			c.vertex_count = m.vertex_count;
 			c.triangle_offset = m.triangle_offset;
 			c.triangle_count = m.triangle_count;
 			c.group_id = parent_lod;
-			c.material_index = 0; // Task 1.16.3 — Stage 1 single-material.
+			c.material_index = 0;
 			c.error = parent_error;
-				c.bounds = AABB(
-						Vector3(b.center[0] - b.radius, b.center[1] - b.radius, b.center[2] - b.radius),
-						Vector3(b.radius * 2.0f, b.radius * 2.0f, b.radius * 2.0f));
-				Vector3 axis(b.cone_axis[0], b.cone_axis[1], b.cone_axis[2]);
-				if (axis.length_squared() > 0.0f) {
-					axis.normalize();
-					c.cone_cutoff = b.cone_cutoff;
-				} else {
-					// meshopt returned degenerate cone_axis (e.g., for meshlets with
-					// cancelling normals after simplification). Use a unit fallback axis
-					// and signal full-sphere cone so runtime backface culling is skipped
-					// (safe conservative behavior).
-					axis = Vector3(0, 1, 0);
-					c.cone_cutoff = -1.0f;
-				}
-				c.cone_axis = axis;
-				c.page_id = 0;
-				m_clusters.push_back(c);
-
-				// LEAF HierarchyNode for this parent cluster.
-				HierarchyNode pn;
-				pn.is_leaf = true;
-				pn.cluster_idx = static_cast<uint32_t>(m_clusters.size() - 1);
-				m_hierarchy_tree.push_back(pn);
-				parent_leaf_node_indices.push_back(static_cast<uint32_t>(m_hierarchy_tree.size() - 1));
+			c.bounds = AABB(
+					Vector3(b.center[0] - b.radius, b.center[1] - b.radius, b.center[2] - b.radius),
+					Vector3(b.radius * 2.0f, b.radius * 2.0f, b.radius * 2.0f));
+			Vector3 axis(b.cone_axis[0], b.cone_axis[1], b.cone_axis[2]);
+			if (axis.length_squared() > 0.0f) {
+				axis.normalize();
+				c.cone_cutoff = b.cone_cutoff;
+			} else {
+				axis = Vector3(0, 1, 0);
+				c.cone_cutoff = -1.0f;
 			}
+			c.cone_axis = axis;
+			c.page_id = 0;
+			m_clusters.push_back(c);
 
-			// 5i) MERGE HierarchyNode linking sources ↔ parent leaves.
-			// The MERGE node is recorded in m_hierarchy_tree for the BVH
-			// linearizer, but it is NOT pushed into next_level_nodes:
-			// next_level_nodes must contain only LEAF HierarchyNodes so the
-			// next iteration can safely read hn.cluster_idx. The parent
-			// clusters (parent_leaf_node_indices) are what the next level
-			// actually iterates over.
-			HierarchyNode merge_node;
-			merge_node.is_leaf = false;
-			merge_node.cluster_idx = UINT32_MAX;
-			for (uint32_t ci = 0; ci < partition.size(); ++ci) {
-				merge_node.source_node_indices.push_back(current_level_nodes[partition[ci]]);
-			}
-			merge_node.parent_leaf_node_indices = parent_leaf_node_indices;
-			m_hierarchy_tree.push_back(merge_node);
-			current_level_merges.push_back(static_cast<uint32_t>(m_hierarchy_tree.size() - 1));
-
-			// The next level iterates over the parent LEAF HierarchyNodes
-			// (each has a valid cluster_idx pointing into m_clusters).
-			for (uint32_t i = 0; i < parent_leaf_node_indices.size(); ++i) {
-				next_level_nodes.push_back(parent_leaf_node_indices[i]);
-			}
-
-			any_merge_happened = true;
+			HierarchyNode pn;
+			pn.is_leaf = true;
+			pn.cluster_idx = static_cast<uint32_t>(m_clusters.size() - 1);
+			m_hierarchy_tree.push_back(pn);
+			uint32_t leaf_idx = static_cast<uint32_t>(m_hierarchy_tree.size() - 1);
+			next_level_nodes.push_back(leaf_idx);
+			all_parent_leaf_indices.push_back(leaf_idx);
 		}
 
-		if (!any_merge_happened) {
-			// No merges this level — partitioning couldn't reduce further. Stop.
-			// all_merges retains every MERGE from earlier levels so the root
-			// can still reference them.
-			break;
-		}
+		// 8) Create a single MERGE node for this level.
+		HierarchyNode merge_node;
+		merge_node.is_leaf = false;
+		merge_node.cluster_idx = UINT32_MAX;
+		merge_node.source_node_indices = current_level_nodes;
+		merge_node.parent_leaf_node_indices = next_level_nodes;
+		m_hierarchy_tree.push_back(merge_node);
+		all_merges.push_back(static_cast<uint32_t>(m_hierarchy_tree.size() - 1));
 
-		// Append this level's MERGEs to the global list so the root groups
-		// over every level's MERGEs, not just the last.
-		for (uint32_t i = 0; i < current_level_merges.size(); ++i) {
-			all_merges.push_back(current_level_merges[i]);
-		}
-		current_level_nodes = next_level_nodes;
+		print_line(vformat("[nanite-build] LOD %d -> %d: parent_clusters=%d", current_lod, parent_lod, (uint64_t)all_parent_leaf_indices.size()));
+
+		// 9) Next level walks over the parent leaf HierarchyNodes.
+		current_level_nodes = all_parent_leaf_indices;
 		current_lod = parent_lod;
 	}
 
@@ -1181,6 +1055,30 @@ bool NaniteBuilder::build_hierarchy() {
 	//    node's parent leaves may also appear in current_level_nodes as
 	//    sources of a higher-level MERGE — that duplication is harmless for
 	//    bounds (union is idempotent) and for error (max is idempotent).
+
+	// Diagnostic: print per-LOD triangle counts.
+	{
+		const uint32_t max_possible_lod = current_lod + 1;
+		LocalVector<uint32_t> lod_tris;
+		LocalVector<uint32_t> lod_clusters;
+		lod_tris.resize(max_possible_lod);
+		lod_clusters.resize(max_possible_lod);
+		memset(lod_tris.ptr(), 0, max_possible_lod * sizeof(uint32_t));
+		memset(lod_clusters.ptr(), 0, max_possible_lod * sizeof(uint32_t));
+		for (uint32_t i = 0; i < m_clusters.size(); ++i) {
+			const NaniteCluster &c = m_clusters[i];
+			if (c.group_id < max_possible_lod) {
+				lod_tris[c.group_id] += c.triangle_count;
+				lod_clusters[c.group_id] += 1;
+			}
+		}
+		String summary = "[nanite-build] LOD summary:";
+		for (uint32_t lod = 0; lod < max_possible_lod; ++lod) {
+			summary += vformat(" LOD%d=%dclusters/%dtris", lod, lod_clusters[lod], lod_tris[lod]);
+		}
+		print_line(summary);
+	}
+
 	LocalVector<uint32_t> root_candidates;
 	root_candidates = all_merges;
 	for (uint32_t i = 0; i < current_level_nodes.size(); ++i) {

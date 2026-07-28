@@ -64,14 +64,14 @@ void NaniteMeshResourceEditorWindow::edit(const Ref<NaniteMeshResource> &p_resou
 
 NaniteMeshResourceEditorWindow::NaniteMeshResourceEditorWindow() {
 	set_title("Nanite Mesh Viewer");
-	set_ok_button_text("Close");
-	set_size(Size2(800, 600));
-	// Hide (don't free) on OK so the window can be reused by the next edit().
-	set_hide_on_ok(true);
+	// Hide the default OK button row — the window is closed via the
+	// window manager's native close button (X) or by pressing Escape.
+	get_ok_button()->hide();
+	set_hide_on_ok(false);
 
 	viewer = memnew(NaniteMeshEditor);
 	add_child(viewer);
-	// Fill the entire dialog content area above the OK button row.
+	// Fill the entire dialog area now that the OK button row is hidden.
 	viewer->set_anchors_and_offsets_preset(Control::PRESET_FULL_RECT);
 	// Give the viewer room to render a meaningful 3D preview.
 	viewer->set_custom_minimum_size(Size2(750, 500));

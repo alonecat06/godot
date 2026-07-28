@@ -409,6 +409,13 @@ void NaniteMeshEditor::gui_input(const Ref<InputEvent> &p_event) {
 	Ref<InputEventMouseButton> mb = p_event;
 	if (mb.is_valid()) {
 		if (mb->get_button_index() == MouseButton::LEFT) {
+			// When the click is on the UI bar (HBoxContainer), skip drag
+			// handling so that child controls (OptionButton, SpinBox) can
+			// process the event. The event is NOT accepted here so it
+			// propagates normally to the child controls.
+			if (ui_bar && ui_bar->get_global_rect().has_point(mb->get_global_position())) {
+				return;
+			}
 			if (mb->is_pressed()) {
 				dragging = true;
 				accept_event();
@@ -650,11 +657,13 @@ NaniteMeshEditor::NaniteMeshEditor() {
 	// Overlay HBoxContainer at the bottom holding the two dropdowns +
 	// SpinBox + spacer. Mirrors the layout in the design doc Section 9.5.
 	HBoxContainer *hb = memnew(HBoxContainer);
+	ui_bar = hb;
 	add_child(hb);
 	hb->set_anchors_and_offsets_preset(Control::PRESET_BOTTOM_WIDE, Control::PRESET_MODE_MINSIZE, 2);
 
 	// List 1: Display Mode.
 	display_mode_btn = memnew(OptionButton);
+	display_mode_btn->set_flat(true);
 	display_mode_btn->add_item("Normal", NaniteDebug::NORMAL);
 	display_mode_btn->add_item("Normal + Wireframe", NaniteDebug::NORMAL_WIREFRAME);
 	display_mode_btn->add_item("Cluster Solid", NaniteDebug::CLUSTER_SOLID);
@@ -668,6 +677,7 @@ NaniteMeshEditor::NaniteMeshEditor() {
 
 	// List 2: LOD Mode.
 	lod_mode_btn = memnew(OptionButton);
+	lod_mode_btn->set_flat(true);
 	lod_mode_btn->add_item("Nanite (auto cull + LOD)  [Stage 1]", NaniteDebug::NANITE_AUTO);
 	lod_mode_btn->add_item("Force LOD Level", NaniteDebug::FORCE_LOD_LEVEL);
 	lod_mode_btn->select(NaniteDebug::FORCE_LOD_LEVEL);

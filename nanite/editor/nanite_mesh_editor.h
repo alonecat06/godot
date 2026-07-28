@@ -33,6 +33,7 @@
 #ifdef TOOLS_ENABLED
 
 #include "editor/plugins/editor_plugin.h"
+#include "scene/gui/box_container.h"
 #include "scene/gui/option_button.h"
 #include "scene/gui/spin_box.h"
 #include "scene/gui/label.h"
@@ -86,6 +87,7 @@ private:
 	OptionButton *lod_mode_btn = nullptr; // List 2: LODMode
 	SpinBox *force_lod_spinner = nullptr; // List 2 child: force_lod_level
 	Label *stats_label = nullptr;
+	HBoxContainer *ui_bar = nullptr; // Bottom bar holding the dropdowns + SpinBox.
 
 	Ref<NaniteMeshResource> current_resource;
 
