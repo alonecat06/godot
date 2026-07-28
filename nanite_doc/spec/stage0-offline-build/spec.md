@@ -31,8 +31,18 @@ Nanite 的 GPU 渲染管线（阶段 1+）必须依赖一份预先构建好的**
   - `Ref<BuilderConfig>` 构建参数回溯
   - Godot 原生 `ResourceSaver` / `ResourceLoader` 集成
 - **新增** meshlet 编解码（`meshopt_encodeMeshlet` / `decodeMeshlet`）+ 顶点池编码（`meshopt_encodeVertexBuffer`）
+- **新增** `NaniteDebug` 类（`Object` 子类）持有运行时可视化状态，包含：
+  - `DisplayMode` 枚举（5 项：`NORMAL` / `NORMAL_WIREFRAME` / `CLUSTER_SOLID` / `CLUSTER_SOLID_WIREFRAME` / `WIREFRAME_ONLY`）— Stage 0 编辑器 preview 着色控制
+  - `LODMode` 枚举（2 项：`NANITE_AUTO` / `FORCE_LOD_LEVEL`）— Stage 0 编辑器 preview LOD 选择控制
+  - 旧 `DebugMode` 枚举（7 项）保留供 Stage 1 GPU pipeline (`nanite_material_resolve.glsl`) 继续使用
+  - `set_display_mode` / `set_lod_mode` / `set_force_lod_level` / `set_show_bounds` 及对应 getter
+- **新增** `NaniteMeshResource::get_max_lod_level()` 辅助方法，扫描 `clusters_data`（68B stride）返回最大 `group_id`，用于 preview SpinBox 范围自适应（不绑定到 ClassDB）
 - **新增** `nanite/editor/` 编辑器扩展：
-  - `NaniteMeshEditor`（继承 `SubViewportContainer`，3D 旋转预览 + 构建统计 + 调试模式切换）
+  - `NaniteMeshEditor`（继承 `SubViewportContainer`，3D 旋转预览 + 构建统计 + **二维下拉列表**显示模式控制 + **独立 CPU 渲染器**）
+    - `solid_instance`（`MeshInstance3D`）：渲染 Lambert / per-vertex HSV 色（`FLAG_ALBEDO_FROM_VERTEX_COLOR`）
+    - `wire_instance`（`MeshInstance3D`）：渲染 `PRIMITIVE_LINES` mesh + `SHADING_MODE_UNSHADED` 白色（线框叠加层）
+    - CPU 侧匿名命名空间 `decode_clusters_for_lod()` 解码器：读 `clusters_data` + `meshlet_vertices_data` + `meshlet_triangles_data` + `vertex_data`，按 `group_id == force_lod_level` 过滤，可选输出 per-cluster HSV 色，支持三角形 mesh 与线框 mesh 两种输出模式
+    - `_rebuild_preview()` 在 edit() 加载新资源、用户切换 DisplayMode / LODMode / ForceLOD 时触发，同步重建 ArrayMesh
   - `EditorInspectorPluginNanite` + `NaniteEditorPlugin`
   - `NaniteResourcePreviewGenerator`（使用 `shadow_mesh` 生成 FileSystem 缩略图）
   - `NaniteConversionContextMenu`（继承 `EditorContextMenuPlugin`，在 FileSystem 对 `.gltf`/`.glb`/`.fbx`/`.obj`/`.tres` mesh 资源提供右键 "Convert to Nanite" 入口）
@@ -234,12 +244,20 @@ Nanite 的 GPU 渲染管线（阶段 1+）必须依赖一份预先构建好的**
 
 ### Requirement: 编辑器预览组件与 Inspector 集成
 
-系统 SHALL 提供 `NaniteMeshEditor`（继承 `SubViewportContainer`，3D 旋转预览 + 构建统计 + 调试模式切换）、`EditorInspectorPluginNanite`、`NaniteEditorPlugin`、`NaniteResourcePreviewGenerator`。
+系统 SHALL 提供 `NaniteMeshEditor`（继承 `SubViewportContainer`，3D 旋转预览 + 构建统计 + **二维下拉列表**显示模式控制）、`EditorInspectorPluginNanite`、`NaniteEditorPlugin`、`NaniteResourcePreviewGenerator`。
 
-> **Stage 0 修订**：原设计在 Inspector 中嵌入 `NaniteMeshEditor` 预览 `NaniteMeshResource`。现修订为：
-> - `NaniteMeshResource` 的可视化预览移至独立窗口（见 "独立资源编辑器窗口" 章节）
-> - `EditorInspectorPluginNanite` 仅对 `ArrayMesh` 资源 / `MeshInstance3D` 节点提供 "Convert to Nanite" 按钮（Task 0.12.4）
-> - `NaniteMeshEditor` 作为可复用的 3D 预览控件，被独立窗口内嵌使用
+> **Stage 0 修订（2026-07-28 二次重构）**：原设计的单轴 `debug_mode_btn`（7 项 DebugMode）+ `wireframe_btn` + `bounds_btn` 三个独立控件已重构为**两个正交维度的下拉列表**：
+> - **列表1 DisplayMode**（5 项）：`NORMAL` / `NORMAL_WIREFRAME` / `CLUSTER_SOLID` / `CLUSTER_SOLID_WIREFRAME` / `WIREFRAME_ONLY`
+> - **列表2 LODMode**（2 项）：`NANITE_AUTO`（Stage 1 占位，选中弹 WARN_PRINT 回退到 FORCE_LOD_LEVEL 0）/ `FORCE_LOD_LEVEL`（配合 `SpinBox` 选择 0..max_lod_level）
+> - 旧 `DebugMode` 枚举保留供 Stage 1 GPU pipeline (`nanite_material_resolve.glsl`) 继续使用，名字与值不变以兼容旧测试
+> - `NaniteDebug` 类新增 `set_display_mode` / `set_lod_mode` / `set_force_lod_level` / `set_show_bounds` 及 getter，与旧 `set_mode` / `set_wireframe` 并存
+> - `NaniteMeshResource` 新增 `get_max_lod_level()` 辅助方法（扫描 `clusters_data` 返回最大 `group_id`），用于 SpinBox 范围自适应
+>
+> **独立渲染约束（关键设计）**：Stage 0 preview 渲染**完全独立于 Nanite GPU 渲染管线**——不挂 `CompositorEffect`、不调用 `nanite_cull.glsl` / `nanite_rasterize.glsl` / `nanite_material_resolve.glsl`、也不写 `NaniteServer` 调试状态。所有渲染代码限制在 `nanite/editor/` 模块内，使用 Godot 标准 `MeshInstance3D` + `ArrayMesh` + `StandardMaterial3D` 经由引擎自带 forward 管线绘制。这让 preview 在未编译任何桥接时也能工作，并避免了预览视口与运行时场景共 `NaniteServer` 调试状态导致的串扰问题。
+>
+> **线框实现方式**：Godot `BaseMaterial3D` 无 `set_wireframe_enabled` 方法，因此 `wire_instance` 渲染的 mesh 是把三角形索引展开成边顶点构造的 `PRIMITIVE_LINES` ArrayMesh，配合 `SHADING_MODE_UNSHADED` 白色 material 绘制。这避开了不同后端 (Vulkan/D3D12/Metal) 线框 mode 支持差异。
+
+详见 `nanite_doc/nanite-overall-design.md` §9.5.3 渲染管线数据流图与五种 Display Mode 渲染策略表。
 
 #### Scenario: InspectorPlugin Convert 按钮
 - **WHEN** 在 Inspector 中选中 `ArrayMesh` 资源或 `MeshInstance3D` 节点
@@ -249,16 +267,50 @@ Nanite 的 GPU 渲染管线（阶段 1+）必须依赖一份预先构建好的**
 #### Scenario: NaniteMeshEditor 渲染不崩溃
 - **WHEN** 调用 `NaniteMeshEditor::edit(res)`（res 为有效资源）
 - **THEN** 不崩溃
-- **AND** `stats_label` 显示 `cluster_count` / `node_count` / `page_count` / shadow mesh 三角形数 / 估算内存
+- **AND** `stats_label` 显示 `cluster_count` / `node_count` / `page_count` / shadow mesh 三角形数 / 估算内存 / `Max LOD Level`
+
+#### Scenario: 二维下拉列表正交工作
+- **WHEN** 用户切换 `display_mode_btn`（列表1）选择任意 DisplayMode
+- **AND** 用户切换 `lod_mode_btn`（列表2）选择任意 LODMode
+- **THEN** 两个列表互不干扰：DisplayMode 仅改变着色方式，LODMode 仅改变 LOD 选择逻辑
+- **AND** 选中 `FORCE_LOD_LEVEL` 时 `force_lod_spinner`（SpinBox）可见且范围 `0..max_lod_level`
+- **AND** 选中 `NANITE_AUTO` 时弹 `WARN_PRINT` 提示 Stage 1 未实现，自动回退到 `FORCE_LOD_LEVEL` + level 0
+
+#### Scenario: 五种 Display Mode 渲染
+- **WHEN** 用户依次切换五种 DisplayMode 并触发 `_rebuild_preview()`
+- **THEN** 系统按以下策略渲染（CPU 侧构造 ArrayMesh，不调 Nanite GPU 管线）：
+  | Mode | solid_instance | wire_instance | mesh 来源 |
+  |------|---------------|---------------|----------|
+  | Normal | shadow_mesh + Lambert | 隐藏 | `get_shadow_mesh()` |
+  | Normal + Wireframe | shadow_mesh + Lambert | `build_wire_from_array_mesh(shadow_mesh)` PRIMITIVE_LINES + 白色 unshaded | 同上 |
+  | Cluster Solid | `build_cluster_mesh(force_lod, true)` + per-vertex HSV + `FLAG_ALBEDO_FROM_VERTEX_COLOR` | 隐藏 | cluster decode |
+  | Cluster Solid + Wireframe | 同上 | `build_cluster_wire_mesh(force_lod)` PRIMITIVE_LINES + 白色 unshaded | 同上 |
+  | Wireframe Only | 隐藏 | `build_cluster_wire_mesh(force_lod)` PRIMITIVE_LINES + 白色 unshaded | 同上 |
+- **AND** `solid_instance` 与 `wire_instance` 的可见性按 Mode 切换（如 `WIREFRAME_ONLY` 时 `solid_instance` 隐藏）
+
+#### Scenario: Force LOD Level 过滤 cluster
+- **WHEN** 用户切换 `force_lod_spinner` 选择 LOD 等级 N
+- **THEN** CPU 侧 `decode_clusters_for_lod()` 遍历 `clusters_data`（68B stride），跳过 `cluster.group_id != N` 的簇
+- **AND** 仅 `group_id == N` 的簇参与 ArrayMesh 构造
+- **AND** SpinBox 范围 `0..max_lod_level`，由 `NaniteMeshResource::get_max_lod_level()` 扫描 `clusters_data` 得到
+
+#### Scenario: Stage 0 preview 不触碰 NaniteServer 调试状态
+- **WHEN** 用户在 preview 面板切换 DisplayMode / LODMode / ForceLOD 等级
+- **THEN** 系统不调用 `NaniteServer::set_debug_mode()`
+- **AND** 不挂载 `CompositorEffect` 到 preview SubViewport
+- **AND** 不使用 `NaniteMeshInstance3D`（改用标准 `MeshInstance3D`）
+- **AND** 运行时场景的 NaniteServer 调试状态保持不变
 
 #### Scenario: 资源缩略图生成
 - **WHEN** FileSystem 面板需要 `NaniteMeshResource` 缩略图
 - **THEN** `NaniteResourcePreviewGenerator::handles("NaniteMeshResource")` 返回 `true`
 - **AND** `generate()` 使用 `shadow_mesh` 渲染缩略图（不启动 Nanite GPUPipeline）
 
-#### Scenario: 焦点隔离
-- **WHEN** `NaniteMeshEditor` 失去焦点（窗口关闭或切换）
-- **THEN** 全局 `NaniteServer::set_debug_mode(NONE)` 被调用，避免影响场景渲染（Stage 0 为 no-op，Stage 1 实现）
+#### Scenario: 焦点进出（Stage 0 no-op）
+- **WHEN** `NaniteMeshEditor` 获得或失去焦点
+- **THEN** `_notification()` 在 `NOTIFICATION_FOCUS_ENTER` / `NOTIFICATION_FOCUS_EXIT` 分支为 no-op
+- **AND** 不修改任何全局状态（Stage 0 preview 状态完全本地）
+- **NOTE** Stage 1 接入 GPU pipeline 后，应改为给预览 SubViewport 单独分配一个 `NaniteDebug` 实例（而非共用 `NaniteServer` 全局单例）。本节 Stage 0 阶段不做该工作。
 
 ---
 

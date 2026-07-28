@@ -21,6 +21,7 @@
 - [x] `BuilderConfig` 注册为 ClassDB 类，可在 Inspector 中创建子资源
 - [x] `NaniteBuilder` 注册为 ClassDB 类，可在 GDScript 中 `NaniteBuilder.new(cfg)`
 - [x] `NaniteMeshResource` 注册为 ClassDB 类，可在 FileSystem 中创建 `.tres`
+- [x] `NaniteDebug` 注册为 ClassDB 类（持有 DisplayMode / LODMode / 旧 DebugMode 枚举与 setter/getter）
 - [x] `NaniteMeshInstance3D` **未**注册（属于阶段 1）
 - [x] `NaniteMeshEditor` 注册（仅 `TOOLS_ENABLED`）
 - [x] `EditorInspectorPluginNanite` 注册（仅 `TOOLS_ENABLED`）
@@ -93,14 +94,80 @@
 
 ## 编辑器预览组件
 
-> **Stage 0 修订**：原 "Inspector 嵌入 NaniteMeshResource 预览" 已移至独立窗口（见下节）。本节仅保留组件本身验证与缩略图生成。
+> **Stage 0 修订（2026-07-28 二次重构）**：原 "Inspector 嵌入 NaniteMeshResource 预览" 已移至独立窗口（见下节）。本节仅保留组件本身验证与缩略图生成。
+>
+> **二次重构**：原单轴 `debug_mode_btn`（7 项 DebugMode）+ `wireframe_btn` + `bounds_btn` 三个控件已重构为两个正交下拉列表 + 独立 CPU 渲染器。验收点新增"二维下拉列表与独立渲染"小节。
 
-- [x] `NaniteMeshEditor::edit(res)` 不崩溃 **[CANNOT_VERIFY]** 代码逻辑对 null/valid resource 均有处理（`nanite_mesh_editor.cpp:102-159`），但需手动启动编辑器验证
-- [x] `stats_label` 显示 cluster/node/page 数 + shadow tris + 估算 MB
-- [x] 鼠标拖拽可旋转预览 **[CANNOT_VERIFY]** `gui_input` 处理鼠标事件 + `_update_rotation` 修改 `rotation_node` Transform3D（`nanite_mesh_editor.cpp:74-100`），但需手动 UI 验证
-- [x] 失去焦点时 `NaniteServer::set_debug_mode(NONE)` 被调用（阶段 0 可空实现） **[PARTIAL]** `nanite_mesh_editor.cpp:63-67` `NOTIFICATION_FOCUS_EXIT` 为空体 + TODO 注释。`NaniteServer` 类未实现（属于阶段 1）。符合 spec "阶段 0 可空实现"语义，但需阶段 1 补齐
+### 组件基础验证
+
+- [x] `NaniteMeshEditor::edit(res)` 不崩溃 **[CANNOT_VERIFY]** 代码逻辑对 null/valid resource 均有处理（`nanite_mesh_editor.cpp` `_rebuild_preview` + `edit`），但需手动启动编辑器验证
+- [x] `stats_label` 显示 cluster/node/page 数 + shadow tris + 估算 MB + Max LOD Level
+- [x] 鼠标拖拽可旋转预览 **[CANNOT_VERIFY]** `gui_input` 处理鼠标事件 + `_update_rotation` 修改 `rotation_node` Transform3D，但需手动 UI 验证
 - [x] FileSystem 中 `NaniteMeshResource` 缩略图由 `shadow_mesh` 生成
 - [x] 缩略图生成不启动 Nanite GPUPipeline
+
+### Stage 0 二维下拉列表与独立渲染（Task 0.9.7 - 0.9.10）
+
+#### NaniteDebug 二维枚举（Task 0.9.7）
+
+- [x] `NaniteDebug::DisplayMode` 枚举含 5 项：`NORMAL=0` / `NORMAL_WIREFRAME=1` / `CLUSTER_SOLID=2` / `CLUSTER_SOLID_WIREFRAME=3` / `WIREFRAME_ONLY=4`
+- [x] `NaniteDebug::LODMode` 枚举含 2 项：`NANITE_AUTO=0` / `FORCE_LOD_LEVEL=1`
+- [x] 旧 `DebugMode` 枚举（7 项）保持原值不变（`NONE=0` / `CLUSTER_SOLID_COLOR=1` / `LOD_SOLID_COLOR=2` / `OVERDRAW_HEATMAP=3` / `PAGE_RESIDENCY=4` / `HZB_MIP_LEVELS=5` / `HZB_OCCLUSION=6`）
+- [x] `NaniteDebug` 新增 `set_display_mode` / `set_lod_mode` / `set_force_lod_level` / `set_show_bounds` 及对应 getter，通过 `_bind_methods` + `ADD_PROPERTY` 暴露
+- [x] `BIND_ENUM_CONSTANT` 暴露 `DisplayMode` 与 `LODMode` 全部常量到 ClassDB
+- [x] `nanite_debug.h` 不再含 `DEBUG_NONE` 拼写错误（应为 `NONE`）
+
+#### NaniteMeshResource::get_max_lod_level（Task 0.9.8）
+
+- [x] `NaniteMeshResource::get_max_lod_level()` 声明在 `nanite_resource.h`，不绑定 ClassDB
+- [x] 实现扫描 `clusters_data`（68B stride）返回最大 `group_id`
+- [x] 空资源（`cluster_count <= 0` 或 `clusters_data.size()` 不足）返回 0
+- [x] 短 blob 情况安全返回 0（不读越界）
+
+#### NaniteMeshEditor 二维下拉列表 UI（Task 0.9.9）
+
+- [x] 移除旧的 `debug_mode_btn` / `wireframe_btn` / `bounds_btn` 三个控件
+- [x] 新增 `display_mode_btn`（`OptionButton`）含 5 项，id 取 `NaniteDebug::NORMAL` 等常量
+- [x] 新增 `lod_mode_btn`（`OptionButton`）含 2 项，`NANITE_AUTO` 项 label 标 `[Stage 1]` 后缀
+- [x] 新增 `force_lod_spinner`（`SpinBox`），range `0..max_lod_level`，默认 0
+- [x] 选中 `NANITE_AUTO` 时弹 `WARN_PRINT` + 自动 `select(FORCE_LOD_LEVEL)` + spinner 设为 0
+- [x] `_on_display_mode_selected` / `_on_lod_mode_selected` / `_on_force_lod_changed` 都只调 `_rebuild_preview()`，不调 `NaniteServer::set_debug_mode()`
+- [x] 两个 `MeshInstance3D` 子节点：`solid_instance`（`FLAG_ALBEDO_FROM_VERTEX_COLOR`）+ `wire_instance`（`SHADING_MODE_UNSHADED` 白色）
+- [x] 构造函数不调用 `NaniteGDExtBridgeManager::attach_to_viewport(viewport)`
+- [x] 使用标准 `MeshInstance3D` 而非 `NaniteMeshInstance3D`
+- [x] `_notification()` 在 `NOTIFICATION_FOCUS_ENTER` / `NOTIFICATION_FOCUS_EXIT` 为 no-op
+- [x] 默认选中 `DisplayMode = NORMAL` + `LODMode = FORCE_LOD_LEVEL` + `force_lod_level = 0`
+- [x] Stage 0 默认 `LODMode = FORCE_LOD_LEVEL`（不是 `NANITE_AUTO`）
+
+#### CPU 侧 cluster 解码器与五种 Display Mode 渲染（Task 0.9.10）
+
+- [x] 匿名命名空间 `decode_clusters_for_lod()` 实现在 `nanite_mesh_editor.cpp`
+- [x] 遍历 `clusters_data`（68B stride）按 `group_id == force_lod_level` 过滤
+- [x] 通过 `meshlet_vertices_data`（`uint32[]`）映射 micro-index → 全局顶点索引
+- [x] 从 `vertex_data`（stride 32B: `pos.xyz` + `normal.xyz` + `uv.xy`）读取位置
+- [x] `p_per_cluster_colors = true` 时按 `ci * 2654435761u` hash 生成 HSV 色
+- [x] `p_emit_lines = false` 输出三角形 mesh（`PackedVector3Array` + `PackedInt32Array` + 可选 `PackedColorArray`）
+- [x] `p_emit_lines = true` 输出线框 mesh（每三角形 6 顶点 = 3 边，仅写 `PackedVector3Array`）
+- [x] bounds check：`vertex_offset + vertex_count <= mv_count`、`triangle_offset + triangle_count * 3 <= tri_byte_count`、global index `< total_vertex_count`
+- [x] `build_cluster_mesh()` 构造 `PRIMITIVE_TRIANGLES` ArrayMesh（含可选 `ARRAY_COLOR`）
+- [x] `build_cluster_wire_mesh()` 构造 `PRIMITIVE_LINES` ArrayMesh
+- [x] `build_wire_from_array_mesh()` 从已有 `ArrayMesh` 的三角形索引展开成边顶点构造 `PRIMITIVE_LINES` ArrayMesh
+- [x] `_rebuild_preview()` 按 DisplayMode 切换 mesh 构造路径与 `solid_instance` / `wire_instance` 可见性
+- [x] Normal 模式：`solid_instance` = `shadow_mesh`，`wire_instance` 隐藏
+- [x] Normal + Wireframe 模式：`solid_instance` = `shadow_mesh`，`wire_instance` = `build_wire_from_array_mesh(shadow_mesh)`
+- [x] Cluster Solid 模式：`solid_instance` = `build_cluster_mesh(force_lod, true)`，`wire_instance` 隐藏
+- [x] Cluster Solid + Wireframe 模式：`solid_instance` = `build_cluster_mesh(force_lod, true)`，`wire_instance` = `build_cluster_wire_mesh(force_lod)`
+- [x] Wireframe Only 模式：`solid_instance` 隐藏，`wire_instance` = `build_cluster_wire_mesh(force_lod)`
+- [x] mesh 为 null 时 `set_visible(false)`（不渲染空 mesh）
+
+#### 独立渲染约束验证
+
+- [x] preview SubViewport 不挂 `CompositorEffect`
+- [x] preview 不调 `nanite_cull.glsl` / `nanite_rasterize.glsl` / `nanite_material_resolve.glsl`
+- [x] preview 不调 `NaniteServer::set_debug_mode()`（运行时场景的 NaniteServer 调试状态保持不变）
+- [x] preview 不使用 `NaniteMeshInstance3D`（避免触发 NaniteServer instance 注册）
+- [x] 所有渲染代码限制在 `nanite/editor/` 模块内（CPU 侧解码 + Godot 标准 `MeshInstance3D` forward 管线）
+- [x] `scons platform=windows target=editor accesskit=no angle=no dev_build=yes -j8` 编译通过（commit `79b2011a68`）
 
 ## 独立资源编辑器窗口 (Task 0.13)
 

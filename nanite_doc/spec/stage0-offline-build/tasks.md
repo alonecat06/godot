@@ -169,12 +169,14 @@
 
 ## 0.9 编辑器预览与调试可视化
 
-- [x] **Task 0.9.1**：实现 `nanite/editor/nanite_mesh_editor.h` / `.cpp`
+> **Stage 0 重构（2026-07-28）**：原 Task 0.9.1 的单轴 `debug_mode_btn`（7 项 DebugMode）+ `wireframe_btn` + `bounds_btn` 三个控件已重构为两个正交下拉列表 + 独立 CPU 渲染器。新增 Task 0.9.7 - 0.9.10 记录该重构；Task 0.9.1 - 0.9.6 标记为已完成（保留旧实现历史），实际生产代码以 0.9.7 - 0.9.10 为准。
+
+- [x] **Task 0.9.1**：实现 `nanite/editor/nanite_mesh_editor.h` / `.cpp`（已被 0.9.7 - 0.9.10 重构覆盖）
   - 继承 `SubViewportContainer`，`GDCLASS(NaniteMeshEditor, SubViewportContainer)`
   - 子节点：`SubViewport`、`Node3D rotation_node`、`Camera3D`、`DirectionalLight3D * 2`、`OptionButton debug_mode_btn`、`Button wireframe_btn`、`Button bounds_btn`、`Label stats_label`
   - `edit(Ref<NaniteMeshResource>)`：设置预览 mesh、填充统计、自动缩放相机
   - `gui_input()` 实现鼠标拖拽旋转（复用 `editor/scene/3d/mesh_editor_plugin.cpp` 模式）
-  - `_notification()` 处理 `NOTIFICATION_FOCUS_ENTER/EXIT` 调试模式隔离
+  - `_notification()` 处理 `NOTIFICATION_FOCUS_ENTER/EXIT` 调试模式隔离（Stage 0 后改为 no-op，见 0.9.9）
 
 - [x] **Task 0.9.2**：实现 `nanite/editor/nanite_editor_plugin.h` / `.cpp`
   - `EditorInspectorPluginNanite : EditorInspectorPlugin`，`can_handle()` 识别 `NaniteMeshResource`，`parse_begin()` 创建 `NaniteMeshEditor`
@@ -195,6 +197,50 @@
 - [x] **Task 0.9.6**：编写 GUT 集成测试 `test_nanite_editor.gd`
   - 覆盖：`can_handle(NaniteMeshResource)`、`edit()` 不崩溃、`handles("NaniteMeshResource")` 返回 true
   - 验证：测试通过 **[策略调整]** C++ 虚函数未暴露到 GDScript，改为通过 ClassDB API 验证类注册与继承（10/10 断言 PASS）（原 `.trae-cn/specs/fix-nanite-stage0-validation-failures/` 已并入 spec.md 并清理）
+
+- [x] **Task 0.9.7**（Stage 0 重构, 2026-07-28）：`NaniteDebug` 二维枚举重构
+  - 在 `nanite/core/nanite_debug.h` 新增 `DisplayMode` 枚举（5 项：`NORMAL` / `NORMAL_WIREFRAME` / `CLUSTER_SOLID` / `CLUSTER_SOLID_WIREFRAME` / `WIREFRAME_ONLY`）
+  - 新增 `LODMode` 枚举（2 项：`NANITE_AUTO` / `FORCE_LOD_LEVEL`）
+  - 保留旧 `DebugMode` 枚举（7 项，原名字不变）继续供 Stage 1 GPU pipeline 使用
+  - 新增 `set_display_mode` / `set_lod_mode` / `set_force_lod_level` / `set_show_bounds` 及对应 getter
+  - 在 `_bind_methods` 中通过 `BIND_ENUM_CONSTANT` 暴露新枚举常量到 GDScript / ClassDB
+  - 验证：`scons platform=windows target=editor accesskit=no angle=no dev_build=yes` 编译通过
+
+- [x] **Task 0.9.8**（Stage 0 重构）：`NaniteMeshResource::get_max_lod_level()` 辅助方法
+  - 在 `nanite/core/nanite_resource.h` 声明 `int get_max_lod_level() const`
+  - 在 `nanite/core/nanite_resource.cpp` 实现：遍历 `clusters_data`（固定 68 字节 stride），返回所有 cluster 中最大的 `group_id` 字段
+  - 处理空资源 / 短 blob 情况返回 0
+  - 不绑定到 ClassDB（编辑器内部使用，每次 `edit()` 调用一次即可）
+  - 验证：编译通过；对含多 LOD 的资源返回正确 max_lod
+
+- [x] **Task 0.9.9**（Stage 0 重构）：`NaniteMeshEditor` 二维下拉列表 + 独立 CPU 渲染器
+  - 移除旧的 `debug_mode_btn`（7 项）/ `wireframe_btn` / `bounds_btn` 三个控件
+  - 新增两个正交下拉列表：
+    - `display_mode_btn`（`OptionButton`）：5 个 DisplayMode 项（`add_item` 用 `NaniteDebug::NORMAL` 等常量作 id）
+    - `lod_mode_btn`（`OptionButton`）：2 个 LODMode 项（`NANITE_AUTO` 标 `[Stage 1]` 后缀）
+  - 新增 `force_lod_spinner`（`SpinBox`，range `0..max_lod_level`），选中 `FORCE_LOD_LEVEL` 时可见
+  - 选中 `NANITE_AUTO` 时弹 `WARN_PRINT` 提示 Stage 1 未实现，自动回退到 `FORCE_LOD_LEVEL` + 0
+  - 三个回调 `_on_display_mode_selected` / `_on_lod_mode_selected` / `_on_force_lod_changed` 都只触发本地 `_rebuild_preview()`，**不调用** `NaniteServer::set_debug_mode()`
+  - 用两个 `MeshInstance3D` 子节点替换原单一 instance：
+    - `solid_instance`：渲染 Lambert / per-vertex HSV 色（`FLAG_ALBEDO_FROM_VERTEX_COLOR`）
+    - `wire_instance`：渲染 `PRIMITIVE_LINES` mesh + `SHADING_MODE_UNSHADED` 白色（线框叠加层）
+  - 构造函数**不**调用 `NaniteGDExtBridgeManager::attach_to_viewport(viewport)`（避免预览视口被 Nanite GPU pipeline 接管）
+  - 使用标准 `MeshInstance3D` 而非 `NaniteMeshInstance3D`（避免触发 NaniteServer 的 instance 注册与 GPU pipeline 调度）
+  - `_notification()` 在 `NOTIFICATION_FOCUS_ENTER` / `NOTIFICATION_FOCUS_EXIT` 分支为 no-op（Stage 0 preview 状态完全本地）
+  - 验证：编译通过；UI 切换不崩溃；预览视口不挂 Nanite compositor
+
+- [x] **Task 0.9.10**（Stage 0 重构）：CPU-side cluster 解码器 + 五种 Display Mode 渲染
+  - 在 `nanite/editor/nanite_mesh_editor.cpp` 匿名命名空间实现 `decode_clusters_for_lod()` 解码器：
+    - 遍历 `clusters_data`（68B stride），过滤 `group_id == force_lod_level`
+    - 通过 `meshlet_vertices_data`（`uint32[]`）映射 micro-index → 全局顶点索引
+    - 从 `vertex_data`（stride 32B: `pos.xyz` + `normal.xyz` + `uv.xy`）读取位置
+    - 可选地为每个 cluster 生成唯一 HSV 色（按 `ci * 2654435761u` hash 散布色相）
+    - `p_emit_lines = false`：输出 `PackedVector3Array` + `PackedInt32Array` + 可选 `PackedColorArray` → `build_cluster_mesh()` 构造 `PRIMITIVE_TRIANGLES` ArrayMesh
+    - `p_emit_lines = true`：每三角形输出 6 个顶点（3 条边 `(v0,v1) (v1,v2) (v2,v0)`），仅写入 `PackedVector3Array` → `build_cluster_wire_mesh()` 构造 `PRIMITIVE_LINES` ArrayMesh
+    - 含 bounds check（`vertex_offset + vertex_count <= mv_count`、`triangle_offset + triangle_count * 3 <= tri_byte_count`、global index `< total_vertex_count`）
+  - 实现 `build_wire_from_array_mesh()`：从已有 `ArrayMesh` 的三角形索引展开成边顶点，构造 `PRIMITIVE_LINES` ArrayMesh（供 Normal+Wireframe 模式使用）
+  - 实现 `_rebuild_preview()`：按 DisplayMode 选择 mesh 构造路径与 `solid_instance` / `wire_instance` 可见性
+  - 验证：编译通过；五种 DisplayMode 切换不崩溃；`Force LOD Level` 切换时解码出不同 triangle count
 
 ---
 
