@@ -90,6 +90,7 @@ private:
 	Ref<NaniteMeshResource> current_resource;
 
 	bool dragging = false;
+	bool lod_mode_updating = false; // Guard against recursive item_selected signals.
 	float rot_x = 0.0f;
 	float rot_y = 0.0f;
 

@@ -130,9 +130,11 @@ Ref<NaniteMeshResource> NaniteBuilder::build_from_resource(Ref<Resource> p_resou
 	ERR_FAIL_COND_V_MSG(p_resource.is_null(), null_result,
 			"NaniteBuilder::build_from_resource: input resource is null");
 
-	// Collect merged vertex/index into these buffers.
+	// Collect merged vertex/index/normal/uv into these buffers.
 	PackedVector3Array merged_verts;
 	PackedInt32Array merged_indices;
+	PackedVector3Array merged_normals;
+	PackedVector2Array merged_uvs;
 
 	// --- Path A: ArrayMesh ------------------------------------------------
 	// Accept both direct ArrayMesh resources and ImportMesh (subclass).
@@ -158,6 +160,36 @@ Ref<NaniteMeshResource> NaniteBuilder::build_from_resource(Ref<Resource> p_resou
 			PackedInt32Array s_indices = arrays[Mesh::ARRAY_INDEX];
 			const int64_t base = merged_verts.size();
 			merged_verts.append_array(s_verts);
+			// Merge normals if present, otherwise fill with defaults.
+			if (arrays.size() > Mesh::ARRAY_NORMAL) {
+				PackedVector3Array s_normals = arrays[Mesh::ARRAY_NORMAL];
+				if (s_normals.size() == s_verts.size()) {
+					merged_normals.append_array(s_normals);
+				} else {
+					for (int i = 0; i < s_verts.size(); ++i) {
+						merged_normals.push_back(Vector3(0, 1, 0));
+					}
+				}
+			} else {
+				for (int i = 0; i < s_verts.size(); ++i) {
+					merged_normals.push_back(Vector3(0, 1, 0));
+				}
+			}
+			// Merge UVs if present, otherwise fill with defaults.
+			if (arrays.size() > Mesh::ARRAY_TEX_UV) {
+				PackedVector2Array s_uvs = arrays[Mesh::ARRAY_TEX_UV];
+				if (s_uvs.size() == s_verts.size()) {
+					merged_uvs.append_array(s_uvs);
+				} else {
+					for (int i = 0; i < s_verts.size(); ++i) {
+						merged_uvs.push_back(Vector2(0, 0));
+					}
+				}
+			} else {
+				for (int i = 0; i < s_verts.size(); ++i) {
+					merged_uvs.push_back(Vector2(0, 0));
+				}
+			}
 			if (s_indices.size() == 0) {
 				// Non-indexed surface: synthesize 0..N-1 indices.
 				for (int i = 0; i < s_verts.size(); ++i) {
@@ -194,6 +226,36 @@ Ref<NaniteMeshResource> NaniteBuilder::build_from_resource(Ref<Resource> p_resou
 					PackedInt32Array s_indices = arrays[Mesh::ARRAY_INDEX];
 					const int64_t base = merged_verts.size();
 					merged_verts.append_array(s_verts);
+					// Merge normals if present, otherwise fill with defaults.
+					if (arrays.size() > Mesh::ARRAY_NORMAL) {
+						PackedVector3Array s_normals = arrays[Mesh::ARRAY_NORMAL];
+						if (s_normals.size() == s_verts.size()) {
+							merged_normals.append_array(s_normals);
+						} else {
+							for (int i = 0; i < s_verts.size(); ++i) {
+								merged_normals.push_back(Vector3(0, 1, 0));
+							}
+						}
+					} else {
+						for (int i = 0; i < s_verts.size(); ++i) {
+							merged_normals.push_back(Vector3(0, 1, 0));
+						}
+					}
+					// Merge UVs if present, otherwise fill with defaults.
+					if (arrays.size() > Mesh::ARRAY_TEX_UV) {
+						PackedVector2Array s_uvs = arrays[Mesh::ARRAY_TEX_UV];
+						if (s_uvs.size() == s_verts.size()) {
+							merged_uvs.append_array(s_uvs);
+						} else {
+							for (int i = 0; i < s_verts.size(); ++i) {
+								merged_uvs.push_back(Vector2(0, 0));
+							}
+						}
+					} else {
+						for (int i = 0; i < s_verts.size(); ++i) {
+							merged_uvs.push_back(Vector2(0, 0));
+						}
+					}
 					if (s_indices.size() == 0) {
 						for (int i = 0; i < s_verts.size(); ++i) {
 							merged_indices.append(static_cast<int32_t>(base + i));
@@ -226,6 +288,36 @@ Ref<NaniteMeshResource> NaniteBuilder::build_from_resource(Ref<Resource> p_resou
 			PackedInt32Array s_indices = arrays[Mesh::ARRAY_INDEX];
 			const int64_t base = merged_verts.size();
 			merged_verts.append_array(s_verts);
+			// Merge normals if present, otherwise fill with defaults.
+			if (arrays.size() > Mesh::ARRAY_NORMAL) {
+				PackedVector3Array s_normals = arrays[Mesh::ARRAY_NORMAL];
+				if (s_normals.size() == s_verts.size()) {
+					merged_normals.append_array(s_normals);
+				} else {
+					for (int i = 0; i < s_verts.size(); ++i) {
+						merged_normals.push_back(Vector3(0, 1, 0));
+					}
+				}
+			} else {
+				for (int i = 0; i < s_verts.size(); ++i) {
+					merged_normals.push_back(Vector3(0, 1, 0));
+				}
+			}
+			// Merge UVs if present, otherwise fill with defaults.
+			if (arrays.size() > Mesh::ARRAY_TEX_UV) {
+				PackedVector2Array s_uvs = arrays[Mesh::ARRAY_TEX_UV];
+				if (s_uvs.size() == s_verts.size()) {
+					merged_uvs.append_array(s_uvs);
+				} else {
+					for (int i = 0; i < s_verts.size(); ++i) {
+						merged_uvs.push_back(Vector2(0, 0));
+					}
+				}
+			} else {
+				for (int i = 0; i < s_verts.size(); ++i) {
+					merged_uvs.push_back(Vector2(0, 0));
+				}
+			}
 			if (s_indices.size() == 0) {
 				for (int i = 0; i < s_verts.size(); ++i) {
 					merged_indices.append(static_cast<int32_t>(base + i));
@@ -251,6 +343,8 @@ Ref<NaniteMeshResource> NaniteBuilder::build_from_resource(Ref<Resource> p_resou
 	Array merged_arrays;
 	merged_arrays.resize(Mesh::ARRAY_MAX);
 	merged_arrays[Mesh::ARRAY_VERTEX] = merged_verts;
+	merged_arrays[Mesh::ARRAY_NORMAL] = merged_normals;
+	merged_arrays[Mesh::ARRAY_TEX_UV] = merged_uvs;
 	merged_arrays[Mesh::ARRAY_INDEX] = merged_indices;
 	merged_mesh->add_surface_from_arrays(Mesh::PRIMITIVE_TRIANGLES, merged_arrays);
 
