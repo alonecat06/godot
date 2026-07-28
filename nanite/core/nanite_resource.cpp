@@ -37,6 +37,7 @@
 #include "scene/resources/mesh.h"
 
 #include "builder_config.h"
+#include "nanite_cluster.h"
 
 // ---------------------------------------------------------------------------
 // Setters / getters
@@ -153,6 +154,26 @@ void NaniteMeshResource::set_page_count(int p_count) {
 
 int NaniteMeshResource::get_page_count() const {
 	return page_count;
+}
+
+int NaniteMeshResource::get_max_lod_level() const {
+	// Scan the fixed-stride clusters_data blob and return the maximum
+	// group_id (LOD level) seen across all clusters. Returns 0 when
+	// there are no clusters or the blob is undersized.
+	const size_t cluster_stride = NaniteCluster::get_serialized_size(); // 68
+	const int count = cluster_count;
+	if (count <= 0 || clusters_data.size() < (int)(count * cluster_stride)) {
+		return 0;
+	}
+	int max_lod = 0;
+	for (int i = 0; i < count; ++i) {
+		NaniteCluster c = NaniteCluster::deserialize(clusters_data,
+				(uint32_t)(i * cluster_stride));
+		if ((int)c.group_id > max_lod) {
+			max_lod = (int)c.group_id;
+		}
+	}
+	return max_lod;
 }
 
 // ---------------------------------------------------------------------------

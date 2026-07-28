@@ -34,12 +34,12 @@
 
 #include "editor/plugins/editor_plugin.h"
 #include "scene/gui/option_button.h"
+#include "scene/gui/spin_box.h"
 #include "scene/gui/label.h"
-#include "scene/gui/button.h"
 #include "scene/gui/subviewport_container.h"
 #include "scene/3d/camera_3d.h"
 #include "scene/3d/light_3d.h"
-#include "nanite/scene/nanite_mesh_instance_3d.h"
+#include "scene/3d/mesh_instance_3d.h"
 #include "scene/3d/node_3d.h"
 #include "scene/main/viewport.h"
 #include "scene/resources/mesh.h"
@@ -49,12 +49,23 @@ class NaniteMeshResource;
 // NaniteMeshEditor is an Inspector-embedded 3D preview widget for
 // NaniteMeshResource. It mirrors the structure of MeshEditor (editor/plugins/
 // mesh_editor_plugin.cpp): a SubViewportContainer hosting a SubViewport with a
-// rotation pivot Node3D, Camera3D, two DirectionalLights, and a MeshInstance3D
-// for the shadow mesh. A stats Label overlays cluster/node/page counts +
-// shadow triangle count + estimated memory.
+// rotation pivot Node3D, Camera3D, two DirectionalLights, and a
+// MeshInstance3D that renders the decoded mesh.
 //
-// All file I/O and GPU pipeline work belongs to later stages; this widget
-// only renders the (already-built) shadow_mesh via a standard MeshInstance3D.
+// Stage 0 refactor (2026-07-28): the old single-axis debug OptionButton +
+// Wireframe/Bounds toggles have been replaced with two orthogonal dropdowns:
+//
+//   - Display Mode (5 options): Normal, Normal+Wireframe, Cluster Solid,
+//     Cluster Solid+Wireframe, Wireframe Only.
+//   - LOD Mode (2 options): Nanite auto cull+LOD (Stage 1 placeholder) /
+//     Force LOD Level (with a SpinBox picking which LOD to render).
+//
+// Stage 0 rendering is INDEPENDENT of the Nanite GPU pipeline (no
+// CompositorEffect, no nanite_cull/rasterize/material_resolve shaders). It
+// reads the encoded blobs from NaniteMeshResource CPU-side and builds a
+// standard ArrayMesh that Godot's MeshInstance3D renders via the regular
+// forward pipeline. This keeps the preview confined to the editor module
+// and lets it work even when no Nanite bridge is compiled in.
 class NaniteMeshEditor : public SubViewportContainer {
 	GDCLASS(NaniteMeshEditor, SubViewportContainer);
 
@@ -64,10 +75,16 @@ private:
 	Camera3D *camera = nullptr;
 	DirectionalLight3D *light1 = nullptr;
 	DirectionalLight3D *light2 = nullptr;
-	NaniteMeshInstance3D *mesh_instance = nullptr;
-	OptionButton *debug_mode_btn = nullptr;
-	Button *wireframe_btn = nullptr;
-	Button *bounds_btn = nullptr;
+	// solid_instance renders the shaded surface (Normal or Cluster Solid).
+	// wire_instance renders the white wireframe overlay (visible in modes
+	// NORMAL_WIREFRAME / CLUSTER_SOLID_WIREFRAME / WIREFRAME_ONLY).
+	MeshInstance3D *solid_instance = nullptr;
+	MeshInstance3D *wire_instance = nullptr;
+
+	// Stage 0 two-axis UI.
+	OptionButton *display_mode_btn = nullptr; // List 1: DisplayMode
+	OptionButton *lod_mode_btn = nullptr; // List 2: LODMode
+	SpinBox *force_lod_spinner = nullptr; // List 2 child: force_lod_level
 	Label *stats_label = nullptr;
 
 	Ref<NaniteMeshResource> current_resource;
@@ -77,7 +94,16 @@ private:
 	float rot_y = 0.0f;
 
 	void _update_rotation();
-	void _on_debug_mode_changed(int p_index);
+	void _on_display_mode_selected(int p_index);
+	void _on_lod_mode_selected(int p_index);
+	void _on_force_lod_changed(double p_value);
+
+	// Rebuild the preview ArrayMesh from current_resource based on the
+	// active DisplayMode + LODMode + force_lod_level. Called whenever the
+	// user changes any of the three controls, or when edit() loads a new
+	// resource. Cheap enough to run synchronously (<1 ms for typical
+	// meshes up to ~50 clusters / few thousand triangles).
+	void _rebuild_preview();
 
 protected:
 	static void _bind_methods();

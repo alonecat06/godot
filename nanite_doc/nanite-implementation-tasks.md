@@ -585,6 +585,56 @@ TEST_CASE("Encoded meshlet decode matches original") {
 
 **任务 0.9.3**：实现 `NaniteResourcePreviewGenerator` — 资源缩略图
 
+**任务 0.9.4**（Stage 0 重构, 2026-07-28）：`NaniteDebug` 二维枚举重构
+
+- 新增 `DisplayMode` 枚举（5 项：NORMAL / NORMAL_WIREFRAME / CLUSTER_SOLID / CLUSTER_SOLID_WIREFRAME / WIREFRAME_ONLY）控制预览的着色方式
+- 新增 `LODMode` 枚举（2 项：NANITE_AUTO / FORCE_LOD_LEVEL）控制预览的 LOD 选择逻辑
+- 保留旧 `DebugMode` 枚举（原名字不变）继续供 Stage 1 GPU pipeline 使用
+- 新增 `set_display_mode` / `set_lod_mode` / `set_force_lod_level` / `set_show_bounds` 及对应 getter
+- `NaniteServer::set_debug_mode` 不变（继续走 legacy `DebugMode` 路径）
+
+**任务 0.9.5**（Stage 0 重构）：`NaniteMeshResource::get_max_lod_level()` 辅助方法
+
+- 扫描 `clusters_data`（固定 68 字节 stride）返回所有 cluster 中最大的 `group_id` 字段
+- 用于 SpinBox 范围设置（0..max_lod_level）
+- 不绑定到 ClassDB（编辑器内部使用，每次 edit() 调用一次即可）
+
+**任务 0.9.6**（Stage 0 重构）：`NaniteMeshEditor` 二维下拉列表 + 本地渲染器
+
+- 移除旧的 `debug_mode_btn`（7 项）/`wireframe_btn`/`bounds_btn` 三个控件
+- 新增两个正交下拉列表：
+  - `display_mode_btn`：5 个 DisplayMode 项
+  - `lod_mode_btn`：2 个 LODMode 项（NANITE_AUTO 标 `[Stage 1]` 后缀）
+- 新增 `force_lod_spinner`（SpinBox，range 0..max_lod_level），选中 FORCE_LOD_LEVEL 时可见
+- 选中 NANITE_AUTO 时弹 `WARN_PRINT` 并自动回退到 FORCE_LOD_LEVEL + 0
+- 三个回调 `_on_display_mode_selected` / `_on_lod_mode_selected` / `_on_force_lod_changed` 都只触发本地 `_rebuild_preview()`，不调用 `NaniteServer::set_debug_mode()`
+
+**任务 0.9.7**（Stage 0 重构）：CPU-side cluster 解码器 + 五种 Display Mode 渲染
+
+**关键约束**：Stage 0 preview 渲染**完全独立于 Nanite GPU 渲染管线**——不调用 `CompositorEffect`、不调用 `nanite_cull.glsl` / `nanite_rasterize.glsl` / `nanite_material_resolve.glsl`，也不需要 `NaniteServer` 已激活任何 bridge。所有渲染代码限制在 `nanite/editor/` 模块内，使用 Godot 标准 `MeshInstance3D` + `ArrayMesh` + `StandardMaterial3D` 经由引擎自带 forward 管线绘制。
+
+实现要点：
+- 使用 Godot 标准 `MeshInstance3D`（不再用 `NaniteMeshInstance3D`）
+- 构造函数不再调用 `NaniteGDExtBridgeManager::attach_to_viewport(viewport)`
+- 两个 MeshInstance3D 子节点：`solid_instance`（Lambert 或 vertex color）+ `wire_instance`（unshaded wireframe overlay）
+- CPU 侧匿名命名空间内的 `decode_clusters_for_lod()` 解码器：
+  - 遍历 `clusters_data`（68B stride），过滤 `group_id == force_lod_level`
+  - 通过 `meshlet_vertices_data`（uint32[]）映射 micro-index → 全局顶点索引
+  - 从 `vertex_data`（stride 32B: pos.xyz + normal.xyz + uv.xy）读取位置
+  - 可选地为每个 cluster 生成唯一 HSV 色（按 ci hash 散布色相）
+  - `p_emit_lines = false`：输出 `PackedVector3Array` + `PackedInt32Array` + 可选 `PackedColorArray` → `build_cluster_mesh()` 构造 `PRIMITIVE_TRIANGLES` ArrayMesh
+  - `p_emit_lines = true`：每三角形输出 6 个顶点 (3 条边)，仅写入 `PackedVector3Array` → `build_cluster_wire_mesh()` 构造 `PRIMITIVE_LINES` ArrayMesh
+- 五种 Display Mode 渲染策略：
+  | Mode | solid 渲染 | wire 渲染 | mesh 来源 |
+  |------|-----------|----------|---------|
+  | Normal | shadow_mesh + Lambert | 隐藏 | `get_shadow_mesh()` |
+  | Normal + Wireframe | shadow_mesh + Lambert | `build_wire_from_array_mesh(shadow_mesh)` → PRIMITIVE_LINES + 白色 unshaded material | 同上 |
+  | Cluster Solid | `build_cluster_mesh(force_lod, true)` + per-vertex HSV + `FLAG_ALBEDO_FROM_VERTEX_COLOR` | 隐藏 | cluster decode |
+  | Cluster Solid + Wireframe | 同上 | `build_cluster_wire_mesh(force_lod)` PRIMITIVE_LINES + 白色 unshaded material | 同上 |
+  | Wireframe Only | 隐藏 | `build_cluster_wire_mesh(force_lod)` PRIMITIVE_LINES + 白色 unshaded material | 同上 |
+- **线框实现方式**：Godot `BaseMaterial3D` 无 `set_wireframe_enabled`，因此 wire_instance 渲染的 mesh 是把三角形索引展开成边顶点构造的 `PRIMITIVE_LINES` ArrayMesh，配合 `SHADING_MODE_UNSHADED` 白色 material 绘制。这避开不同后端 (Vulkan/D3D12/Metal) 线框 mode 支持差异。
+- `_rebuild_preview()` 在 edit() 加载新资源、用户切换 display_mode / lod_mode / force_lod 时触发，同步重建 ArrayMesh
+
 **单元测试 0.9**：
 ```gdscript
 # test_nanite_editor.gd — 编辑器集成测试（场景测试）
@@ -606,7 +656,61 @@ func test_nanite_mesh_editor_edit():
 func test_resource_preview_generator_handles_nanite():
     var gen = NaniteResourcePreviewGenerator.new()
     assert(gen.handles("NaniteMeshResource"), "Preview generator should handle NaniteMeshResource")
+
+# Stage 0 重构新增测试
+func test_nanite_debug_display_mode_enum():
+    # 5 个 DisplayMode 常量
+    assert(NaniteDebug.NORMAL == 0)
+    assert(NaniteDebug.NORMAL_WIREFRAME == 1)
+    assert(NaniteDebug.CLUSTER_SOLID == 2)
+    assert(NaniteDebug.CLUSTER_SOLID_WIREFRAME == 3)
+    assert(NaniteDebug.WIREFRAME_ONLY == 4)
+
+func test_nanite_debug_lod_mode_enum():
+    assert(NaniteDebug.NANITE_AUTO == 0)
+    assert(NaniteDebug.FORCE_LOD_LEVEL == 1)
+
+func test_nanite_debug_legacy_mode_unchanged():
+    # 旧 DebugMode 枚举保持原值（Stage 1 兼容性）
+    assert(NaniteDebug.NONE == 0)
+    assert(NaniteDebug.CLUSTER_SOLID_COLOR == 1)
+    assert(NaniteDebug.HZB_OCCLUSION == 6)
+
+func test_nanite_mesh_editor_has_two_dropdowns():
+    var editor = NaniteMeshEditor.new()
+    # 列表1 应有 5 个 DisplayMode 项
+    assert(editor.display_mode_btn.item_count == 5)
+    # 列表2 应有 2 个 LODMode 项
+    assert(editor.lod_mode_btn.item_count == 2)
+    # Stage 0 默认选中 Force LOD Level + level 0
+    assert(editor.lod_mode_btn.selected == NaniteDebug.FORCE_LOD_LEVEL)
+    assert(editor.force_lod_spinner.value == 0)
+    assert(editor.force_lod_spinner.visible == true)
+
+func test_nanite_mesh_editor_no_compositor_attach():
+    # Stage 0 关键约束：preview viewport 不挂 Nanite compositor
+    # 通过观察 NaniteServer 不应被触碰来验证（间接验证）
+    var editor = NaniteMeshEditor.new()
+    var srv = Engine.get_singleton("NaniteServer")
+    var before = srv.get_debug_mode()
+    # 切换 display mode 不应改变 NaniteServer 的 debug_mode
+    editor.display_mode_btn.select(NaniteDebug.CLUSTER_SOLID)
+    editor.display_mode_btn.emit_signal("item_selected", NaniteDebug.CLUSTER_SOLID)
+    assert(srv.get_debug_mode() == before, "Stage 0 preview must NOT touch NaniteServer debug state")
+
+func test_force_lod_filters_clusters_by_group_id():
+    # 构造含多 LOD 的 NaniteMeshResource，验证 force_lod_level 切换时
+    # 解码出的三角形数变化
+    pass # 需要构造测试 mesh + builder, 见 0.10 e2e
 ```
+
+**Stage 0 验收要点（preview panel）**：
+- ✅ 两个下拉列表正交工作（DisplayMode 与 LODMode 互不干扰）
+- ✅ 五种 Display Mode 全部可正确切换渲染（含 CPU 解码 cluster 模式）
+- ✅ Force LOD Level SpinBox 范围随资源 max_lod_level 自适应
+- ✅ 选中 NANITE_AUTO 弹警告并回退到 FORCE_LOD_LEVEL 0
+- ✅ preview 切换不影响主场景的 NaniteServer 调试状态
+- ✅ preview 不依赖 CompositorEffect，编译时不需 `nanite_bridge=gdext`
 
 ### 0.10 阶段 0 端到端测试
 
@@ -668,6 +772,12 @@ func test_build_large_mesh():
 - [ ] `NaniteMeshResource` 保存/加载 roundtrip 正确
 - [ ] meshlet encode/decode roundtrip 正确
 - [ ] `NaniteMeshEditor` 在 Inspector 中可预览
+- [ ] **`NaniteDebug` 新增 `DisplayMode` + `LODMode` 二维枚举，旧 `DebugMode` 名字不变**
+- [ ] **`NaniteMeshResource::get_max_lod_level()` 正确扫描 clusters_data 返回最大 group_id**
+- [ ] **`NaniteMeshEditor` 两个正交下拉列表 + SpinBox 可正确切换**
+- [ ] **五种 Display Mode 全部可渲染：Normal / Normal+Wire / Cluster Solid / Cluster Solid+Wire / Wireframe Only**
+- [ ] **Force LOD Level 切换时 CPU 解码器正确过滤 cluster by `group_id`**
+- [ ] **preview 渲染独立于 Nanite GPU 管线：不调用 `NaniteServer::set_debug_mode()`、不挂载 CompositorEffect**
 - [ ] 所有单元测试通过
 
 ### 0.12 资源转换接口与编辑器对接

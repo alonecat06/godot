@@ -1545,7 +1545,16 @@ void PageCache::decode_page(uint32_t p_page_id) {
 
 ### 9.1 概述
 
-离线构建完成后，用户需要在 Inspector 中预览 Nanite mesh 并能切换调试可视化模式验证构建质量。参照 Godot 内置的 `MeshEditor`(`editor/scene/3d/mesh_editor_plugin.h`)，设计 `NaniteMeshEditor`。
+离线构建完成后，用户需要在 Inspector 中预览 Nanite mesh 并能切换可视化模式验证构建质量。参照 Godot 内置的 `MeshEditor`(`editor/scene/3d/mesh_editor_plugin.h`)，设计 `NaniteMeshEditor`。
+
+**Stage 0 重构后的预览面板设计原则**：将原本分散的"调试模式 + 线框按钮 + 包围盒按钮"三个独立控件，重组为**两个正交维度的下拉列表**，让用户从"看什么"和"用哪个 LOD"两个独立角度选择，避免模式组合爆炸：
+
+| 维度 | 控件 | 选项数 | 影响 shader |
+|------|------|--------|------------|
+| 显示模式 (Display Mode) | 列表1 | 5 项 | `nanite_material_resolve.glsl` 的 `display_mode` push constant |
+| LOD 模式 (LOD Mode) | 列表2 | 2 类×N 等级 | `nanite_cull.glsl` 的 `lod_mode` + `force_lod_level` push constant |
+
+> 高级调试可视化（Overdraw 热力图 / HZB mip 可视化 / Page Residency 等）作为 Stage 2+ 的补充能力，不进入 Stage 0 主流程面板。
 
 ### 9.2 类图
 
@@ -1561,14 +1570,24 @@ classDiagram
         -Camera3D camera
         -DirectionalLight3D light1
         -DirectionalLight3D light2
-        -OptionButton debug_mode_btn
-        -Button wireframe_btn
-        -Button bounds_btn
+        -OptionButton display_mode_btn
+        -OptionButton lod_mode_btn
+        -SpinBox force_lod_spinner
         -Label stats_label
         +edit(p_resource: Ref~NaniteMeshResource~) void
-        -_on_debug_mode_selected(p_index: int) void
-        -_on_wireframe_toggled(p_pressed: bool) void
-        -_on_bounds_toggled(p_pressed: bool) void
+        -_on_display_mode_selected(p_index: int) void
+        -_on_lod_mode_selected(p_index: int) void
+        -_on_force_lod_changed(p_value: int) void
+    }
+    class NaniteDebug {
+        <<Stage 0 重构>>
+        -DisplayMode display_mode
+        -LODMode lod_mode
+        -int force_lod_level
+        -bool show_bounds
+        +set_display_mode(p_mode: int) void
+        +set_lod_mode(p_mode: int) void
+        +set_force_lod_level(p_level: int) void
     }
     class EditorInspectorPluginNanite {
         +can_handle(p_object: Object) bool
@@ -1595,20 +1614,120 @@ classDiagram
     EditorInspectorPluginNanite --> NaniteMeshEditor : creates in parse_begin
     NaniteEditorPlugin --> EditorInspectorPluginNanite : registers
     NaniteEditorPlugin --> NaniteResourcePreviewGenerator : registers
+    NaniteMeshEditor ..> NaniteDebug : writes via NaniteServer setter
 ```
 
-### 9.3 预览界面功能
+### 9.3 预览界面功能 — 两个正交下拉列表
 
-| 功能 | 实现方式 |
-|------|----------|
-| 3D 旋转预览 | 继承 `SubViewportContainer`，鼠标拖拽旋转 `rotation_node`，与 `MeshEditor` 一致 |
-| Nanite 渲染 | 预览视口内放置 `NaniteMeshInstance3D`，Nanite GPUPipeline 正常工作 |
-| 调试模式切换 | `OptionButton` 下拉选择：NONE / Cluster 纯色 / LOD 着色 / Overdraw / Page |
-| 线框叠加 | `Button` toggle，调 `NaniteServer::set_debug_wireframe()` |
-| 包围盒显示 | `Button` toggle，调 `NaniteServer::set_debug_show_bounds()` |
-| 构建统计 | `Label` 显示：cluster 数 / node 数 / page 数 / 粗 LOD tri 数 / 内存估算 |
+#### 列表1：显示模式（DisplayMode）
+
+控制 `nanite_material_resolve.glsl` 的输出方式，5 个选项：
+
+| 序号 | 名称 | 视觉效果 | material_resolve shader 行为 |
+|------|------|----------|----------------------------|
+| 0 | Normal | 真实材质 Lambert 着色 | `display_mode == 0` → 读 material_ssbo base_color/metallic/roughness，Lambert diffuse + ambient |
+| 1 | Normal + Wireframe | 真实材质 + 三角形边线 | `display_mode == 1` → Lambert 输出 + barycentric 坐标任一分量 < epsilon 处叠加白色线 |
+| 2 | Cluster Solid (色块) | 每个簇一种唯一颜色 | `display_mode == 2` → 用 `cluster_id` hash 到 HSV 色环，覆盖材质色 |
+| 3 | Cluster Solid + Wireframe | 簇色块 + 三角形边线 | `display_mode == 3` → 簇 hash 色 + barycentric 边线叠加 |
+| 4 | Wireframe Only | 纯线框（黑底白线） | `display_mode == 4` → 仅 barycentric 边线处输出白色，其余输出背景色 |
+
+> Stage 0 即可实现 0/2/4 三种"纯色"模式；1/3 的"叠加线框"模式依赖 material_resolve shader 增加 barycentric 边检测分支，作为 Stage 0 后期补完项。
+
+#### 列表2：LOD 模式（LODMode）
+
+控制 `nanite_cull.glsl` 的 LOD 选择逻辑，2 类选项：
+
+| 序号 | 名称 | 行为 | Stage |
+|------|------|------|:-----:|
+| 0 | Nanite (auto cull + LOD) | 走完整 Nanite 流程：视锥剔除 + 背面剔除 + HZB 遮挡 + 基于 error 的自动 LOD 选择 | Stage 1 |
+| 1+ | Force LOD Level: N | 跳过自动剔除与 LOD 选择，cull shader 仅输出 `cluster.group_id == N` 的簇；用户通过 SpinBox 选择 0..max_lod_levels-1 | Stage 0 |
+
+- **Stage 0 默认值**：`LODMode = FORCE_LOD_LEVEL`，`force_lod_level = 0`（显示最细 LOD，便于验证 cluster 划分质量）
+- **Stage 0 中选项 0 (Nanite auto)** 在下拉中保留但显示 "(Stage 1)" 后缀，选中时弹 tooltip 提示"将在 Stage 1 实现"，实际行为回退到 Force LOD 0
+- **Stage 1 完成后**：选项 0 自动启用，走真实 cull + LOD 选择流程
+
+#### 构建统计
+
+| 显示字段 | 来源 |
+|---------|------|
+| Clusters / Nodes / Pages | `NaniteMeshResource::cluster_count` / `node_count` / `page_count` |
+| Shadow mesh tris | `shadow_mesh->get_faces() / 3` |
+| Est. GPU | `(vertex_data + clusters_data + nodes_data + materials_data) / (1024*1024)` |
+| Visible Clusters (当前帧) | `NaniteServer::get_visible_cluster_count()` |
+| Max LOD Level | `NaniteMeshResource::max_lod_level`（builder 构建 hierarchy 时的 `current_lod` 终值） |
 
 ### 9.4 代码骨架
+
+```cpp
+// nanite/core/nanite_debug.h — Stage 0 重构后的二维枚举
+//
+// 设计要点（2026-07-28 实施）：
+//   - 新增 DisplayMode + LODMode 两个正交枚举用于 Stage 0 编辑器 preview
+//     面板。Stage 0 preview 渲染完全独立，不调用 NaniteServer 调试状态。
+//   - 旧 DebugMode 枚举（NONE / CLUSTER_SOLID_COLOR / ...）保留，继续供
+//     Stage 1 GPU pipeline (nanite_material_resolve.glsl) 使用，名字不变
+//     以避免破坏 Stage 1 测试与着色器代码。
+class NaniteDebug : public Object {
+    GDCLASS(NaniteDebug, Object);
+public:
+    // 列表1: 显示模式 (Stage 0 编辑器 preview 用)
+    enum DisplayMode {
+        NORMAL = 0,
+        NORMAL_WIREFRAME,
+        CLUSTER_SOLID,
+        CLUSTER_SOLID_WIREFRAME,
+        WIREFRAME_ONLY,
+    };
+    // 列表2: LOD 模式 (Stage 0 编辑器 preview 用)
+    enum LODMode {
+        NANITE_AUTO = 0,    // 自动剔除 + LOD 选择 (Stage 1 实现)
+        FORCE_LOD_LEVEL,    // 整体指定 LOD 等级
+    };
+    // Legacy: Stage 1 GPU pipeline 调试模式（保持原名以兼容旧测试）
+    enum DebugMode {
+        NONE = 0,
+        CLUSTER_SOLID_COLOR,
+        LOD_SOLID_COLOR,
+        OVERDRAW_HEATMAP,
+        PAGE_RESIDENCY,
+        HZB_MIP_LEVELS,
+        HZB_OCCLUSION,
+    };
+
+private:
+    DisplayMode display_mode = NORMAL;
+    LODMode lod_mode = FORCE_LOD_LEVEL; // Stage 0 默认强制 LOD 0
+    int force_lod_level = 0;            // 0 = 最细，n = 最粗
+    bool show_bounds = false;
+
+    DebugMode mode = NONE;             // Stage 1 GPU pipeline 状态
+    bool wireframe = false;
+
+public:
+    // Stage 0 API
+    void set_display_mode(int p_mode);
+    int get_display_mode() const;
+    DisplayMode get_display_mode_enum() const;
+
+    void set_lod_mode(int p_mode);
+    int get_lod_mode() const;
+    LODMode get_lod_mode_enum() const;
+
+    void set_force_lod_level(int p_level);
+    int get_force_lod_level() const;
+
+    void set_show_bounds(bool p_show);
+    bool get_show_bounds() const;
+
+    // Legacy Stage 1 API (nanite_material_resolve.glsl 仍读取此值)
+    void set_mode(int p_mode);
+    int get_mode() const;
+    DebugMode get_mode_enum() const;
+
+    void set_wireframe(bool p_wireframe);
+    bool get_wireframe() const;
+};
+```
 
 ```cpp
 // nanite/editor/nanite_mesh_editor.h
@@ -1619,7 +1738,7 @@ classDiagram
 
 class SubViewport;
 class OptionButton;
-class Button;
+class SpinBox;
 class Label;
 class NaniteMeshInstance3D;
 
@@ -1636,15 +1755,15 @@ class NaniteMeshEditor : public SubViewportContainer {
     DirectionalLight3D *light2 = nullptr;
     Camera3D *camera = nullptr;
 
-    // 调试可视化工具栏
-    OptionButton *debug_mode_btn = nullptr;
-    Button *wireframe_btn = nullptr;
-    Button *bounds_btn = nullptr;
+    // Stage 0 重构：两个正交下拉列表
+    OptionButton *display_mode_btn = nullptr; // 列表1: 显示模式
+    OptionButton *lod_mode_btn = nullptr;     // 列表2: LOD 模式
+    SpinBox *force_lod_spinner = nullptr;     // 列表2 子项: 强制 LOD 等级
     Label *stats_label = nullptr;
 
-    void _on_debug_mode_selected(int p_index);
-    void _on_wireframe_toggled(bool p_pressed);
-    void _on_bounds_toggled(bool p_pressed);
+    void _on_display_mode_selected(int p_index);
+    void _on_lod_mode_selected(int p_index);
+    void _on_force_lod_changed(int p_value);
     void _update_rotation();
 
 protected:
@@ -1658,56 +1777,349 @@ public:
 ```
 
 ```cpp
-// nanite/editor/nanite_mesh_editor.cpp
+// nanite/editor/nanite_mesh_editor.cpp — Stage 0 实现（独立于 Nanite GPU 管线）
+//
+// 关键约束（2026-07-28 用户澄清）：
+//   - preview 渲染完全独立，不依赖 CompositorEffect / nanite_cull.glsl /
+//     nanite_rasterize.glsl / nanite_material_resolve.glsl。
+//   - 也不调用 NaniteServer::set_debug_mode() — 所有渲染状态都本地保存在
+//     NaniteMeshEditor 实例内，避免与运行时场景的 NaniteServer 串扰。
+//   - 渲染代码限制在 nanite/editor/ 模块内。
+//
+// 实现策略：
+//   - 使用 Godot 标准 MeshInstance3D（不用 NaniteMeshInstance3D）
+//   - 构造函数不再调用 NaniteGDExtBridgeManager::attach_to_viewport()
+//   - CPU-side 解码 clusters_data → 临时 ArrayMesh → MeshInstance3D 渲染
+
 void NaniteMeshEditor::edit(const Ref<NaniteMeshResource> &p_resource) {
-    if (p_resource.is_null()) return;
+    current_resource = p_resource;
+    if (current_resource.is_null()) {
+        solid_instance->set_mesh(Ref<Mesh>());
+        wire_instance->set_mesh(Ref<Mesh>());
+        stats_label->set_text("");
+        return;
+    }
 
-    preview_instance->set_nanite_mesh(p_resource);
+    // Force LOD SpinBox 范围: 0..max_lod_level (扫描 clusters_data 得到)
+    int max_lod = current_resource->get_max_lod_level();
+    force_lod_spinner->set_min(0);
+    force_lod_spinner->set_max(MAX(max_lod, 0));
+    if ((int)force_lod_spinner->get_value() > max_lod) {
+        force_lod_spinner->set_value(max_lod);
+    }
 
-    // 填充调试模式下拉
-    debug_mode_btn->clear();
-    debug_mode_btn->add_item("Normal", NaniteDebugMode::NONE);
-    debug_mode_btn->add_item("Cluster Solid Color", NaniteDebugMode::CLUSTER_SOLID_COLOR);
-    debug_mode_btn->add_item("LOD Color", NaniteDebugMode::LOD_SOLID_COLOR);
-    debug_mode_btn->add_item("Overdraw Heatmap", NaniteDebugMode::OVERDRAW_HEATMAP);
-    debug_mode_btn->add_item("Page Residency", NaniteDebugMode::PAGE_RESIDENCY);
-
-    // 填充构建统计
+    // 构建统计
+    int shadow_tris = 0;
+    Ref<ArrayMesh> shadow = current_resource->get_shadow_mesh();
+    if (shadow.is_valid()) {
+        for (int i = 0; i < shadow->get_surface_count(); ++i) {
+            int idx = shadow->surface_get_array_index_len(i);
+            shadow_tris += idx > 0 ? idx / 3
+                                  : shadow->surface_get_array_len(i) / 3;
+        }
+    }
     String stats = vformat(
         "Clusters: %d  |  Nodes: %d  |  Pages: %d\n"
-        "Shadow mesh tris: %d  |  Est. GPU: ~%.1f MB",
-        p_resource->cluster_count,
-        p_resource->node_count,
-        p_resource->page_count,
-        p_resource->shadow_mesh.is_valid()
-            ? p_resource->shadow_mesh->get_faces() : 0,
-        (p_resource->vertex_data.size() +
-         p_resource->clusters_data.size() +
-         p_resource->nodes_data.size()) / (1024.0 * 1024.0));
+        "Shadow Tris: %d  |  Est. GPU: %.2f MB  |  Max LOD: %d",
+        current_resource->get_cluster_count(),
+        current_resource->get_node_count(),
+        current_resource->get_page_count(),
+        shadow_tris,
+        (current_resource->get_vertex_data().size() +
+         current_resource->get_clusters_data().size() +
+         current_resource->get_nodes_data().size() +
+         current_resource->get_page_table_data().size()) / (1024.0 * 1024.0),
+        max_lod);
     stats_label->set_text(stats);
 
     // 自动缩放相机适配 mesh bounds
-    if (camera && p_resource->mesh_bounds.has_surface()) {
-        float radius = p_resource->mesh_bounds.get_longest_axis_size();
-        camera->set_position(Vector3(0, 0, radius * 1.8));
+    if (shadow.is_valid() && shadow->get_aabb().size.length() > 0.0f) {
+        float distance = shadow->get_aabb().size.length() * 1.2f;
+        camera->set_position(Vector3(0, 0, distance));
+    }
+
+    _rebuild_preview(); // 根据 display_mode + lod_mode + force_lod 重建 mesh
+}
+
+// 核心重建逻辑：CPU-side 解码 clusters → ArrayMesh + 线框 PRIMITIVE_LINES ArrayMesh
+void NaniteMeshEditor::_rebuild_preview() {
+    if (!current_resource.is_valid()) {
+        solid_instance->set_mesh(Ref<Mesh>());
+        wire_instance->set_mesh(Ref<Mesh>());
+        return;
+    }
+
+    int display_id = display_mode_btn->get_selected_id();
+    int force_lod  = (int)force_lod_spinner->get_value();
+
+    Ref<ArrayMesh> solid_mesh;              // PRIMITIVE_TRIANGLES
+    Ref<ArrayMesh> wire_mesh;               // PRIMITIVE_LINES（边顶点展开）
+    bool wire_visible = false;
+    bool solid_visible = true;
+
+    if (display_id == NaniteDebug::NORMAL ||
+        display_id == NaniteDebug::NORMAL_WIREFRAME) {
+        // 直接用 shadow_mesh（粗 LOD ArrayMesh），不解码 cluster
+        solid_mesh = current_resource->get_shadow_mesh();
+        wire_visible = (display_id == NaniteDebug::NORMAL_WIREFRAME);
+        // 把 shadow_mesh 的三角形索引展开成边 → PRIMITIVE_LINES mesh
+        if (wire_visible && solid_mesh.is_valid()) {
+            wire_mesh = build_wire_from_array_mesh(solid_mesh);
+        }
+    } else {
+        // Cluster 解码模式：CPU 侧扫描 clusters_data + meshlet_*_data
+        bool per_cluster_colors =
+            (display_id == NaniteDebug::CLUSTER_SOLID ||
+             display_id == NaniteDebug::CLUSTER_SOLID_WIREFRAME);
+        solid_mesh = build_cluster_mesh(*current_resource, force_lod, per_cluster_colors);
+        wire_visible = (display_id == NaniteDebug::CLUSTER_SOLID_WIREFRAME ||
+                       display_id == NaniteDebug::WIREFRAME_ONLY);
+        if (wire_visible) {
+            // 直接从 cluster decode 出线框 mesh（每三角形 6 个顶点 = 3 条边）
+            wire_mesh = build_cluster_wire_mesh(*current_resource, force_lod);
+        }
+        if (display_id == NaniteDebug::WIREFRAME_ONLY) {
+            solid_visible = false;
+        }
+    }
+
+    solid_instance->set_mesh(solid_mesh);
+    wire_instance->set_mesh(wire_mesh);
+    wire_instance->set_visible(wire_visible && !wire_mesh.is_null());
+    solid_instance->set_visible(solid_visible && !solid_mesh.is_null());
+}
+
+// 三个 UI 回调都只触发本地 _rebuild_preview()，不调用 NaniteServer
+void NaniteMeshEditor::_on_display_mode_selected(int p_index) { _rebuild_preview(); }
+
+void NaniteMeshEditor::_on_lod_mode_selected(int p_index) {
+    int mode = lod_mode_btn->get_item_id(p_index);
+    if (mode == NaniteDebug::NANITE_AUTO) {
+        WARN_PRINT("Nanite auto cull + LOD selection is a Stage 1 feature. "
+                   "Falling back to Force LOD Level 0.");
+        lod_mode_btn->select(NaniteDebug::FORCE_LOD_LEVEL);
+        force_lod_spinner->set_value(0);
+    }
+    _rebuild_preview();
+}
+
+void NaniteMeshEditor::_on_force_lod_changed(double p_value) { _rebuild_preview(); }
+```
+
+**CPU 侧 cluster 解码器**（在 `nanite_mesh_editor.cpp` 内匿名命名空间）：
+
+```cpp
+// 顶点 stride 32B: pos.xyz (3f) + normal.xyz (3f) + uv.xy (2f)
+constexpr size_t kVertexStride = 32;
+
+// 解码所有 group_id == p_force_lod_level 的 cluster。
+//   p_emit_lines = false → 输出三角形 mesh（3 verts + 3 indices per tri，
+//                  可选 per-vertex color）
+//   p_emit_lines = true  → 输出 PRIMITIVE_LINES mesh（每三角形 6 个顶点
+//                  = 3 条边 (v0,v1) (v1,v2) (v2,v0)），p_indices/p_colors 不写入
+int decode_clusters_for_lod(const NaniteMeshResource &p_resource,
+                            int p_force_lod_level,
+                            bool p_per_cluster_colors,
+                            bool p_emit_lines,
+                            PackedVector3Array &p_verts,
+                            PackedInt32Array &p_indices,
+                            PackedColorArray &p_colors) {
+    const PackedByteArray &clusters_data = p_resource.get_clusters_data();
+    const PackedByteArray &vertex_data = p_resource.get_vertex_data();
+    const PackedByteArray &meshlet_vertices_data = p_resource.get_meshlet_vertices_data();
+    const PackedByteArray &meshlet_triangles_data = p_resource.get_meshlet_triangles_data();
+
+    const size_t cluster_stride = NaniteCluster::get_serialized_size(); // 68
+    const int cluster_count = p_resource.get_cluster_count();
+    // ... bounds checks ...
+
+    for (int ci = 0; ci < cluster_count; ++ci) {
+        NaniteCluster c = NaniteCluster::deserialize(clusters_data,
+                                                     ci * cluster_stride);
+        if ((int)c.group_id != p_force_lod_level) continue;
+
+        // 每个 cluster 的唯一 HSV 色（按 ci hash）
+        Color cluster_color = p_per_cluster_colors
+            ? Color::from_hsv((ci * 2654435761u) % 360 / 360.0f, 0.65f, 0.95f)
+            : Color(1, 1, 1);
+
+        for (uint32_t ti = 0; ti < c.triangle_count; ++ti) {
+            const uint8_t *tri = tri_base + c.triangle_offset + ti * 3;
+            // micro-index → meshlet_vertices_data 全局顶点索引 → vertex_data 位置
+            uint32_t g0 = mv[c.vertex_offset + tri[0]];
+            uint32_t g1 = mv[c.vertex_offset + tri[1]];
+            uint32_t g2 = mv[c.vertex_offset + tri[2]];
+            const float *vp0 = vp_base + g0 * (kVertexStride / sizeof(float));
+            // ...
+            if (p_emit_lines) {
+                p_verts.push_back(v0); p_verts.push_back(v1);
+                p_verts.push_back(v1); p_verts.push_back(v2);
+                p_verts.push_back(v2); p_verts.push_back(v0);
+            } else {
+                int base = p_verts.size();
+                p_verts.push_back(v0); p_verts.push_back(v1); p_verts.push_back(v2);
+                p_indices.push_back(base); p_indices.push_back(base+1); p_indices.push_back(base+2);
+                if (p_per_cluster_colors) {
+                    p_colors.push_back(cluster_color); p_colors.push_back(cluster_color); p_colors.push_back(cluster_color);
+                }
+            }
+        }
     }
 }
 
-void NaniteMeshEditor::_on_debug_mode_selected(int p_index) {
-    int mode = debug_mode_btn->get_item_id(p_index);
-    NaniteServer::get_singleton()->set_debug_mode(mode);
-}
-
-void NaniteMeshEditor::_on_wireframe_toggled(bool p_pressed) {
-    NaniteServer::get_singleton()->set_debug_wireframe(p_pressed);
-}
-
-void NaniteMeshEditor::_on_bounds_toggled(bool p_pressed) {
-    NaniteServer::get_singleton()->set_debug_show_bounds(p_pressed);
-}
+// 三种 ArrayMesh 构造 helper（都返回空 Ref 当解码失败时）：
+Ref<ArrayMesh> build_cluster_mesh(...);         // PRIMITIVE_TRIANGLES + 可选 ARRAY_COLOR
+Ref<ArrayMesh> build_cluster_wire_mesh(...);    // PRIMITIVE_LINES（cluster decode 路径）
+Ref<ArrayMesh> build_wire_from_array_mesh(...); // PRIMITIVE_LINES（从已有 ArrayMesh
+                                                //   的索引展开成边，Normal+Wire 路径用）
 ```
 
-### 9.5 InspectorPlugin 注册
+### 9.5 Preview 界面设计图
+
+#### 9.5.1 整体布局
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  Nanite Mesh Editor (Inspector preview panel)                   │
+├──────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│   ┌──────────────────────────────────────────────────────────┐   │
+│   │                                                          │   │
+│   │                  3D Preview Viewport                      │   │
+│   │              (SubViewportContainer, 256×256)             │   │
+│   │                                                          │   │
+│   │                                                          │   │
+│   │       ← drag to rotate / wheel to zoom →                │   │
+│   │                                                          │   │
+│   │                                                          │   │
+│   └──────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│   ┌── Display Mode ──────────────────────────────┐ ┌── LOD Mode ─────────────────────────┐
+│   │ [Normal                            ▼]        │ │ [Force LOD Level                ▼] │
+│   │ ┌────────────────────────────────────┐ │ │ ┌──────────────────────────────────┐ │
+│   │ │ Normal                              │ │ │ │ Nanite (auto cull + LOD) [S1]   │ │ │
+│   │ │ Normal + Wireframe                 │ │ │ │ Force LOD Level  ▼               │ │ │
+│   │ │ Cluster Solid                      │ │ │ └──────────────────────────────────┘ │ │
+│   │ │ Cluster Solid + Wireframe          │ │ │                                      │
+│   │ │ Wireframe Only                     │ │ │ LOD Level: [ 0 ▼] (0..3)            │
+│   │ └────────────────────────────────────┘ │ │                                      │
+│   └────────────────────────────────────────┘ └──────────────────────────────────────┘
+│                                                                  │
+│   ┌── Stats ─────────────────────────────────────────────────┐   │
+│   │ Clusters: 1024   Nodes: 259   Pages: 4                  │   │
+│   │ Shadow mesh tris: 5120   Est. GPU: ~3.2 MB              │   │
+│   │ Visible Clusters: 256 (current frame)                    │   │
+│   │ Max LOD Level: 3                                          │   │
+│   └────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+#### 9.5.2 状态机：LOD 模式与 Force LOD 等级联动
+
+```mermaid
+stateDiagram-v2
+    [*] --> ForceLOD_0
+
+    state "LOD Mode = Force LOD Level" as ForceLOD {
+        [*] --> ForceLOD_0
+        ForceLOD_0 --> ForceLOD_1: spinner = 1
+        ForceLOD_1 --> ForceLOD_2: spinner = 2
+        ForceLOD_2 --> ForceLOD_1: spinner = 1
+        ForceLOD_1 --> ForceLOD_0: spinner = 0
+        ForceLOD_0 --> ForceLOD_N: spinner = N
+    }
+
+    state "LOD Mode = Nanite (auto)" as NaniteAuto {
+        [*] --> Warn_Stage1_NotReady
+        Warn_Stage1_NotReady --> AutoFallback: WARN_PRINT + 回退
+    }
+
+    ForceLOD --> NaniteAuto: 用户选 "Nanite (auto)"
+    NaniteAuto --> ForceLOD: Stage 0 自动回退 / Stage 1 后保留
+```
+
+#### 9.5.3 渲染管线数据流（Stage 0 独立路径）
+
+> **重要约束（2026-07-28 用户澄清）**：Stage 0 的 preview 渲染**完全独立于 Nanite GPU 渲染管线**——不依赖 `CompositorEffect`、不调用 `nanite_cull.glsl` / `nanite_rasterize.glsl` / `nanite_material_resolve.glsl`，也不需要 `NaniteServer` 已激活任何 bridge。所有渲染代码**限制在 nanite/editor/ 模块内**，使用 Godot 标准的 `MeshInstance3D` + `ArrayMesh` + `StandardMaterial3D` 经由引擎自带的 forward 管线绘制。这让 Stage 0 preview 在未编译任何桥接时也能工作，并避免了预览视口与运行时场景共 NaniteServer 调试状态导致的串扰问题。
+
+```mermaid
+flowchart LR
+    UI["NaniteMeshEditor<br/>display_mode_btn + lod_mode_btn + force_lod_spinner"] -->|"reads selected id"| DECODE["CPU-side cluster decoder<br/>(nanite/editor/nanite_mesh_editor.cpp)"]
+    RES["NaniteMeshResource (.tres)<br/>clusters_data / vertex_data /<br/>meshlet_vertices_data /<br/>meshlet_triangles_data"] --> DECODE
+    DECODE -->|"filter group_id == force_lod_level<br/>+ optional per-cluster HSV color"| AM["Ref&lt;ArrayMesh&gt; triangles<br/>(pos + index + color)"]
+    DECODE -->|"p_emit_lines = true<br/>6 verts per triangle (3 edges)"| WM["Ref&lt;ArrayMesh&gt; PRIMITIVE_LINES<br/>(pos only)"]
+    AM --> MI["MeshInstance3D (solid_instance)<br/>StandardMaterial3D<br/>FLAG_ALBEDO_FROM_VERTEX_COLOR=true"]
+    WM --> WI["MeshInstance3D (wire_instance)<br/>StandardMaterial3D<br/>SHADING_MODE_UNSHADED + 白色"]
+    SHADOW["shadow_mesh (coarse ArrayMesh)"] -.->|"Normal / Normal+Wire modes<br/>skip cluster decode"| AM
+    SHADOW -.->|"build_wire_from_array_mesh()<br/>iterate indices → line verts"| WM
+    MI -->|"forward pipeline"| VP["Preview SubViewport<br/>(no Nanite compositor attached)"]
+    WI -->|"forward pipeline"| VP
+
+    style DECODE fill:#fff3e0,stroke:#e65100
+    style AM fill:#e3f2fd,stroke:#1565c0
+    style WM fill:#f3e5f5,stroke:#6a1b9a
+    style VP fill:#e8f5e9,stroke:#2e7d32
+```
+
+**Stage 0 五种 Display Mode 的渲染策略**：
+
+| Mode | solid_instance 渲染内容 | wire_instance 渲染内容 | mesh 来源 |
+|------|------------------------|------------------------|----------|
+| Normal | shadow_mesh + Lambert StandardMaterial3D | 隐藏 | `NaniteMeshResource::shadow_mesh` |
+| Normal + Wireframe | shadow_mesh + Lambert StandardMaterial3D | `build_wire_from_array_mesh(shadow_mesh)` → PRIMITIVE_LINES + 白色 unshaded material | `shadow_mesh` |
+| Cluster Solid | `build_cluster_mesh(force_lod, true)` ArrayMesh + per-vertex HSV 色 + `FLAG_ALBEDO_FROM_VERTEX_COLOR` | 隐藏 | `clusters_data` + `vertex_data` + `meshlet_vertices_data` + `meshlet_triangles_data` |
+| Cluster Solid + Wireframe | 同 Cluster Solid 的 ArrayMesh | `build_cluster_wire_mesh(force_lod)` PRIMITIVE_LINES + 白色 unshaded material | 同上 |
+| Wireframe Only | 隐藏 | `build_cluster_wire_mesh(force_lod)` PRIMITIVE_LINES + 白色 unshaded material | 同 Cluster Solid |
+
+> **为什么用 PRIMITIVE_LINES 而非材质线框属性**：Godot 的 `BaseMaterial3D` 没有 `set_wireframe_enabled` 方法（`StandardMaterial3D` 也一样）。要在预览视口里画线框，必须把三角形索引展开成边顶点，构造 `PRIMITIVE_LINES` 类型的 ArrayMesh，再配合 unshaded 白色材质绘制。这也避开了不同渲染后端 (Vulkan / D3D12 / Metal) 对线框 mode 支持不一致的问题。
+
+**LOD 过滤逻辑**：
+
+- `LODMode = FORCE_LOD_LEVEL` (Stage 0 默认)：CPU decoder 在遍历 clusters 时跳过 `cluster.group_id != force_lod_level` 的簇；Spinbox 范围 `0..max_lod_level`，由 `NaniteMeshResource::get_max_lod_level()` 扫描 `clusters_data` 得到。
+- `LODMode = NANITE_AUTO` (Stage 1 预留)：选中时弹 `WARN_PRINT` 提示未实现，自动回退到 `FORCE_LOD_LEVEL` + level 0。
+
+**关键设计要点**：
+
+1. **不挂载 Compositor**：构造函数中**不再**调用 `NaniteGDExtBridgeManager::attach_to_viewport(viewport)`，避免预览视口被 Nanite GPU pipeline 接管，让 preview 行为可预测。
+2. **使用 MeshInstance3D 而非 NaniteMeshInstance3D**：避免触发 NaniteServer 的 instance 注册与 GPU pipeline 调度。
+3. **两个 MeshInstance3D 共享同一 mesh**：solid + wire 共用，只在 material override 与可见性上区分，避免重复几何上传。
+4. **不写 NaniteServer 调试状态**：预览切换不调用 `NaniteServer::set_debug_mode()`，避免影响运行时场景的渲染。
+5. **Stage 1 时可选接入 GPU pipeline**：当 NANITE_AUTO 选项启用时，可在 Stage 1 通过 `NaniteGDExtBridgeManager::attach_to_viewport` 重新挂载 compositor，使 preview 也能验证 cull/LOD 真实行为——但这是 Stage 1 的事，Stage 0 不做。
+
+#### 9.5.4 五种 Display Mode 视觉示意
+
+```
+Mode 0: Normal                Mode 1: Normal + Wireframe
+┌──────────────┐              ┌──────────────┐
+│ ████████████ │              │ ▓▓▓▓▓▓▓▓▓▓▓▓ │
+│ ████████████ │              │ ▓▓▓+-------+ │
+│ ████████████ │              │ ▓▓▓| ▲▲▲ | │
+│ ████████████ │              │ ▓▓▓| ▲▲▲ | │
+└──────────────┘              └──────────────┘
+  Lambert diffuse               Lambert + 白线
+
+Mode 2: Cluster Solid          Mode 3: Cluster Solid + Wireframe
+┌──────────────┐              ┌──────────────┐
+│ ▓▓▓▓▓▓▓▓▓▓▓▓ │              │ ▓▓▓▓▓▓▓▓▓▓▓▓ │
+│ ▒▒▒▒▒▓▓▓▓▒▒▒ │              │ ▒▒▒▒▒▓▓▓▓▒▒▒ │
+│ ▒▒▒▒▒▓▓▓▓▒▒▒ │              │ ▒▒▒▒▒▓▓+--+▓ │
+│ ▒▒▒▒▒▓▓▓▓▒▒▒ │              │ ▒▒▒▒▒▓▓|▲▲|▓ │
+└──────────────┘              └──────────────┘
+  每个 cluster 唯一色            cluster 色 + 白线
+
+Mode 4: Wireframe Only
+┌──────────────┐
+│              │
+│    +--+       │
+│   / ▲▲|       │
+│  +--+         │
+│              │
+└──────────────┘
+  黑底白线（仅三角形边）
+```
+
+### 9.6 InspectorPlugin 注册
 
 ```cpp
 // nanite/editor/nanite_editor_plugin.h
@@ -1737,28 +2149,27 @@ public:
 };
 ```
 
-### 9.6 焦点管理（调试模式隔离）
+### 9.6 焦点管理（Stage 0 后已不需要）
 
-预览视口内的 `NaniteMeshInstance3D` 与场景中的实例走同一 Nanite GPUPipeline，因此 `NaniteServer::set_debug_mode()` 设置的调试模式对预览视口同样生效。调试模式是全局的，切换预览界面的调试模式会影响所有 Nanite 实例。
+> **设计变更（2026-07-28）**：原本预览视口内的 `NaniteMeshInstance3D` 与场景中的实例走同一 Nanite GPU pipeline，因此 `NaniteServer::set_debug_mode()` 设置的调试模式对预览视口同样生效，需要靠焦点进出切换来隔离。Stage 0 重构后，预览渲染**完全独立于 Nanite GPU 管线**（详见 §9.5.3）——预览视口不再挂载 `CompositorEffect`，不再使用 `NaniteMeshInstance3D`，不再调用 `NaniteServer::set_debug_mode()`。所有 display mode 与 LOD 选择状态都保存在 `NaniteMeshEditor` 实例内的 `OptionButton` / `SpinBox` 中，因此**焦点进出预览视口时无需做任何状态隔离**。
 
-**解决方案**：预览界面仅在获得焦点时应用调试模式，失焦时恢复为 NONE。
+`_notification()` 在 Stage 0 实现中只是 no-op：
 
 ```cpp
 void NaniteMeshEditor::_notification(int p_what) {
     switch (p_what) {
         case NOTIFICATION_FOCUS_ENTER:
-            // 恢复用户在预览中选择的调试模式
-            if (debug_mode_btn) {
-                _on_debug_mode_selected(debug_mode_btn->get_selected_id());
-            }
-            break;
         case NOTIFICATION_FOCUS_EXIT:
-            // 离开预览时关闭调试，避免影响场景渲染
-            NaniteServer::get_singleton()->set_debug_mode(NANITE_DEBUG_NONE);
+            // No-op: Stage 0 preview rendering is fully local; no
+            // NaniteServer debug state needs to be touched.
+            break;
+        default:
             break;
     }
 }
 ```
+
+> **Stage 1 注意事项**：当 §9.5.3 的"Nanite (auto cull + LOD)"选项真正接入 GPU pipeline 后，预览视口会挂载自己的 `CompositorEffect`，那时若仍要让预览的调试模式与场景隔离，应改为给预览 SubViewport 单独分配一个 `NaniteDebug` 实例（而非共用 `NaniteServer` 的全局单例）。本节暂保留以记录这一 Stage 1 待办。
 
 ### 9.7 构建后即时预览与资源转换入口
 
@@ -1771,9 +2182,9 @@ void NaniteImporter::_on_build_completed(Ref<NaniteMeshResource> p_resource) {
     if (preview_editor) {
         preview_editor->edit(p_resource);
     }
-    // 同时自动切换到 Cluster Solid Color 模式，方便验证构建质量
-    NaniteServer::get_singleton()->set_debug_mode(
-        NaniteDebugMode::CLUSTER_SOLID_COLOR);
+    // Stage 0 重构后不再触碰 NaniteServer 调试状态——预览默认进入
+    // DisplayMode = Cluster Solid + LODMode = Force LOD 0，便于用户
+    // 直接验证 cluster 划分质量。如需切换模式由用户在预览面板操作。
 }
 ```
 

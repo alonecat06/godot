@@ -130,6 +130,14 @@ public:
 	void set_page_count(int p_count);
 	int get_page_count() const;
 
+	// Stage 0 helper — scans clusters_data (fixed 68-byte stride) and
+	// returns the maximum `group_id` field across all clusters, i.e.
+	// the coarsest LOD level available. Returns 0 when there are no
+	// clusters. Used by the preview UI to size the Force LOD Level
+	// SpinBox (range 0..max_lod_level). Not bound to ClassDB since it
+	// is editor-only and cheap to recompute on demand.
+	int get_max_lod_level() const;
+
 	// .nanite binary format. Magic = "NANM" (4 bytes), Version = 3 (uint32).
 	// Layout (v3, after Task 1.16.4):
 	//   char[4]   magic = "NANM"
