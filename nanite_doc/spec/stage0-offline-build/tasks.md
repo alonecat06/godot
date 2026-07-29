@@ -205,7 +205,7 @@
   - 验证：测试通过 **[策略调整]** C++ 虚函数未暴露到 GDScript，改为通过 ClassDB API 验证类注册与继承（10/10 断言 PASS）（原 `.trae-cn/specs/fix-nanite-stage0-validation-failures/` 已并入 spec.md 并清理）
 
 - [x] **Task 0.9.7**（Stage 0 重构, 2026-07-28）：`NaniteDebug` 二维枚举重构
-  - 在 `nanite/core/nanite_debug.h` 新增 `DisplayMode` 枚举（5 项：`NORMAL` / `NORMAL_WIREFRAME` / `CLUSTER_SOLID` / `CLUSTER_SOLID_WIREFRAME` / `WIREFRAME_ONLY`）
+  - 在 `nanite/core/nanite_debug.h` 新增 `DisplayMode` 枚举（6 项：`NORMAL` / `NORMAL_WIREFRAME` / `CLUSTER_SOLID` / `CLUSTER_SOLID_WIREFRAME` / `WIREFRAME_ONLY` / `CLUSTER_SOLID_WITH_PARTITION_BORDER`）
   - 新增 `LODMode` 枚举（2 项：`NANITE_AUTO` / `FORCE_LOD_LEVEL`）
   - 保留旧 `DebugMode` 枚举（7 项，原名字不变）继续供 Stage 1 GPU pipeline 使用
   - 新增 `set_display_mode` / `set_lod_mode` / `set_force_lod_level` / `set_show_bounds` 及对应 getter
@@ -247,6 +247,25 @@
   - 实现 `build_wire_from_array_mesh()`：从已有 `ArrayMesh` 的三角形索引展开成边顶点，构造 `PRIMITIVE_LINES` ArrayMesh（供 Normal+Wireframe 模式使用）
   - 实现 `_rebuild_preview()`：按 DisplayMode 选择 mesh 构造路径与 `solid_instance` / `wire_instance` 可见性
   - 验证：编译通过；五种 DisplayMode 切换不崩溃；`Force LOD Level` 切换时解码出不同 triangle count
+
+- [ ] **Task 0.9.11**（Stage 0 新增, 2026-07-29）：`CLUSTER_SOLID_WITH_PARTITION_BORDER` DisplayMode
+  - 在 `nanite/core/nanite_debug.h` 的 `DisplayMode` 枚举中新增 `CLUSTER_SOLID_WITH_PARTITION_BORDER = 5`
+  - 在 `nanite/core/nanite_debug.cpp` 的 `_bind_methods` 中更新 `BIND_ENUM_CONSTANT`、`PROPERTY_HINT_ENUM` 字符串及 `set_display_mode` switch
+  - 在 `nanite/editor/nanite_mesh_editor.cpp` 匿名命名空间实现 `build_partition_border_wire()` 函数：
+    - 解码 LOD N+1 的所有 cluster，提取每个 cluster 的三角形全局顶点索引列表
+    - 调用 `meshopt_partitionClusters(target=4)` 将 LOD N+1 的 cluster 按空间邻近性分组
+    - 对每个 partition（约 4 个 cluster）：
+      - 统计每个全局顶点被几个 cluster 引用（vertex_ref_count）
+      - 标记 `vertex_ref_count >= 2` 的顶点为 locked（边界顶点）
+      - 遍历所有三角形边，收集两端均为 locked 的边
+      - 边去重后输出为 PRIMITIVE_LINES 顶点对
+    - 所有 partition 的边界边合并为一个黄色 PRIMITIVE_LINES ArrayMesh
+  - 在 `_rebuild_preview()` 中处理 `CLUSTER_SOLID_WITH_PARTITION_BORDER` 模式：
+    - `solid_instance` 渲染当前 LOD 的 cluster solid（per-cluster HSV 色）
+    - `wire_instance` 渲染 partition 边界线框（黄色 unshaded material）
+    - 当 `force_lod == max_lod_level` 或 LOD N+1 的 cluster 数 <= 1 时，`wire_instance` 隐藏
+  - 在 `display_mode_btn` 下拉列表中添加 "Cluster Solid + Partition Border" 项
+  - 验证：编译通过；模式切换不崩溃；partition 边界线框正确显示
 
 ---
 

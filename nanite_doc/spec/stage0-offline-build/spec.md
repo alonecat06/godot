@@ -32,7 +32,7 @@ Nanite 的 GPU 渲染管线（阶段 1+）必须依赖一份预先构建好的**
   - Godot 原生 `ResourceSaver` / `ResourceLoader` 集成
 - **新增** meshlet 编解码（`meshopt_encodeMeshlet` / `decodeMeshlet`）+ 顶点池编码（`meshopt_encodeVertexBuffer`）
 - **新增** `NaniteDebug` 类（`Object` 子类）持有运行时可视化状态，包含：
-  - `DisplayMode` 枚举（5 项：`NORMAL` / `NORMAL_WIREFRAME` / `CLUSTER_SOLID` / `CLUSTER_SOLID_WIREFRAME` / `WIREFRAME_ONLY`）— Stage 0 编辑器 preview 着色控制
+  - `DisplayMode` 枚举（6 项：`NORMAL` / `NORMAL_WIREFRAME` / `CLUSTER_SOLID` / `CLUSTER_SOLID_WIREFRAME` / `WIREFRAME_ONLY` / `CLUSTER_SOLID_WITH_PARTITION_BORDER`）— Stage 0 编辑器 preview 着色控制
   - `LODMode` 枚举（2 项：`NANITE_AUTO` / `FORCE_LOD_LEVEL`）— Stage 0 编辑器 preview LOD 选择控制
   - 旧 `DebugMode` 枚举（7 项）保留供 Stage 1 GPU pipeline (`nanite_material_resolve.glsl`) 继续使用
   - `set_display_mode` / `set_lod_mode` / `set_force_lod_level` / `set_show_bounds` 及对应 getter
@@ -265,7 +265,7 @@ Nanite 的 GPU 渲染管线（阶段 1+）必须依赖一份预先构建好的**
 系统 SHALL 提供 `NaniteMeshEditor`（继承 `SubViewportContainer`，3D 旋转预览 + 构建统计 + **二维下拉列表**显示模式控制）、`EditorInspectorPluginNanite`、`NaniteEditorPlugin`、`NaniteResourcePreviewGenerator`。
 
 > **Stage 0 修订（2026-07-28 二次重构）**：原设计的单轴 `debug_mode_btn`（7 项 DebugMode）+ `wireframe_btn` + `bounds_btn` 三个独立控件已重构为**两个正交维度的下拉列表**：
-> - **列表1 DisplayMode**（5 项）：`NORMAL` / `NORMAL_WIREFRAME` / `CLUSTER_SOLID` / `CLUSTER_SOLID_WIREFRAME` / `WIREFRAME_ONLY`
+> - **列表1 DisplayMode**（6 项）：`NORMAL` / `NORMAL_WIREFRAME` / `CLUSTER_SOLID` / `CLUSTER_SOLID_WIREFRAME` / `WIREFRAME_ONLY` / `CLUSTER_SOLID_WITH_PARTITION_BORDER`
 > - **列表2 LODMode**（2 项）：`NANITE_AUTO`（Stage 1 占位，选中弹 WARN_PRINT 回退到 FORCE_LOD_LEVEL 0）/ `FORCE_LOD_LEVEL`（配合 `SpinBox` 选择 0..max_lod_level）
 > - 旧 `DebugMode` 枚举保留供 Stage 1 GPU pipeline (`nanite_material_resolve.glsl`) 继续使用，名字与值不变以兼容旧测试
 > - `NaniteDebug` 类新增 `set_display_mode` / `set_lod_mode` / `set_force_lod_level` / `set_show_bounds` 及 getter，与旧 `set_mode` / `set_wireframe` 并存
@@ -294,8 +294,8 @@ Nanite 的 GPU 渲染管线（阶段 1+）必须依赖一份预先构建好的**
 - **AND** 选中 `FORCE_LOD_LEVEL` 时 `force_lod_spinner`（SpinBox）可见且范围 `0..max_lod_level`
 - **AND** 选中 `NANITE_AUTO` 时弹 `WARN_PRINT` 提示 Stage 1 未实现，自动回退到 `FORCE_LOD_LEVEL` + level 0
 
-#### Scenario: 五种 Display Mode 渲染
-- **WHEN** 用户依次切换五种 DisplayMode 并触发 `_rebuild_preview()`
+#### Scenario: 六种 Display Mode 渲染
+- **WHEN** 用户依次切换六种 DisplayMode 并触发 `_rebuild_preview()`
 - **THEN** 系统按以下策略渲染（CPU 侧构造 ArrayMesh，不调 Nanite GPU 管线）：
   | Mode | solid_instance | wire_instance | mesh 来源 |
   |------|---------------|---------------|----------|
@@ -304,7 +304,26 @@ Nanite 的 GPU 渲染管线（阶段 1+）必须依赖一份预先构建好的**
   | Cluster Solid | `build_cluster_mesh(force_lod, true)` + per-vertex HSV + `FLAG_ALBEDO_FROM_VERTEX_COLOR` | 隐藏 | cluster decode |
   | Cluster Solid + Wireframe | 同上 | `build_cluster_wire_mesh(force_lod)` PRIMITIVE_LINES + 白色 unshaded | 同上 |
   | Wireframe Only | 隐藏 | `build_cluster_wire_mesh(force_lod)` PRIMITIVE_LINES + 白色 unshaded | 同上 |
+  | Cluster Solid + Partition Border | `build_cluster_mesh(force_lod, true)` + per-vertex HSV + `FLAG_ALBEDO_FROM_VERTEX_COLOR` | `build_partition_border_wire(resource, force_lod)` PRIMITIVE_LINES + 黄色 unshaded | cluster decode + partition border |
 - **AND** `solid_instance` 与 `wire_instance` 的可见性按 Mode 切换（如 `WIREFRAME_ONLY` 时 `solid_instance` 隐藏）
+- **AND** `CLUSTER_SOLID_WITH_PARTITION_BORDER` 模式下，`wire_instance` 使用黄色 unshaded material 以区分 partition 边界线框与普通线框
+
+#### Scenario: Cluster Solid + Partition Border 模式渲染
+- **WHEN** 用户选择 `CLUSTER_SOLID_WITH_PARTITION_BORDER` DisplayMode
+- **AND** 当前 `force_lod` 等级为 N（N < max_lod_level）
+- **THEN** `solid_instance` 渲染当前 LOD N 的 cluster solid（per-cluster HSV 色，同 CLUSTER_SOLID 模式）
+- **AND** `wire_instance` 渲染下一级 LOD N+1 的 partition 边界线框（黄色 PRIMITIVE_LINES）
+- **AND** partition 边界线框的构建流程为：
+  1. 解码 LOD N+1 的所有 cluster，提取每个 cluster 的三角形全局顶点索引列表
+  2. 调用 `meshopt_partitionClusters(target=4)` 将 LOD N+1 的 cluster 按空间邻近性分组
+  3. 对每个 partition（约 4 个 cluster）：
+     a. 统计每个全局顶点被几个 cluster 引用（vertex_ref_count）
+     b. 标记 `vertex_ref_count >= 2` 的顶点为 locked（边界顶点）
+     c. 遍历 partition 内所有 cluster 的所有三角形边，收集两端均为 locked 的边
+     d. 边去重后输出为 PRIMITIVE_LINES 顶点对
+  4. 所有 partition 的边界边合并为一个 PRIMITIVE_LINES ArrayMesh
+- **AND** 当 `force_lod == max_lod_level`（当前为最粗 LOD，无下一级）时，`wire_instance` 隐藏（无 partition 边界可显示）
+- **AND** 当 LOD N+1 的 cluster 数 <= 1 时，`wire_instance` 隐藏（无 partition 可划分）
 
 #### Scenario: Force LOD Level 过滤 cluster
 - **WHEN** 用户切换 `force_lod_spinner` 选择 LOD 等级 N

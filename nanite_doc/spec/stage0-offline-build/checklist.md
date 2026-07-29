@@ -116,7 +116,7 @@
 
 #### NaniteDebug 二维枚举（Task 0.9.7）
 
-- [x] `NaniteDebug::DisplayMode` 枚举含 5 项：`NORMAL=0` / `NORMAL_WIREFRAME=1` / `CLUSTER_SOLID=2` / `CLUSTER_SOLID_WIREFRAME=3` / `WIREFRAME_ONLY=4`
+- [x] `NaniteDebug::DisplayMode` 枚举含 6 项：`NORMAL=0` / `NORMAL_WIREFRAME=1` / `CLUSTER_SOLID=2` / `CLUSTER_SOLID_WIREFRAME=3` / `WIREFRAME_ONLY=4` / `CLUSTER_SOLID_WITH_PARTITION_BORDER=5`
 - [x] `NaniteDebug::LODMode` 枚举含 2 项：`NANITE_AUTO=0` / `FORCE_LOD_LEVEL=1`
 - [x] 旧 `DebugMode` 枚举（7 项）保持原值不变（`NONE=0` / `CLUSTER_SOLID_COLOR=1` / `LOD_SOLID_COLOR=2` / `OVERDRAW_HEATMAP=3` / `PAGE_RESIDENCY=4` / `HZB_MIP_LEVELS=5` / `HZB_OCCLUSION=6`）
 - [x] `NaniteDebug` 新增 `set_display_mode` / `set_lod_mode` / `set_force_lod_level` / `set_show_bounds` 及对应 getter，通过 `_bind_methods` + `ADD_PROPERTY` 暴露
@@ -165,6 +165,22 @@
 - [x] Cluster Solid + Wireframe 模式：`solid_instance` = `build_cluster_mesh(force_lod, true)`，`wire_instance` = `build_cluster_wire_mesh(force_lod)`
 - [x] Wireframe Only 模式：`solid_instance` 隐藏，`wire_instance` = `build_cluster_wire_mesh(force_lod)`
 - [x] mesh 为 null 时 `set_visible(false)`（不渲染空 mesh）
+
+#### CPU 侧 Partition Border 解码器与第六种 Display Mode 渲染（Task 0.9.11）
+
+- [x] `build_partition_border_wire()` 函数实现在 `nanite_mesh_editor.cpp` 匿名命名空间
+- [x] 解码 LOD N+1 的所有 cluster，提取三角形全局顶点索引列表
+- [x] 调用 `meshopt_partitionClusters(target=4)` 按空间邻近性分组
+- [x] 对每个 partition，统计 vertex_ref_count 标记 locked 顶点（count >= 2）
+- [x] 收集两端均为 locked 的三角形边，去重后输出 PRIMITIVE_LINES 顶点对
+- [x] 所有 partition 边界边合并为一个 ArrayMesh
+- [x] `CLUSTER_SOLID_WITH_PARTITION_BORDER` 模式：`solid_instance` = `build_cluster_mesh(force_lod, true)`，`wire_instance` = `build_partition_border_wire(resource, force_lod)`（黄色 unshaded material）
+- [x] `force_lod == max_lod_level` 时 `wire_instance` 隐藏（无下一级 LOD）
+- [x] LOD N+1 cluster 数 <= 1 时 `wire_instance` 隐藏（无 partition 可划分）
+- [x] `display_mode_btn` 下拉列表含 "Cluster Solid + Partition Border" 项（id = `NaniteDebug::CLUSTER_SOLID_WITH_PARTITION_BORDER`）
+- [x] `nanite_debug.cpp` 的 `set_display_mode` switch 处理 `CLUSTER_SOLID_WITH_PARTITION_BORDER` 分支
+- [x] `_bind_methods` 中 `BIND_ENUM_CONSTANT(CLUSTER_SOLID_WITH_PARTITION_BORDER)` 注册
+- [x] `PROPERTY_HINT_ENUM` 字符串更新含 "Cluster Solid + Partition Border"
 
 #### 独立渲染约束验证
 
