@@ -302,7 +302,19 @@ TEST_CASE("build_leaf_clusters each cluster has valid bounds and cone") {
 
 ### 0.5 NaniteBuilder — 层次化简化与 BVH 装配
 
-**任务 0.5.1**：实现 `NaniteBuilder::build_hierarchy()` — 自底向上循环：`partitionClusters` → `simplifyWithAttributes` → `buildMeshletsFlex` → 计算父节点 error/bounds
+**任务 0.5.1**：实现 `NaniteBuilder::build_hierarchy()` — 自底向上循环，UE5 Nanite 风格: 4 相邻 cluster 合并 → 分区独立简化
+
+- 算法流程（每层循环）：
+  1. `meshopt_partitionClusters(target=4)` → 将当前层 cluster 按空间邻近性分组，每组 ~4 个相邻 cluster
+  2. 对每个 partition（4 个相邻 cluster）：
+     a. 合并 partition 内 cluster 的 vertex + index 子集（仅局部合并，非全局合并）
+     b. 计算 `vertex_lock`：标记 partition 边界顶点（出现在 >=2 个原始 cluster 中的顶点）
+     c. `meshopt_simplifyWithAttributes(target=原/2, options=LockBorder|Regularize)` → 分区独立简化，锁住边界顶点保证裂缝消除
+     d. `meshopt_buildMeshletsFlex(...)` 简化结果再切 2 簇
+     e. 计算 parent.error = max(child.error, result_error) 和 parent.bounds = union(child.bounds)
+  3. 所有 partition 的 parent 节点构成下一层输入
+- 循环退出条件：`current_level.size() <= 1`
+- 中间产物：层次化 `NaniteClusterNode` 列表
 
 **任务 0.5.2**：实现 `NaniteBuilder::build_bvh()` — 展开层次结构为线性 `NaniteClusterNode` 数组
 

@@ -963,18 +963,22 @@ ArrayMesh / SurfaceTool 顶点数组
    │           bounds = meshopt_computeMeshletBounds(...)
    │           error = 0
    │
-   ├─ 2. 层次化生成(自底向上)
+   ├─ 2. 层次化生成(自底向上) — UE5 Nanite 风格: 4 相邻 cluster 合并 → 分区独立简化
    │     while cluster_count > 1:
    │       ├─ meshopt_partitionClusters(target_partition_size=4)
-   │       ├─ for each partition:
-   │       │     ├─ 合并 4 簇的 index + vertex 子集
-   │       │     ├─ vertex_lock 锁住组边界
+   │       │     → 将当前层 cluster 按空间邻近性分组, 每组 ~4 个相邻 cluster
+   │       ├─ for each partition (4 个相邻 cluster):
+   │       │     ├─ 合并 partition 内 4 簇的 index + vertex 子集
+   │       │     │     (仅合并该 partition 的局部几何, 不是全局合并)
+   │       │     ├─ 计算 vertex_lock: 标记 partition 边界顶点
+   │       │     │     (边界顶点 = 出现在 >=2 个原始 cluster 中的顶点)
    │       │     ├─ meshopt_simplifyWithAttributes(target=原/2,
    │       │     │     target_error=0.5, options=LockBorder+Regularize)
-   │       │     ├─ meshopt_buildMeshletsFlex(...) 再切 2 簇
+   │       │     │     → 分区独立简化, 锁住边界顶点保证裂缝消除
+   │       │     ├─ meshopt_buildMeshletsFlex(...) 简化结果再切 2 簇
    │       │     ├─ parent.error = max(child.error, result_error)
    │       │     └─ parent.bounds = union(child.bounds)
-   │       └─ 输出 parent 节点
+   │       └─ 所有 partition 的 parent 节点构成下一层输入
    │
    ├─ 3. BVH 装配
    │     └─ 展开层次结构为线性节点数组(left_child/right_child 用数组下标)
@@ -1107,14 +1111,17 @@ flowchart TD
     L0c --> L0d[L0 簇列表, error=0]
 
     L0d --> Loop{cluster_count > 1?}
-    Loop -- Yes --> Part[2a. meshopt_partitionClusters<br/>target_partition_size=4]
-    Part --> Merge[2b. 合并 partition 的 4 簇<br/>index + vertex 子集]
-    Merge --> Lock[2c. 计算 vertex_lock<br/>标记跨组共享边顶点]
-    Lock --> Simp[2d. meshopt_simplifyWithAttributes<br/>target=原/2, target_error=0.5<br/>options=LockBorder+Regularize]
-    Simp --> Recluster[2e. meshopt_buildMeshletsFlex<br/>简化结果再切 2 簇]
-    Recluster --> Bounds2[2f. parent.error = max child error<br/>parent.bounds = union]
-    Bounds2 --> Append[2g. tree.append parent]
-    Append --> Loop
+    Loop -- Yes --> Part[2a. meshopt_partitionClusters<br/>target_partition_size=4<br/>将当前层 cluster 按空间邻近性分组<br/>每组 ~4 个相邻 cluster]
+    Part --> ForEach[2b. for each partition]
+    ForEach --> Merge[2c. 合并 partition 内 4 簇<br/>index + vertex 子集<br/>仅合并该 partition 局部几何]
+    Merge --> Lock[2d. 计算 vertex_lock<br/>标记 partition 边界顶点<br/>边界顶点 = 出现在 >=2 个原始 cluster 中的顶点]
+    Lock --> Simp[2e. meshopt_simplifyWithAttributes<br/>target=原/2, target_error=0.5<br/>options=LockBorder+Regularize<br/>分区独立简化, 锁住边界保证裂缝消除]
+    Simp --> Recluster[2f. meshopt_buildMeshletsFlex<br/>简化结果再切 2 簇]
+    Recluster --> Bounds2[2g. parent.error = max child error<br/>parent.bounds = union]
+    Bounds2 --> Append[2h. tree.append parent]
+    Append --> NextPart{还有 partition?}
+    NextPart -- Yes --> ForEach
+    NextPart -- No --> Loop
 
     Loop -- No --> BVH[3. BVH 装配<br/>展开层次 → 线性 node 数组]
     BVH --> Aux[4. 辅助数据生成]
@@ -1152,8 +1159,9 @@ sequenceDiagram
     loop hierarchy levels
         B->>MO: meshopt_partitionClusters(target=4)
         MO-->>B: partition_id[] per cluster
-        loop each partition
-            B->>B: merge 4 clusters + compute vertex_lock
+        loop each partition (~4 adjacent clusters)
+            B->>B: merge partition's 4 clusters' vertex/index subsets
+            B->>B: compute vertex_lock (border vertices shared by >=2 clusters)
             B->>MO: meshopt_simplifyWithAttributes(target=原/2,<br/>options=LockBorder+Regularize)
             MO-->>B: simplified_indices, result_error
             B->>MO: meshopt_buildMeshletsFlex(simplified, ...)
