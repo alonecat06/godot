@@ -58,7 +58,7 @@ public:
 	double cone_weight = 0.5;
 	double split_factor = 0.5;
 	double simplification_ratio = 0.5;
-	double target_error = 0.05;
+	double target_error = 0.5;
 	bool lock_partition_border = true;
 	int meshlet_optimize_level = 3;
 
