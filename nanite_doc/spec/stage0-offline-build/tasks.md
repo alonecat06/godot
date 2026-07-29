@@ -88,8 +88,14 @@
 
 ## 0.5 NaniteBuilder — 层次化简化与 BVH 装配
 
-- [x] **Task 0.5.1**：实现 `build_hierarchy()`
-  - 自底向上循环：`meshopt_partitionClusters(target=4)` → 按 partition_id 分组 → 合并 partition 的 index+vertex 子集 → 计算 `vertex_lock`（锁跨 partition 共享边顶点）→ `meshopt_simplifyWithAttributes(target=原/2, options=LockBorder|Regularize)` → `meshopt_buildMeshletsFlex` 再切 2 簇 → 计算父 error/bounds
+- [ ] **Task 0.5.1**：实现 `build_hierarchy()` — UE5 Nanite 风格: 4 相邻 cluster 合并 → 分区独立简化
+  - 每层循环：`meshopt_partitionClusters(target=4)` → 按 partition_id 分组
+  - 对每个 partition（4 个相邻 cluster）：
+    - 合并 partition 内 cluster 的 vertex + index 子集（仅局部合并，非全局合并）
+    - 计算 `vertex_lock`（锁跨 partition 共享边顶点，即出现在 >=2 个原始 cluster 中的顶点）
+    - `meshopt_simplifyWithAttributes(target=原/2, options=LockBorder|Regularize)` 分区独立简化
+    - `meshopt_buildMeshletsFlex` 简化结果再切 ~2 簇
+    - 计算 parent.error = max(child.error, result_error) 和 parent.bounds = union(child.bounds)
   - 循环退出条件：`current_level.size() <= 1`
   - 中间产物：层次化 `NaniteClusterNode` 列表
 

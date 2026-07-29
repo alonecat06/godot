@@ -61,13 +61,19 @@
 
 ## 层次化与 BVH
 
-- [x] 8000 tri sphere 产出 `nodes.size() >= 3`
-- [x] 根节点（`nodes[0]`）`error` >= 所有其他节点 `error`
-- [x] 内部节点 `bounds` 包含 `nodes[left_child].bounds`
-- [x] 内部节点 `bounds` 包含 `nodes[right_child].bounds`
-- [x] BVH 根 bounds 包含 `mesh->get_aabb()`
-- [x] 叶子层三角形总数 > 父层三角形总数
-- [x] 每个 internal 节点 `error >= max(children.error)`（容差 0.001）
+> **算法要求**：UE5 Nanite 风格 "4 相邻 cluster 合并 → 分区独立简化"。每层循环：`meshopt_partitionClusters(target=4)` → 对每个 partition 合并局部几何 → 计算 `vertex_lock`（边界顶点）→ `meshopt_simplifyWithAttributes` 分区独立简化 → `meshopt_buildMeshletsFlex` 再切簇 → 计算 parent error/bounds。**禁止全局合并后简化再重分区**。
+
+- [ ] 8000 tri sphere 产出 `nodes.size() >= 3`
+- [ ] 根节点（`nodes[0]`）`error` >= 所有其他节点 `error`
+- [ ] 内部节点 `bounds` 包含 `nodes[left_child].bounds`
+- [ ] 内部节点 `bounds` 包含 `nodes[right_child].bounds`
+- [ ] BVH 根 bounds 包含 `mesh->get_aabb()`
+- [ ] 叶子层三角形总数 > 父层三角形总数
+- [ ] 每个 internal 节点 `error >= max(children.error)`（容差 0.001）
+- [ ] 使用 `meshopt_partitionClusters` 分组（非全局合并）
+- [ ] 使用 `meshopt_simplifyWithAttributes` 分区独立简化（非全局简化）
+- [ ] 简化时使用 `LockBorder` 选项锁住 partition 边界顶点
+- [ ] 简化后使用 `meshopt_buildMeshletsFlex` 重新聚类（非 `meshopt_buildMeshletsSpatial` 空间重分区）
 
 ## Page 划分
 

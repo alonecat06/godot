@@ -157,7 +157,25 @@ Nanite 的 GPU 渲染管线（阶段 1+）必须依赖一份预先构建好的**
 
 ### Requirement: NaniteBuilder 层次化简化与 BVH 装配
 
-系统 SHALL 在 `NaniteBuilder::build_hierarchy()` 中自底向上循环：`meshopt_partitionClusters(target=4)` → 合并 partition → 计算 `vertex_lock` → `meshopt_simplifyWithAttributes(target=原/2, options=LockBorder|Regularize)` → `meshopt_buildMeshletsFlex` 再聚类 → 计算父节点 error/bounds；并在 `build_bvh()` 中将层次结构展开为线性 `NaniteClusterNode` 数组（`left_child`/`right_child` 用数组下标，叶子为 `UINT32_MAX`）。
+系统 SHALL 在 `NaniteBuilder::build_hierarchy()` 中自底向上循环，采用 UE5 Nanite 风格 "4 个相邻 cluster 合并 → 分区独立简化" 算法：
+
+每层循环：
+1. `meshopt_partitionClusters(target=4)` 将当前层 cluster 按空间邻近性分组，每组约 4 个相邻 cluster
+2. 对每个 partition（4 个相邻 cluster）：
+   a. 合并 partition 内 cluster 的 vertex + index 子集（仅局部合并，非全局合并）
+   b. 计算 `vertex_lock`：标记 partition 边界顶点（出现在 >=2 个原始 cluster 中的顶点）
+   c. `meshopt_simplifyWithAttributes(target=原/2, options=LockBorder|Regularize)` 分区独立简化，锁住边界顶点保证裂缝消除
+   d. `meshopt_buildMeshletsFlex` 将简化结果再切 ~2 簇
+   e. 计算 parent.error = max(child.error, result_error) 和 parent.bounds = union(child.bounds)
+3. 所有 partition 的 parent 节点构成下一层输入
+
+并在 `build_bvh()` 中将层次结构展开为线性 `NaniteClusterNode` 数组（`left_child`/`right_child` 用数组下标，叶子为 `UINT32_MAX`）。
+
+> **设计说明**：与 "全局合并 → 全局 edge-collapse 简化 → 空间重分区" 方案不同，UE5 Nanite 的 "4 相邻 cluster 合并 → 分区独立简化" 方案具有以下优势：
+> - 分区独立简化锁住边界顶点，保证裂缝消除（crack-free），这是后续 Stage 1 GPU 渲染的基础
+> - 每个 partition 的简化是局部的，保留了空间局部性，对后续 GPU culling 和 streaming 友好
+> - 4 个相邻 cluster 合并后再简化，确保每个 parent cluster 代表一个空间上连续的区域
+> - 分区独立简化可以并行化，适合离线构建的吞吐量优化
 
 #### Scenario: 多层 BVH 生成
 - **WHEN** 对 8000 tri 球体（segments=64）调用 `builder.build(sphere)`
