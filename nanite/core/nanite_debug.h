@@ -61,6 +61,7 @@ public:
 		CLUSTER_SOLID, // Per-cluster unique solid color (HSV hash)
 		CLUSTER_SOLID_WIREFRAME, // Per-cluster color + white wireframe
 		WIREFRAME_ONLY, // Black background, white wireframe only
+		CLUSTER_SOLID_WITH_PARTITION_BORDER, // Per-cluster color + partition border wireframe
 	};
 
 	// ---- List 2: LOD Mode (Stage 0 refactor) ----------------------------

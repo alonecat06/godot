@@ -56,7 +56,7 @@ class NaniteMeshResource;
 // Stage 0 refactor (2026-07-28): the old single-axis debug OptionButton +
 // Wireframe/Bounds toggles have been replaced with two orthogonal dropdowns:
 //
-//   - Display Mode (5 options): Normal, Normal+Wireframe, Cluster Solid,
+//   - Display Mode (6 options): Normal, Normal+Wireframe, Cluster Solid,
 //     Cluster Solid+Wireframe, Wireframe Only.
 //   - LOD Mode (2 options): Nanite auto cull+LOD (Stage 1 placeholder) /
 //     Force LOD Level (with a SpinBox picking which LOD to render).

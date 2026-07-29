@@ -42,6 +42,7 @@ void NaniteDebug::set_display_mode(int p_mode) {
 		case CLUSTER_SOLID:
 		case CLUSTER_SOLID_WIREFRAME:
 		case WIREFRAME_ONLY:
+		case CLUSTER_SOLID_WITH_PARTITION_BORDER:
 			display_mode = m;
 			break;
 		default:
@@ -103,7 +104,7 @@ void NaniteDebug::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_display_mode", "mode"), &NaniteDebug::set_display_mode);
 	ClassDB::bind_method(D_METHOD("get_display_mode"), &NaniteDebug::get_display_mode);
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "display_mode", PROPERTY_HINT_ENUM,
-					   "Normal,Normal + Wireframe,Cluster Solid,Cluster Solid + Wireframe,Wireframe Only"),
+					   "Normal,Normal + Wireframe,Cluster Solid,Cluster Solid + Wireframe,Wireframe Only,Cluster Solid + Partition Border"),
 			"set_display_mode", "get_display_mode");
 
 	ClassDB::bind_method(D_METHOD("set_lod_mode", "mode"), &NaniteDebug::set_lod_mode);
@@ -138,6 +139,7 @@ void NaniteDebug::_bind_methods() {
 	BIND_ENUM_CONSTANT(CLUSTER_SOLID);
 	BIND_ENUM_CONSTANT(CLUSTER_SOLID_WIREFRAME);
 	BIND_ENUM_CONSTANT(WIREFRAME_ONLY);
+	BIND_ENUM_CONSTANT(CLUSTER_SOLID_WITH_PARTITION_BORDER);
 
 	// LODMode enum.
 	BIND_ENUM_CONSTANT(NANITE_AUTO);

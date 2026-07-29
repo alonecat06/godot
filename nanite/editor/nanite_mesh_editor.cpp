@@ -39,6 +39,8 @@
 #include "core/math/math_funcs.h"
 #include "core/object/callable_mp.h"
 #include "core/object/class_db.h"
+#include "core/templates/hash_map.h"
+#include "core/templates/hash_set.h"
 #include "core/variant/variant.h"
 #include "editor/editor_node.h"
 #include "editor/themes/editor_scale.h"
@@ -46,6 +48,8 @@
 #include "scene/main/viewport.h"
 #include "scene/resources/3d/world_3d.h"
 #include "scene/resources/material.h"
+
+#include <meshoptimizer.h>
 
 // ---------------------------------------------------------------------------
 // CPU-side cluster decoder
@@ -342,6 +346,221 @@ Ref<ArrayMesh> build_wire_from_array_mesh(const Ref<ArrayMesh> &p_src) {
 	return out;
 }
 
+// Build a partition border wireframe for the next LOD level.
+// For each partition (group of ~4 clusters that will merge into 1 at the next
+// LOD level), draws edges where both vertices are shared between clusters
+// (locked/border vertices). These edges show the partition boundaries that
+// will be locked during simplification to guarantee crack-free LOD transitions.
+// Returns a PRIMITIVE_LINES ArrayMesh, or empty Ref on failure.
+Ref<ArrayMesh> build_partition_border_wire(const NaniteMeshResource &p_resource,
+		int p_current_lod_level) {
+	const int next_lod = p_current_lod_level + 1;
+	const int max_lod = p_resource.get_max_lod_level();
+
+	// No next level to show partitions for.
+	if (next_lod > max_lod) {
+		return Ref<ArrayMesh>();
+	}
+
+	const PackedByteArray &clusters_data = p_resource.get_clusters_data();
+	const PackedByteArray &vertex_data = p_resource.get_vertex_data();
+	const PackedByteArray &meshlet_vertices_data = p_resource.get_meshlet_vertices_data();
+	const PackedByteArray &meshlet_triangles_data = p_resource.get_meshlet_triangles_data();
+
+	const int cluster_count = p_resource.get_cluster_count();
+	const size_t cluster_stride = NaniteCluster::get_serialized_size(); // 68
+
+	if (cluster_count <= 0 || clusters_data.size() < (int)(cluster_count * cluster_stride)) {
+		return Ref<ArrayMesh>();
+	}
+	if (vertex_data.size() < (int)kVertexStride || meshlet_vertices_data.size() < 4 ||
+			meshlet_triangles_data.size() < 3) {
+		return Ref<ArrayMesh>();
+	}
+
+	const int total_vertex_count = vertex_data.size() / kVertexStride;
+	const uint32_t *mv = reinterpret_cast<const uint32_t *>(meshlet_vertices_data.ptr());
+	const int mv_count = meshlet_vertices_data.size() / 4;
+	const uint8_t *tri_base = meshlet_triangles_data.ptr();
+	const int tri_byte_count = meshlet_triangles_data.size();
+	const float *vp_base = reinterpret_cast<const float *>(vertex_data.ptr());
+
+	// 1) Collect clusters at next_lod and build their triangle index lists.
+	struct ClusterInfo {
+		uint32_t cluster_idx; // global cluster index in the resource
+		LocalVector<unsigned int> tri_indices; // global vertex indices for all triangles
+	};
+	LocalVector<ClusterInfo> next_lod_clusters;
+
+	for (int ci = 0; ci < cluster_count; ++ci) {
+		NaniteCluster c = NaniteCluster::deserialize(clusters_data, (uint32_t)(ci * cluster_stride));
+		if ((int)c.group_id != next_lod) {
+			continue;
+		}
+		if (c.vertex_count == 0 || c.triangle_count == 0) {
+			continue;
+		}
+		if ((int)c.vertex_offset < 0 || (int)(c.vertex_offset + c.vertex_count) > mv_count) {
+			continue;
+		}
+		const uint32_t tri_bytes_needed = c.triangle_count * 3;
+		if ((uint64_t)c.triangle_offset + tri_bytes_needed > (uint64_t)tri_byte_count) {
+			continue;
+		}
+
+		ClusterInfo info;
+		info.cluster_idx = (uint32_t)ci;
+		for (uint32_t t = 0; t < c.triangle_count; ++t) {
+			const uint8_t *tri_ptr = tri_base + c.triangle_offset + t * 3;
+			for (int k = 0; k < 3; ++k) {
+				uint8_t local_idx = tri_ptr[k];
+				if (local_idx >= c.vertex_count) {
+					continue;
+				}
+				unsigned int global_v = mv[c.vertex_offset + local_idx];
+				if (global_v >= (uint32_t)total_vertex_count) {
+					continue;
+				}
+				info.tri_indices.push_back(global_v);
+			}
+		}
+		if (info.tri_indices.size() > 0) {
+			next_lod_clusters.push_back(info);
+		}
+	}
+
+	const size_t nl_cluster_count = next_lod_clusters.size();
+	if (nl_cluster_count <= 1) {
+		// No partitions to show (single cluster or none).
+		return Ref<ArrayMesh>();
+	}
+
+	// 2) Build cluster_indices and cluster_index_counts for meshopt_partitionClusters.
+	LocalVector<unsigned int> cluster_indices;
+	LocalVector<unsigned int> cluster_index_counts;
+	cluster_index_counts.resize(nl_cluster_count);
+	for (size_t i = 0; i < nl_cluster_count; ++i) {
+		const ClusterInfo &info = next_lod_clusters[i];
+		cluster_index_counts[i] = (unsigned int)info.tri_indices.size();
+		for (unsigned int idx : info.tri_indices) {
+			cluster_indices.push_back(idx);
+		}
+	}
+
+	// 3) Partition clusters into groups of ~4 spatially adjacent clusters.
+	LocalVector<unsigned int> partition_ids;
+	partition_ids.resize(nl_cluster_count);
+	size_t partition_count = meshopt_partitionClusters(
+			partition_ids.ptr(),
+			cluster_indices.ptr(),
+			cluster_indices.size(),
+			cluster_index_counts.ptr(),
+			nl_cluster_count,
+			vp_base,
+			total_vertex_count,
+			kVertexStride,
+			4); // target = 4 clusters per partition
+
+	if (partition_count == 0 || partition_count == nl_cluster_count) {
+		// No meaningful partitions (all singletons or partition failed).
+		return Ref<ArrayMesh>();
+	}
+
+	// 4) Group clusters by partition_id.
+	LocalVector<LocalVector<size_t>> partitions;
+	partitions.resize(partition_count);
+	for (size_t i = 0; i < nl_cluster_count; ++i) {
+		uint32_t pid = partition_ids[i];
+		if (pid < partition_count) {
+			partitions[pid].push_back(i);
+		}
+	}
+
+	// 5) For each partition, compute locked vertices and border edges.
+	PackedVector3Array line_verts;
+
+	for (size_t pid = 0; pid < partition_count; ++pid) {
+		const LocalVector<size_t> &p_clusters = partitions[pid];
+		if (p_clusters.size() <= 1) {
+			continue;
+		}
+
+		// 5a) Count vertex references across clusters within this partition.
+		HashMap<unsigned int, uint32_t> vertex_ref_count;
+		for (size_t ci : p_clusters) {
+			const ClusterInfo &info = next_lod_clusters[ci];
+			HashSet<unsigned int> cluster_verts;
+			for (unsigned int v : info.tri_indices) {
+				cluster_verts.insert(v);
+			}
+			for (unsigned int v : cluster_verts) {
+				HashMap<unsigned int, uint32_t>::Iterator it = vertex_ref_count.find(v);
+				if (it != vertex_ref_count.end()) {
+					it->value += 1;
+				} else {
+					vertex_ref_count[v] = 1;
+				}
+			}
+		}
+
+		// 5b) Build locked vertex set (vertices appearing in >=2 clusters).
+		HashSet<unsigned int> locked_verts;
+		for (const KeyValue<unsigned int, uint32_t> &E : vertex_ref_count) {
+			if (E.value >= 2) {
+				locked_verts.insert(E.key);
+			}
+		}
+		if (locked_verts.size() < 2) {
+			continue;
+		}
+
+		// 5c) Find border edges (edges where both vertices are locked).
+		// Use a hash set to deduplicate edges (same edge may appear in
+		// multiple triangles).
+		HashSet<uint64_t> edge_set;
+		for (size_t ci : p_clusters) {
+			const ClusterInfo &info = next_lod_clusters[ci];
+			for (size_t t = 0; t + 2 < info.tri_indices.size(); t += 3) {
+				unsigned int v0 = info.tri_indices[t];
+				unsigned int v1 = info.tri_indices[t + 1];
+				unsigned int v2 = info.tri_indices[t + 2];
+
+				// Helper to emit a line segment for edge (a,b) if both are locked.
+				auto emit_edge = [&](unsigned int a, unsigned int b) {
+					if (locked_verts.has(a) && locked_verts.has(b)) {
+						uint64_t key = (uint64_t)(a < b ? a : b) << 32 | (uint64_t)(a < b ? b : a);
+						if (!edge_set.has(key)) {
+							edge_set.insert(key);
+							const float *pa = vp_base + a * (kVertexStride / sizeof(float));
+							const float *pb = vp_base + b * (kVertexStride / sizeof(float));
+							line_verts.push_back(Vector3(pa[0], pa[1], pa[2]));
+							line_verts.push_back(Vector3(pb[0], pb[1], pb[2]));
+						}
+					}
+				};
+				emit_edge(v0, v1);
+				emit_edge(v1, v2);
+				emit_edge(v2, v0);
+			}
+		}
+	}
+
+	if (line_verts.is_empty()) {
+		return Ref<ArrayMesh>();
+	}
+
+	print_line(vformat("[nanite-partition-border] next_lod=%d clusters=%d partitions=%d border_edges=%d",
+			next_lod, (uint64_t)nl_cluster_count, (uint64_t)partition_count, line_verts.size() / 2));
+
+	Array arrays;
+	arrays.resize(Mesh::ARRAY_MAX);
+	arrays[Mesh::ARRAY_VERTEX] = line_verts;
+	Ref<ArrayMesh> mesh;
+	mesh.instantiate();
+	mesh->add_surface_from_arrays(Mesh::PRIMITIVE_LINES, arrays);
+	return mesh;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -472,13 +691,23 @@ void NaniteMeshEditor::_rebuild_preview() {
 		// Stage 0: use cluster decode for all display modes.
 		const bool per_cluster_colors =
 				(display_id == NaniteDebug::CLUSTER_SOLID ||
-						display_id == NaniteDebug::CLUSTER_SOLID_WIREFRAME);
+						display_id == NaniteDebug::CLUSTER_SOLID_WIREFRAME ||
+						display_id == NaniteDebug::CLUSTER_SOLID_WITH_PARTITION_BORDER);
 		solid_mesh = build_cluster_mesh(*current_resource.ptr(), force_lod, per_cluster_colors);
 		wire_visible = (display_id == NaniteDebug::NORMAL_WIREFRAME ||
 						display_id == NaniteDebug::CLUSTER_SOLID_WIREFRAME ||
-						display_id == NaniteDebug::WIREFRAME_ONLY);
+						display_id == NaniteDebug::WIREFRAME_ONLY ||
+						display_id == NaniteDebug::CLUSTER_SOLID_WITH_PARTITION_BORDER);
 		if (wire_visible) {
-			wire_mesh = build_cluster_wire_mesh(*current_resource.ptr(), force_lod);
+			if (display_id == NaniteDebug::CLUSTER_SOLID_WITH_PARTITION_BORDER) {
+				wire_mesh = build_partition_border_wire(*current_resource.ptr(), force_lod);
+				// Hide wire if partition border generation failed (e.g., at last LOD).
+				if (wire_mesh.is_null()) {
+					wire_visible = false;
+				}
+			} else {
+				wire_mesh = build_cluster_wire_mesh(*current_resource.ptr(), force_lod);
+			}
 		}
 		if (display_id == NaniteDebug::WIREFRAME_ONLY) {
 			solid_visible = false;
@@ -496,6 +725,17 @@ void NaniteMeshEditor::_rebuild_preview() {
 	wire_instance->set_mesh(wire_mesh);
 	wire_instance->set_visible(wire_visible && !wire_mesh.is_null());
 	solid_instance->set_visible(solid_visible && !solid_mesh.is_null());
+
+	// Tint the wireframe material yellow for partition border mode to
+	// distinguish partition boundaries from regular cluster wireframes.
+	{
+		Ref<Material> wire_mat = wire_instance->get_material_override();
+		StandardMaterial3D *smat = Object::cast_to<StandardMaterial3D>(wire_mat.ptr());
+		if (smat) {
+			bool is_partition_border = (display_id == NaniteDebug::CLUSTER_SOLID_WITH_PARTITION_BORDER);
+			smat->set_albedo(is_partition_border ? Color(1.0f, 0.85f, 0.1f) : Color(1.0f, 1.0f, 1.0f));
+		}
+	}
 
 	print_line(vformat("[nanite-preview] final: solid_mesh_valid=%d wire_mesh_valid=%d solid_visible=%d wire_visible=%d",
 			(int)solid_mesh.is_valid(), (int)wire_mesh.is_valid(), (int)solid_visible, (int)wire_visible));
@@ -669,6 +909,7 @@ NaniteMeshEditor::NaniteMeshEditor() {
 	display_mode_btn->add_item("Cluster Solid", NaniteDebug::CLUSTER_SOLID);
 	display_mode_btn->add_item("Cluster Solid + Wireframe", NaniteDebug::CLUSTER_SOLID_WIREFRAME);
 	display_mode_btn->add_item("Wireframe Only", NaniteDebug::WIREFRAME_ONLY);
+	display_mode_btn->add_item("Cluster Solid + Partition Border", NaniteDebug::CLUSTER_SOLID_WITH_PARTITION_BORDER);
 	display_mode_btn->select(0);
 	display_mode_btn->set_custom_minimum_size(Size2(180, 0) * EDSCALE);
 	hb->add_child(display_mode_btn);
