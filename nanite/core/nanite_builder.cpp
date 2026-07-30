@@ -36,6 +36,7 @@
 #include "core/templates/hash_set.h"
 #include "core/templates/list.h" // List<Node *> for PackedScene traversal.
 #include "page_packer.h" // PagePacker::pack + PageTable for finalize_resource().
+#include "scene/resources/3d/importer_mesh.h" // ImporterMesh for build_from_resource() gltf/glb imports.
 #include "scene/resources/material.h" // BaseMaterial3D for collect_materials().
 #include "scene/resources/mesh.h"
 
@@ -146,6 +147,14 @@ Ref<NaniteMeshResource> NaniteBuilder::build_from_resource(Ref<Resource> p_resou
 	// single-argument cast_to overload that uses runtime derives_from.
 	Object *obj_ptr = p_resource.ptr();
 	Ref<ArrayMesh> arr_mesh = Object::cast_to<ArrayMesh>(obj_ptr);
+	// Handle ImporterMesh (gltf/glb imports produce ImporterMesh instances
+	// which are not subclasses of ArrayMesh — they extend Resource directly).
+	if (arr_mesh.is_null()) {
+		ImporterMesh *importer_mesh = Object::cast_to<ImporterMesh>(obj_ptr);
+		if (importer_mesh) {
+			arr_mesh = importer_mesh->get_mesh();
+		}
+	}
 	Ref<PackedScene> packed_scene = Object::cast_to<PackedScene>(obj_ptr);
 	MeshInstance3D *mesh_instance = Object::cast_to<MeshInstance3D>(obj_ptr);
 
@@ -215,7 +224,21 @@ Ref<NaniteMeshResource> NaniteBuilder::build_from_resource(Ref<Resource> p_resou
 			Node *node = stack.front()->get();
 			stack.pop_front();
 			if (MeshInstance3D *mi = Object::cast_to<MeshInstance3D>(node)) {
-				Ref<ArrayMesh> mesh = mi->get_mesh();
+				Ref<Mesh> mesh_ref = mi->get_mesh();
+				if (mesh_ref.is_null()) {
+					continue;
+				}
+				// Handle ImporterMesh (gltf/glb imports): ImporterMesh is not
+				// an ArrayMesh subclass, so call get_mesh() to extract the
+				// underlying ArrayMesh.
+				Ref<ArrayMesh> mesh;
+				Object *raw = mesh_ref.ptr();
+				ImporterMesh *im = Object::cast_to<ImporterMesh>(raw);
+				if (im) {
+					mesh = im->get_mesh();
+				} else {
+					mesh = Object::cast_to<ArrayMesh>(raw);
+				}
 				if (mesh.is_null()) {
 					continue;
 				}
@@ -276,10 +299,25 @@ Ref<NaniteMeshResource> NaniteBuilder::build_from_resource(Ref<Resource> p_resou
 		memdelete(root);
 	} else if (mesh_instance != nullptr) {
 		// --- Path C: MeshInstance3D node (in-scene selection) -----------------
-		Ref<ArrayMesh> mesh = mesh_instance->get_mesh();
+		Ref<Mesh> mesh_ref = mesh_instance->get_mesh();
+		if (mesh_ref.is_null()) {
+			ERR_FAIL_COND_V_MSG(true, null_result,
+					"NaniteBuilder::build_from_resource: MeshInstance3D has no mesh");
+		}
+		// Handle ImporterMesh (gltf/glb imports): ImporterMesh is not an
+		// ArrayMesh subclass, so call get_mesh() to extract the underlying
+		// ArrayMesh.
+		Ref<ArrayMesh> mesh;
+		Object *raw = mesh_ref.ptr();
+		ImporterMesh *im = Object::cast_to<ImporterMesh>(raw);
+		if (im) {
+			mesh = im->get_mesh();
+		} else {
+			mesh = Object::cast_to<ArrayMesh>(raw);
+		}
 		if (mesh.is_null() || mesh->get_surface_count() == 0) {
 			ERR_FAIL_COND_V_MSG(true, null_result,
-					"NaniteBuilder::build_from_resource: MeshInstance3D has no mesh or no surfaces");
+					"NaniteBuilder::build_from_resource: MeshInstance3D has no ArrayMesh or no surfaces");
 		}
 		for (int s = 0; s < mesh->get_surface_count(); ++s) {
 			Array arrays = mesh->surface_get_arrays(s);
@@ -935,7 +973,22 @@ bool NaniteBuilder::build_hierarchy() {
 				vertex_lock[i] = (vertex_cluster_count[i] >= 2) ? 1 : 0;
 			}
 
-			// 4c) Simplify the partition's merged mesh to ~50% triangle count.
+			// 4c) Build a local vertex position buffer for the merged geometry.
+			//     merged_indices and vertex_lock use LOCAL indices (0..merged_vertices.size()-1),
+			//     but meshopt functions expect indices that correspond to the position buffer.
+			//     Building a local position buffer ensures correct spatial queries.
+			const size_t local_vertex_count = merged_vertices.size();
+			LocalVector<float> local_vertex_positions;
+			local_vertex_positions.resize(local_vertex_count * 3);
+			for (size_t i = 0; i < local_vertex_count; ++i) {
+				unsigned int global_v = merged_vertices[i];
+				local_vertex_positions[i * 3 + 0] = m_verts_pos[global_v * 3 + 0];
+				local_vertex_positions[i * 3 + 1] = m_verts_pos[global_v * 3 + 1];
+				local_vertex_positions[i * 3 + 2] = m_verts_pos[global_v * 3 + 2];
+			}
+			const size_t local_vertex_stride = sizeof(float) * 3;
+
+			// 4d) Simplify the partition's merged mesh to ~50% triangle count.
 			const size_t target_index_count = merged_index_count / 2;
 			if (target_index_count < min_triangles * 3) {
 				// Too few triangles to simplify — promote clusters individually.
@@ -955,9 +1008,9 @@ bool NaniteBuilder::build_hierarchy() {
 					simplified_indices.ptr(),
 					merged_indices.ptr(),
 					merged_index_count,
-					m_verts_pos.ptr(),
-					vertex_count,
-					vertex_stride,
+					local_vertex_positions.ptr(),
+					local_vertex_count,
+					local_vertex_stride,
 					nullptr, 0,        // no extra attributes
 					nullptr, 0,        // no attribute weights
 					vertex_lock.ptr(),
@@ -994,6 +1047,8 @@ bool NaniteBuilder::build_hierarchy() {
 			any_simplified = true;
 
 			// 4e) Build meshlets from the simplified mesh using meshopt_buildMeshletsFlex.
+			//     Use the local vertex position buffer so that simplified_indices
+			//     (local indices) correctly reference the partition's vertex positions.
 			const size_t max_meshlets = meshopt_buildMeshletsBound(simplified_index_count, max_vertices, min_triangles);
 			LocalVector<struct meshopt_Meshlet> parent_meshlets;
 			parent_meshlets.resize(max_meshlets);
@@ -1008,9 +1063,9 @@ bool NaniteBuilder::build_hierarchy() {
 					parent_meshlet_triangles.ptr(),
 					simplified_indices.ptr(),
 					simplified_index_count,
-					m_verts_pos.ptr(),
-					vertex_count,
-					vertex_stride,
+					local_vertex_positions.ptr(),
+					local_vertex_count,
+					local_vertex_stride,
 					max_vertices,
 					min_triangles,
 					max_triangles,
@@ -1052,7 +1107,9 @@ bool NaniteBuilder::build_hierarchy() {
 			for (size_t i = 0; i < parent_meshlet_count; ++i) {
 				const struct meshopt_Meshlet &src = parent_meshlets[i];
 				for (uint32_t v = 0; v < src.vertex_count; ++v) {
-					unsigned int global_v = parent_meshlet_vertices[src.vertex_offset + v];
+					unsigned int local_v = parent_meshlet_vertices[src.vertex_offset + v];
+					// Convert local index back to global index via merged_vertices.
+					unsigned int global_v = (local_v < merged_vertices.size()) ? merged_vertices[local_v] : 0;
 					m_meshlet_vertices.push_back(global_v);
 				}
 			}
