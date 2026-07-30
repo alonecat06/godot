@@ -189,7 +189,35 @@
 - [x] preview 不调 `NaniteServer::set_debug_mode()`（运行时场景的 NaniteServer 调试状态保持不变）
 - [x] preview 不使用 `NaniteMeshInstance3D`（避免触发 NaniteServer instance 注册）
 - [x] 所有渲染代码限制在 `nanite/editor/` 模块内（CPU 侧解码 + Godot 标准 `MeshInstance3D` forward 管线）
-- [x] `scons platform=windows target=editor accesskit=no angle=no dev_build=yes -j8` 编译通过（commit `79b2011a68`）
+- [x] `scons platform=windows target=editor accesskit=no angle=no dev_build=yes -j8` 编译通过
+
+## 预览相机控制 (Task 0.9.12)
+
+- [ ] 鼠标滚轮缩放：`WHEEL_UP` 拉近，`WHEEL_DOWN` 推远，缩放速度与距离成正比
+- [ ] 相机距离有最小值 0.01，不穿过模型
+- [ ] 鼠标中键拖拽平移：屏幕空间 XY 平面平移，平移速度与距离成正比
+- [ ] Shift+左键拖拽平移：行为与中键平移一致，不触发旋转
+- [ ] F 键聚焦：重置距离、平移、旋转为默认值，框选整个模型
+- [ ] 无资源时 F 键无操作（不崩溃）
+- [ ] 左键旋转（无 Shift）保持原有行为不变
+- [ ] `_update_camera_transform()` 正确计算相机位置（pan_offset + camera_distance + rotation）
+- [ ] 加载新资源时自动调用 focus 设置初始相机参数
+
+## Cluster 选中与虚化交互 (Task 0.9.13)
+
+- [ ] `dimmed_instance` 在构造函数中创建，使用半透明灰色材质（alpha=0.2, TRANSPARENCY_ALPHA, DISABLE_DEPTH_TEST）
+- [ ] `ray_triangle_intersect()` 使用 Möller-Trumbore 算法正确检测射线-三角形相交
+- [ ] `_ray_pick_cluster()` 正确将世界空间射线变换到 rotation_node 局部空间
+- [ ] 在 CLUSTER_SOLID / CLUSTER_SOLID_WIREFRAME / CLUSTER_SOLID_WITH_PARTITION_BORDER 模式下点击选中 cluster
+- [ ] 选中后 solid_instance 仅渲染选中 cluster，dimmed_instance 渲染其他 cluster 虚化
+- [ ] 点击空白区域取消选中（selected_cluster_index = -1）
+- [ ] Escape 键取消选中
+- [ ] 切换 LOD 等级时自动清除选中
+- [ ] 切换 DisplayMode 时自动清除选中
+- [ ] 拖拽（移动距离 > 5px）不触发选中，按原有逻辑处理
+- [ ] NORMAL / NORMAL_WIREFRAME / WIREFRAME_ONLY 模式下不响应 cluster 选中
+- [ ] 选中状态下镜头操作（缩放/平移/旋转）保持选中不变
+- [ ] `scons platform=windows target=editor accesskit=no angle=no dev_build=yes -j8` 编译通过
 
 ## 独立资源编辑器窗口 (Task 0.13)
 

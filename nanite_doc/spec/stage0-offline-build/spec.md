@@ -38,11 +38,14 @@ Nanite 的 GPU 渲染管线（阶段 1+）必须依赖一份预先构建好的**
   - `set_display_mode` / `set_lod_mode` / `set_force_lod_level` / `set_show_bounds` 及对应 getter
 - **新增** `NaniteMeshResource::get_max_lod_level()` 辅助方法，扫描 `clusters_data`（68B stride）返回最大 `group_id`，用于 preview SpinBox 范围自适应（不绑定到 ClassDB）
 - **新增** `nanite/editor/` 编辑器扩展：
-  - `NaniteMeshEditor`（继承 `SubViewportContainer`，3D 旋转预览 + 构建统计 + **二维下拉列表**显示模式控制 + **独立 CPU 渲染器**）
+  - `NaniteMeshEditor`（继承 `SubViewportContainer`，3D 旋转预览 + 构建统计 + **二维下拉列表**显示模式控制 + **独立 CPU 渲染器** + **相机控制（缩放/平移/聚焦）** + **Cluster 选中与虚化交互**）
     - `solid_instance`（`MeshInstance3D`）：渲染 Lambert / per-vertex HSV 色（`FLAG_ALBEDO_FROM_VERTEX_COLOR`）
     - `wire_instance`（`MeshInstance3D`）：渲染 `PRIMITIVE_LINES` mesh + `SHADING_MODE_UNSHADED` 白色（线框叠加层）
+    - `dimmed_instance`（`MeshInstance3D`）：渲染半透明灰色虚化 mesh（`TRANSPARENCY_ALPHA` + `FLAG_DISABLE_DEPTH_TEST`），仅在 Cluster 选中时显示其他 cluster
     - CPU 侧匿名命名空间 `decode_clusters_for_lod()` 解码器：读 `clusters_data` + `meshlet_vertices_data` + `meshlet_triangles_data` + `vertex_data`，按 `group_id == force_lod_level` 过滤，可选输出 per-cluster HSV 色，支持三角形 mesh 与线框 mesh 两种输出模式
     - `_rebuild_preview()` 在 edit() 加载新资源、用户切换 DisplayMode / LODMode / ForceLOD 时触发，同步重建 ArrayMesh
+    - `_ray_pick_cluster()`：CPU 侧射线-三角形相交检测，在 Cluster Solid 模式下点击选中单个 cluster
+    - `_update_camera_transform()`：根据 `camera_distance`、`pan_offset`、`rot_x`、`rot_y` 更新相机位置
   - `EditorInspectorPluginNanite` + `NaniteEditorPlugin`
   - `NaniteResourcePreviewGenerator`（使用 `shadow_mesh` 生成 FileSystem 缩略图）
   - `NaniteConversionContextMenu`（继承 `EditorContextMenuPlugin`，在 FileSystem 对 `.gltf`/`.glb`/`.fbx`/`.obj`/`.tres` mesh 资源提供右键 "Convert to Nanite" 入口）
@@ -451,6 +454,96 @@ Nanite 的 GPU 渲染管线（阶段 1+）必须依赖一份预先构建好的**
 - **THEN** 弹错误对话框 "Nanite build failed: <reason>"
 - **AND** 不写入文件
 - **AND** EditorLog 输出错误详情
+
+---
+
+### Requirement: 预览相机控制
+
+系统 SHALL 在 `NaniteMeshEditor` 预览窗口中提供完整的相机控制能力，包括缩放（滚轮）、平移（中键拖拽或 Shift+左键拖拽）、旋转（左键拖拽，已有功能）和聚焦（快捷键 F 重新框选模型）。
+
+#### Scenario: 滚轮缩放
+- **WHEN** 用户在预览区域滚动鼠标滚轮
+- **THEN** 相机与模型的距离变化：`WHEEL_UP` 拉近（缩小距离），`WHEEL_DOWN` 推远（增大距离）
+- **AND** 缩放速度与当前距离成正比（距离越远缩放越快），保证远近操作手感一致
+- **AND** 相机距离有最小值限制（`0.01`），防止穿过模型
+
+#### Scenario: 中键拖拽平移
+- **WHEN** 用户在预览区域按住鼠标中键并拖拽
+- **THEN** 相机在屏幕空间 XY 平面内平移（左右/上下移动）
+- **AND** 平移速度与当前相机距离成正比（距离越远平移越快）
+- **AND** 平移方向与鼠标移动方向一致（鼠标向右拖拽 → 模型向右平移，即相机向左移动）
+
+#### Scenario: Shift+左键拖拽平移
+- **WHEN** 用户在预览区域按住 Shift 键并用鼠标左键拖拽
+- **THEN** 行为与中键拖拽平移完全一致（屏幕空间 XY 平面平移）
+- **AND** 不触发旋转（Shift 修饰键抑制旋转行为）
+
+#### Scenario: F 键聚焦
+- **WHEN** 用户在预览区域按下 F 键
+- **THEN** 相机距离重置为 `aabb.size.length() * 1.2`（框选整个模型）
+- **AND** 平移偏移 `pan_offset` 重置为 `(0, 0)`（模型居中）
+- **AND** 旋转角度重置为默认值 `rot_x = -15°`, `rot_y = 30°`
+- **AND** 若当前无资源（`current_resource` 为空），F 键无操作
+
+#### Scenario: 左键旋转保持
+- **WHEN** 用户在不按 Shift 的情况下用鼠标左键拖拽
+- **THEN** 现有的轨道旋转行为保持不变（`rot_x` / `rot_y` 更新）
+
+#### Scenario: 相机变换更新
+- **WHEN** 任一相机参数（距离、平移、旋转）发生变化
+- **THEN** 调用 `_update_camera_transform()` 重新计算相机位置：
+  - 相机相对于 `rotation_node` 的位置为 `(pan_offset.x, pan_offset.y, camera_distance)`
+  - 再通过 `rotation_node` 的旋转变换得到最终世界空间位置
+
+---
+
+### Requirement: Cluster 选中与虚化交互
+
+系统 SHALL 在 Cluster Solid 系列显示模式（`CLUSTER_SOLID`、`CLUSTER_SOLID_WIREFRAME`、`CLUSTER_SOLID_WITH_PARTITION_BORDER`）下支持点击选中单个 Cluster，并将其他 Cluster 虚化，以便用户聚焦观察特定 Cluster 的几何结构。
+
+#### Scenario: 点击选中 Cluster
+- **WHEN** 用户在 CLUSTER_SOLID / CLUSTER_SOLID_WIREFRAME / CLUSTER_SOLID_WITH_PARTITION_BORDER 模式下左键点击（非拖拽，即按下和释放位置接近）
+- **THEN** 系统执行 CPU 侧射线-三角形相交检测：
+  1. 从 `Camera3D::project_ray_origin()` / `project_ray_normal()` 获取世界空间射线
+  2. 将射线变换到 `rotation_node` 局部空间（因为 mesh 实例是 `rotation_node` 的子节点）
+  3. 遍历当前 LOD 的所有 cluster 的三角形，使用 Möller-Trumbore 算法测试相交
+  4. 返回第一个命中的 cluster 索引（最近命中点）
+- **AND** 若命中一个 cluster，则 `selected_cluster_index` 设置为该 cluster 的全局索引
+- **AND** 若未命中任何 cluster（点击空白区域），则清除选中（`selected_cluster_index = -1`）
+
+#### Scenario: 选中后虚化其他 Cluster
+- **WHEN** `selected_cluster_index >= 0`（有 cluster 被选中）
+- **THEN** `_rebuild_preview()` 渲染以下内容：
+  - `solid_instance`：仅渲染选中的 cluster，使用其 per-cluster HSV 颜色（正常亮度）
+  - `dimmed_instance`（新增 `MeshInstance3D`）：渲染当前 LOD 所有其他 cluster，使用半透明灰色材质（`albedo = Color(0.3, 0.3, 0.3)`，`alpha = 0.2`，`transparency = ALPHA`）
+  - `wire_instance` / `partition_border_instance`：按原有 DisplayMode 逻辑渲染（不受选中影响）
+- **AND** `dimmed_instance` 的材质使用 `BaseMaterial3D::TRANSPARENCY_ALPHA` + `FLAG_DISABLE_DEPTH_TEST` 使虚化部分不遮挡选中 cluster
+
+#### Scenario: 选中后镜头操作
+- **WHEN** 一个 cluster 被选中
+- **THEN** 用户可以自由缩放、平移、旋转镜头来观察选中的 cluster
+- **AND** 虚化的其他 cluster 提供空间上下文但不阻挡视线
+- **AND** 选中状态在镜头操作期间保持不变（不因拖拽旋转而清除选中）
+
+#### Scenario: Escape 取消选中
+- **WHEN** 用户按下 Escape 键
+- **THEN** 当前 cluster 选中被清除（`selected_cluster_index = -1`）
+- **AND** `_rebuild_preview()` 恢复所有 cluster 正常渲染（`dimmed_instance` 隐藏）
+
+#### Scenario: 切换 LOD / DisplayMode 清除选中
+- **WHEN** 用户切换 LOD 等级或 DisplayMode
+- **THEN** 当前 cluster 选中被清除（`selected_cluster_index = -1`）
+- **AND** preview 按新模式正常渲染
+
+#### Scenario: 非 Cluster Solid 模式不响应选中
+- **WHEN** 当前 DisplayMode 为 NORMAL / NORMAL_WIREFRAME / WIREFRAME_ONLY
+- **THEN** 点击不触发 cluster 选中逻辑
+- **AND** 鼠标行为按原有逻辑处理（旋转/平移/缩放）
+
+#### Scenario: 拖拽不触发选中
+- **WHEN** 用户左键拖拽（鼠标移动距离超过阈值，如 5 像素）
+- **THEN** 不触发 cluster 选中，按原有旋转/平移逻辑处理
+- **AND** 仅在点击（按下后几乎不移动即释放）时触发选中
 
 ---
 

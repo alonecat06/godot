@@ -267,6 +267,54 @@
   - 在 `display_mode_btn` 下拉列表中添加 "Cluster Solid + Partition Border" 项
   - 验证：编译通过；模式切换不崩溃；partition 边界线框正确显示
 
+- [ ] **Task 0.9.12**（Stage 0 新增, 2026-07-30）：预览相机控制（缩放、平移、聚焦）
+  - 在 `NaniteMeshEditor` 中新增成员变量：
+    - `float camera_distance`：相机到旋转中心的距离（默认 3.0）
+    - `Vector2 pan_offset`：相机在 rotation_node 局部空间 XY 平面的平移偏移（默认 (0,0)）
+    - `bool panning`：中键平移拖拽状态
+    - `bool shift_panning`：Shift+左键平移拖拽状态
+    - `Vector2 click_pos`：记录鼠标按下位置，用于区分点击与拖拽
+  - 新增 `_update_camera_transform()` 方法：根据 `pan_offset`、`camera_distance`、`rot_x`、`rot_y` 更新相机 Transform3D
+  - 修改 `gui_input()` 处理方法：
+    - **滚轮缩放**：`WHEEL_UP` 使 `camera_distance *= 0.9`，`WHEEL_DOWN` 使 `camera_distance *= 1.1`，最小距离 0.01
+    - **中键平移**：`MIDDLE` 按下开始拖拽，移动时根据 `mm->get_relative()` 更新 `pan_offset`（平移速度 = `camera_distance * 0.002`）
+    - **Shift+左键平移**：检测 `Shift` 修饰键 + 左键拖拽，行为同中键平移
+    - **F 键聚焦**：重置 `camera_distance = aabb_len * 1.2`、`pan_offset = (0,0)`、`rot_x = -15°`、`rot_y = 30°`
+    - **左键旋转**：保持原有行为（无 Shift 时左键拖拽旋转）
+  - 修改 `edit()` 方法：加载新资源时使用 `_focus_on_model()` 设置初始相机参数
+  - 验证：编译通过；滚轮缩放正常；中键平移正常；Shift+左键平移正常；F 键聚焦正常；旋转不受影响
+
+- [ ] **Task 0.9.13**（Stage 0 新增, 2026-07-30）：Cluster 选中与虚化交互
+  - 在 `NaniteMeshEditor` 中新增成员变量：
+    - `int selected_cluster_index`：当前选中的 cluster 全局索引（-1 表示无选中）
+    - `MeshInstance3D *dimmed_instance`：渲染虚化 cluster 的半透明 mesh 实例
+  - 在构造函数中创建 `dimmed_instance`：
+    - 使用 `TRANSPARENCY_ALPHA` + `FLAG_DISABLE_DEPTH_TEST` 的 `StandardMaterial3D`
+    - `albedo = Color(0.3, 0.3, 0.3)`，`alpha = 0.2`
+    - 默认隐藏
+  - 在匿名命名空间实现 `ray_triangle_intersect()` 辅助函数：
+    - 使用 Möller-Trumbore 算法测试射线与三角形相交
+    - 返回交点距离 t（< 0 表示不相交）
+  - 新增 `_ray_pick_cluster()` 方法：
+    - 从 `camera->project_ray_origin()` / `project_ray_normal()` 获取世界空间射线
+    - 将射线变换到 `rotation_node` 局部空间
+    - 遍历当前 LOD 所有 cluster 的三角形进行相交测试
+    - 返回最近命中 cluster 的全局索引（-1 表示未命中）
+  - 修改 `gui_input()`：
+    - 左键按下时记录 `click_pos`
+    - 左键释放时，若移动距离 < 5 像素且当前为 Cluster Solid 系列模式，调用 `_ray_pick_cluster()` 执行选中
+    - Escape 键清除选中（`selected_cluster_index = -1`）
+  - 在匿名命名空间新增 `build_cluster_mesh_excluding()` 函数：
+    - 解码当前 LOD 所有 cluster，排除指定 cluster_index
+    - 返回半透明灰色 mesh（不含 ARRAY_COLOR，由 material 控制颜色）
+  - 修改 `_rebuild_preview()`：
+    - 当 `selected_cluster_index >= 0` 且为 Cluster Solid 系列模式时：
+      - `solid_instance`：仅渲染选中 cluster（`build_single_cluster_mesh()`）
+      - `dimmed_instance`：渲染其他所有 cluster（`build_cluster_mesh_excluding()`）
+    - 当 `selected_cluster_index < 0` 时：`dimmed_instance` 隐藏，按原有逻辑渲染
+  - 修改 `_on_display_mode_selected()` / `_on_lod_mode_selected()` / `_on_force_lod_changed()`：清除选中
+  - 验证：编译通过；点击选中 cluster 正常；虚化效果正常；Escape 取消选中正常；切换 LOD/DisplayMode 清除选中正常
+
 ---
 
 ## 0.10 阶段 0 端到端测试
