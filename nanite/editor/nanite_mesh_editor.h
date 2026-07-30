@@ -79,17 +79,19 @@ private:
 	// solid_instance renders the shaded surface (Normal or Cluster Solid).
 	// wire_instance renders the white wireframe overlay (visible in modes
 	// NORMAL_WIREFRAME / CLUSTER_SOLID_WIREFRAME / WIREFRAME_ONLY).
-	// partition_border_instance renders the partition border wireframe
-	// overlay in CLUSTER_SOLID_WITH_PARTITION_BORDER mode. It uses a
-	// dedicated MeshInstance3D with depth-test disabled and a stipple
-	// (dashed) shader so partition borders are always visible even when
-	// occluded by solid geometry.
+	// partition_border_solid_instance renders the solid partition border
+	// lines on the model surface (depth-test enabled). Only shown in
+	// CLUSTER_SOLID_WITH_PARTITION_BORDER mode.
+	// partition_border_instance renders the dashed partition border overlay
+	// for occluded edges (depth-test disabled, stipple shader). Only shown
+	// in CLUSTER_SOLID_WITH_PARTITION_BORDER mode.
 	// dimmed_instance renders the dimmed (ghosted) clusters when a single
 	// cluster is selected in CLUSTER_SOLID modes. It uses a semi-transparent
 	// gray material with depth-test disabled so the ghosted geometry doesn't
 	// occlude the selected cluster.
 	MeshInstance3D *solid_instance = nullptr;
 	MeshInstance3D *wire_instance = nullptr;
+	MeshInstance3D *partition_border_solid_instance = nullptr;
 	MeshInstance3D *partition_border_instance = nullptr;
 	MeshInstance3D *dimmed_instance = nullptr;
 

@@ -46,8 +46,8 @@ TEST_CASE("[Nanite][Instance] forced_lod_getter_setter") {
 	// Can't instantiate Node in headless test easily, but verify the property exists
 	// via ClassDB. Full instantiation test requires a SceneTree.
 	// For now, just verify the class is properly registered.
-	CHECK(ClassDB::class_has_method("NaniteMeshInstance3D", "set_forced_lod"));
-	CHECK(ClassDB::class_has_method("NaniteMeshInstance3D", "get_forced_lod"));
+	CHECK(ClassDB::has_method("NaniteMeshInstance3D", "set_forced_lod"));
+	CHECK(ClassDB::has_method("NaniteMeshInstance3D", "get_forced_lod"));
 }
 
 } // namespace TestNaniteMeshInstance3D

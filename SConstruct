@@ -479,7 +479,7 @@ env["nanite_bridge"] = ARGUMENTS.get("nanite_bridge", "gdext")
 # `nanite/` rather than `modules/nanite/`. Use an absolute path so that the
 # `modules/SCsub` loop (whose cwd is `modules/`) can locate the SCsub and
 # test headers via the same code path as custom modules.
-modules_detected["nanite"] = Dir("nanite").abspath
+modules_detected["nanite"] = Dir("nanite").abspath.replace("\\", "/")
 
 # Add module options.
 for name, path in modules_detected.items():
