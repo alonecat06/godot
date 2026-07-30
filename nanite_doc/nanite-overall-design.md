@@ -1256,15 +1256,18 @@ NaniteMeshEditor (SubViewportContainer)
 │   ├── DirectionalLight3D × 2 (双光源)
 │   └── Node3D (rotation_node, 鼠标拖拽旋转)
 │       ├── MeshInstance3D (solid_instance, 实体渲染)
-│       ├── MeshInstance3D (wire_instance, 线框叠加)
-│       ├── MeshInstance3D (partition_border_instance, partition边界叠加)
-│       └── MeshInstance3D (dimmed_instance, 选中簇时其余簇半透明)
+│       ├── MeshInstance3D (wire_instance, 白色线框叠加)
+│       ├── MeshInstance3D (partition_border_solid_instance, 黄色实体边界线, depth-test enabled)
+│       ├── MeshInstance3D (partition_border_instance, 黄色虚线边界 overlay, depth-test disabled + stipple shader)
+│       └── MeshInstance3D (dimmed_instance, 选中簇时同 partition sibling 半透明)
 ├── HBoxContainer (ui_bar, UI 工具栏)
 │   ├── OptionButton (display_mode_btn) — List 1
 │   ├── OptionButton (lod_mode_btn)      — List 2
 │   └── SpinBox (force_lod_spinner)      — List 2 子控件
 └── Label (stats_label, 构建统计)
 ```
+
+> Partition border 由两个 instance 配对渲染同一份 `PRIMITIVE_LINES` mesh：`partition_border_solid_instance` 开启 depth-test 显示模型表面的边界线，`partition_border_instance` 关闭 depth-test 并用 stipple shader（checkerboard discard）以虚线形式显示被遮挡的边界，两者叠加保证外轮廓在任何视角下都可见。
 
 **独立渲染约束**（关键设计）：Stage 0 预览渲染**完全独立于 Nanite GPU 管线**——不挂 `CompositorEffect`、不调用 `nanite_cull.glsl` / `nanite_rasterize.glsl` / `nanite_material_resolve.glsl`、也不写 `NaniteServer` 调试状态。所有渲染代码限制在 `nanite/editor/` 模块内，使用 Godot 标准 `MeshInstance3D` + `ArrayMesh` + `StandardMaterial3D` 经由引擎自带 forward 管线绘制。
 
@@ -1279,11 +1282,11 @@ NaniteMeshEditor (SubViewportContainer)
 | Cluster Solid | `CLUSTER_SOLID` | `build_cluster_mesh(force_lod, true)` + per-vertex HSV | 隐藏 |
 | Cluster Solid + Wireframe | `CLUSTER_SOLID_WIREFRAME` | 同上 | `build_cluster_wire_mesh(force_lod)` 白色线框 |
 | Wireframe Only | `WIREFRAME_ONLY` | 隐藏 | `build_cluster_wire_mesh(force_lod)` 白色线框 |
-| Cluster Solid + Partition Border | `CLUSTER_SOLID_WITH_PARTITION_BORDER` | `build_cluster_mesh(force_lod, true)` + per-vertex HSV | `build_partition_border_wire(resource, force_lod)` 黄色线框 (depth-test disabled) |
+| Cluster Solid + Partition Border | `CLUSTER_SOLID_WITH_PARTITION_BORDER` | `build_cluster_mesh(force_lod, true)` + per-vertex HSV | `build_partition_border_wire(resource, force_lod)` 黄色边界线（配对渲染：`partition_border_solid_instance` 实体 + `partition_border_instance` 虚线 overlay） |
 
 > 旧 `DebugMode` 枚举（7 项：NONE / CLUSTER_SOLID_COLOR / LOD_SOLID_COLOR / OVERDRAW_HEATMAP / PAGE_RESIDENCY / HZB_MIP_LEVELS / HZB_OCCLUSION）保留供 Stage 1 GPU pipeline (`nanite_material_resolve.glsl`) 继续使用。
 
-**Partition Border 可视化**：`build_partition_border_wire()` 函数对指定 LOD 的 cluster 执行 `meshopt_partitionClusters(target=4)` 重建分区，统计每个顶点被多少个 cluster 引用（`>=2` = 边界顶点），提取两端均为边界顶点的边，去重后生成黄色 `PRIMITIVE_LINES` 线段。
+**Partition Border 可视化**：`build_partition_border_wire()` 函数对指定 LOD 的 cluster 执行 `meshopt_partitionClusters(target=4)` 重建分区，对每个 partition 合并其内所有 cluster 的三角形，统计每条边（无向，key = `min_v << 32 | max_v`）在 partition 内被多少个三角形引用，**仅保留恰好出现 1 次的边**——即 partition 整体的外轮廓边界（未被同 partition 内其他三角形共享的边）。这与早期"提取被 ≥2 cluster 共享的顶点构成的边"不同：外轮廓描述 partition 与外部的边界，而非 cluster 间的内部接缝。结果生成黄色 `PRIMITIVE_LINES` 线段，由 `partition_border_solid_instance`（depth-test enabled）和 `partition_border_instance`（stipple shader, depth-test disabled）配对渲染。
 
 #### 8.8.3 LOD Mode（2 种）
 
@@ -1313,7 +1316,9 @@ NaniteMeshEditor (SubViewportContainer)
 
 1. 左键点击（非拖拽，移动距离 < 5px）触发 `_ray_pick_cluster()`
 2. CPU 侧射线-三角形相交测试（Möller-Trumbore 算法），遍历当前 LOD 所有 cluster 三角形
-3. 命中时：`solid_instance` 仅渲染选中 cluster，`dimmed_instance` 以半透明灰色（alpha=0.2, `TRANSPARENCY_ALPHA` + `FLAG_DISABLE_DEPTH_TEST`）渲染其余 cluster
+3. 命中时：`solid_instance` 仅渲染选中 cluster；`dimmed_instance` 以半透明白色（`Color(1,1,1,0.75)`, `TRANSPARENCY_ALPHA` + `FLAG_DISABLE_DEPTH_TEST` + `CULL_DISABLED`）渲染"虚化"内容，其构成随 DisplayMode 不同：
+   - `CLUSTER_SOLID` / `CLUSTER_SOLID_WIREFRAME`：虚化当前 LOD 的所有非选中 cluster
+   - `CLUSTER_SOLID_WITH_PARTITION_BORDER`：仅虚化选中 cluster 所在 partition 内的 sibling clusters（通过 `build_partition_sibling_mesh()` 收集同 partition_id 的其他 cluster），其余 partition 不渲染，从而突出"4 簇合并"的分区边界
 4. ESC 键清除选中，切换 LOD/DisplayMode 也清除选中
 
 #### 8.8.6 渲染管线数据流
@@ -1324,11 +1329,18 @@ flowchart LR
     RES["NaniteMeshResource<br/>clusters_data / vertex_data /<br/>meshlet_vertices_data /<br/>meshlet_triangles_data"] --> DECODE
     DECODE -->|"filter group_id == force_lod_level<br/>+ optional per-cluster HSV color"| AM["Ref ArrayMesh triangles<br/>(pos + index + color)"]
     DECODE -->|"p_emit_lines = true<br/>6 verts per triangle"| WM["Ref ArrayMesh PRIMITIVE_LINES<br/>(pos only)"]
+    DECODE -->|"selected_cluster >= 0<br/>+ same-partition siblings"| SM["Ref ArrayMesh<br/>(sibling triangles)"]
     AM --> MI["solid_instance<br/>FLAG_ALBEDO_FROM_VERTEX_COLOR"]
-    WM --> WI["wire_instance / partition_border_instance<br/>SHADING_MODE_UNSHADED"]
+    WM --> WI["wire_instance<br/>SHADING_MODE_UNSHADED (white)"]
+    WM --> PBS["partition_border_solid_instance<br/>SHADING_MODE_UNSHADED + depth-test ON (yellow)"]
+    WM --> PBI["partition_border_instance<br/>stipple ShaderMaterial + depth-test OFF (yellow dashed)"]
+    SM --> DIM["dimmed_instance<br/>TRANSPARENCY_ALPHA white 0.75 + depth-test OFF"]
     SHADOW["shadow_mesh"] -.->|"Normal modes<br/>skip cluster decode"| AM
     MI --> VP["Preview SubViewport<br/>(no Nanite compositor)"]
     WI --> VP
+    PBS --> VP
+    PBI --> VP
+    DIM --> VP
 ```
 
 #### 8.8.7 构建统计
@@ -1358,6 +1370,7 @@ classDiagram
         -SubViewport viewport
         -MeshInstance3D solid_instance
         -MeshInstance3D wire_instance
+        -MeshInstance3D partition_border_solid_instance
         -MeshInstance3D partition_border_instance
         -MeshInstance3D dimmed_instance
         -OptionButton display_mode_btn
