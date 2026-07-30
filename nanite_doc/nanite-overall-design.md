@@ -13,14 +13,13 @@
 5. [核心类设计](#5-核心类设计)
 6. [三阶段实施路径](#6-三阶段实施路径)
 7. [GPU HZB 模块：层次化深度缓冲](#7-gpu-hzb-模块层次化深度缓冲)
-8. [离线构建模块：基于 meshoptimizer 的层次化 Meshlet + BVH](#8-离线构建模块基于-meshoptimizer-的层次化-meshlet-+-bvh)
-9. [编辑器模块：预览界面与调试可视化](#9-编辑器模块预览界面与调试可视化)
-10. [阶段一：GDExtension 桥接](#10-阶段一gdextension-桥接)
-11. [阶段二：Module 桥接](#11-阶段二module-桥接)
-12. [阶段三：Deep 桥接](#12-阶段三deep-桥接)
-13. [关键 API 对照表](#13-关键-api-对照表)
-14. [验证与测试矩阵](#14-验证与测试矩阵)
-15. [与调研文档差异说明](#15-与调研文档差异说明)
+8. [阶段零：离线构建数据与预览](#8-阶段零离线构建数据与预览)
+9. [阶段一：GDExtension 桥接](#9-阶段一gdextension-桥接)
+10. [阶段二：Module 桥接](#10-阶段二module-桥接)
+11. [阶段三：Deep 桥接](#11-阶段三deep-桥接)
+12. [关键 API 对照表](#12-关键-api-对照表)
+13. [验证与测试矩阵](#13-验证与测试矩阵)
+14. [与调研文档差异说明](#14-与调研文档差异说明)
 
 ---
 
@@ -920,7 +919,7 @@ HZB mip 可视化实现：在 Material Eval 阶段，用 fullscreen quad 将各�
 
 ---
 
-## 8. 离线构建模块：基于 meshoptimizer 的层次化 Meshlet + BVH
+## 8. 阶段零：离线构建数据与预览
 
 ### 8.1 为什么用 meshoptimizer
 
@@ -940,579 +939,497 @@ Godot 在 `thirdparty/meshoptimizer/`(版本 1.1)和 `modules/meshoptimizer/` �
 | Provoking vertex 调整 | `meshopt_generateProvokingIndexBuffer` |
 
 但 Godot 的 `modules/meshoptimizer/register_types.cpp` 只把 7 个函数挂到 `SurfaceTool`，完全没暴露 meshlet/BVH/cluster 相关 API。因此：
-- ✅ meshoptimizer 库已链接进引擎，无需重新引入；
-- ✅ 三套方案都可 `#include <thirdparty/meshoptimizer/meshoptimizer.h>` 直接调用；
-- ⚠️ 需在自己的代码里直接调用 meshoptimizer C API，不要通过 `SurfaceTool` 间接触发。
+- meshoptimizer 库已链接进引擎，无需重新引入；
+- 三套方案都可 `#include <thirdparty/meshoptimizer/meshoptimizer.h>` 直接调用；
+- 需在自己的代码里直接调用 meshoptimizer C API，不要通过 `SurfaceTool` 间接触发。
 
 ### 8.2 离线构建管线总览
 
-```
-ArrayMesh / SurfaceTool 顶点数组
-   │
-   ├─ 0. 预处理
-   │     ├─ meshopt_generateVertexRemap           # 合并重复顶点
-   │     ├─ meshopt_optimizeVertexCache            # 顶点 cache 优化
-   │     └─ meshopt_optimizeVertexFetch            # 顶点 fetch 局部性
-   │
-   ├─ 1. 叶子层(L0)聚类
-   │     ├─ meshopt_buildMeshletsFlex(max_vertices=64,
-   │     │     min_triangles=32, max_triangles=128,
-   │     │     cone_weight=0.5, split_factor=0.5)
-   │     └─ for each meshlet:
-   │           meshopt_optimizeMeshletLevel(level=3)
-   │           bounds = meshopt_computeMeshletBounds(...)
-   │           error = 0
-   │
-   ├─ 2. 层次化生成(自底向上) — UE5 Nanite 风格: 4 相邻 cluster 合并 → 分区独立简化
-   │     while cluster_count > 1:
-   │       ├─ meshopt_partitionClusters(target_partition_size=4)
-   │       │     → 将当前层 cluster 按空间邻近性分组, 每组 ~4 个相邻 cluster
-   │       ├─ for each partition (4 个相邻 cluster):
-   │       │     ├─ 合并 partition 内 4 簇的 index + vertex 子集
-   │       │     │     (仅合并该 partition 的局部几何, 不是全局合并)
-   │       │     ├─ 计算 vertex_lock: 标记 partition 边界顶点
-   │       │     │     (边界顶点 = 出现在 >=2 个原始 cluster 中的顶点)
-   │       │     ├─ meshopt_simplifyWithAttributes(target=原/2,
-   │       │     │     target_error=0.5, options=LockBorder+Regularize)
-   │       │     │     → 分区独立简化, 锁住边界顶点保证裂缝消除
-   │       │     ├─ meshopt_buildMeshletsFlex(...) 简化结果再切 2 簇
-   │       │     ├─ parent.error = max(child.error, result_error)
-   │       │     └─ parent.bounds = union(child.bounds)
-   │       └─ 所有 partition 的 parent 节点构成下一层输入
-   │
-   ├─ 3. BVH 装配
-   │     └─ 展开层次结构为线性节点数组(left_child/right_child 用数组下标)
-   │
-   ├─ 4. 辅助数据生成
-   │     ├─ 4.1 Group ID (crack-free 渲染)
-   │     ├─ 4.2 Page ID (按 LOD+空间 locality 排序后切页,默认 64KB/页)
-   │     ├─ 4.3 Material Index
-   │     ├─ 4.4 Cone Axis/Cutoff (背面剔除)
-   │     ├─ 4.5 Provoking reorder (VisBuffer flat 取值)
-   │     ├─ 4.6 顶点量化 (meshopt_encodeFilterExp)
-   │     └─ 4.7 误差归一化 (meshopt_simplifyScale)
-   │
-   ├─ 5. 粗 LOD Shadow Mesh 生成(供 GDExtension 桥接阴影方案使用)
-   │
-   ├─ 6. 序列化
-   │     ├─ meshopt_encodeMeshlet(每簇独立编码)
-   │     ├─ meshopt_encodeVertexBuffer(顶点池)
-   │     └─ 写入 *.nanite 二进制 + .res 元数据
-   │
-   └─ 输出: NaniteMeshResource(可挂到 NaniteMeshInstance3D)
+```mermaid
+flowchart TD
+    Input["Input: ArrayMesh / ImporterMesh / PackedScene / MeshInstance3D"] --> BuildFrom["build_from_resource()<br/>合并多 surface → 单 ArrayMesh"]
+    BuildFrom --> Build["build()"]
+    Build --> Pre["1. preprocess_mesh()<br/>顶点去重 + cache/fetch 优化<br/>(positions + normals + UVs 三路属性流)"]
+    Pre --> Leaf["2. build_leaf_clusters()<br/>meshopt_buildMeshletsFlex<br/>→ L0 cluster 列表 (error=0)"]
+    Leaf --> Hierarchy["3. build_hierarchy()<br/>自底向上: 4相邻簇合并 → 分区独立简化"]
+    Hierarchy --> BVH["4. build_bvh()<br/>层次结构 → 线性 NaniteClusterNode 数组"]
+    BVH --> Shadow["5. build_shadow_mesh()<br/>选取 group_id=shadow_lod_depth 的 cluster<br/>+ 注入 AABB 角点"]
+    Shadow --> Finalize["6. finalize_resource()<br/>PagePacker + 序列化"]
+    Finalize --> Output["Output: NaniteMeshResource"]
+    
+    style Pre fill:#c8e6c9,stroke:#2e7d32
+    style Hierarchy fill:#e3f2fd,stroke:#1565c0
+    style Shadow fill:#fce4ec,stroke:#c62828
 ```
 
-### 8.3 类图
+### 8.3 核心数据结构
 
 ```mermaid
 classDiagram
-    class ArrayMesh {
-        <<Godot built-in>>
-        +surface_get_arrays() PackedArrays
-    }
-    class meshoptimizer {
-        <<C library, thirdparty>>
-        +meshopt_buildMeshletsFlex
-        +meshopt_computeMeshletBounds
-        +meshopt_partitionClusters
-        +meshopt_simplifyWithAttributes
-        +meshopt_optimizeMeshletLevel
-        +meshopt_encodeMeshlet
-        +meshopt_simplifyScale
-    }
-    class NaniteBuilder {
-        -BuilderConfig config
-        +build(Ref~ArrayMesh~)  Ref~NaniteMeshResource~
-        -preprocess_mesh(verts, indices)
-        -build_leaf_clusters(verts, indices)  LocalVector~Cluster~
-        -build_hierarchy(clusters)  BVHTree
-        -simplify_partition(partition)  LocalVector~Cluster~
-        -build_shadow_mesh(...)  Ref~ArrayMesh~
-        -finalize_resource(...)  Ref~NaniteMeshResource~
-    }
     class BuilderConfig {
-        +uint32_t max_vertices = 64
-        +uint32_t min_triangles = 32
-        +uint32_t max_triangles = 128
-        +uint32_t partition_size = 4
-        +float    cone_weight = 0.5
-        +float    split_factor = 0.5
-        +float    simplification_ratio = 0.5
-        +float    target_error = 0.5
-        +uint32_t max_lod_levels = 16
-        +uint32_t page_size_bytes = 65536
-        +bool     lock_partition_border = true
-        +int      meshlet_optimize_level = 3
-        +int      shadow_lod_depth = 3
+        +int max_vertices = 64
+        +int max_triangles = 128
+        +int min_triangles = 32
+        +int partition_size = 4
+        +double cone_weight = 0.5
+        +double split_factor = 0.5
+        +double simplification_ratio = 0.5
+        +double target_error = 0.5
+        +bool lock_partition_border = true
+        +int meshlet_optimize_level = 3
+        +int max_lod_levels = 16
+        +int page_size_bytes = 65536
+        +int shadow_lod_depth = 3
+        +is_valid() bool
     }
     class NaniteCluster {
         +uint32 vertex_offset
         +uint32 triangle_offset
         +uint32 vertex_count
         +uint32 triangle_count
-        +AABB    bounds
-        +Vec3    cone_axis
-        +float   cone_cutoff
-        +float   error
-        +uint32  group_id
-        +uint32  material_index
-        +uint32  page_id
+        +AABB bounds
+        +Vector3 cone_axis
+        +float cone_cutoff
+        +float error
+        +uint32 group_id
+        +uint32 material_index
+        +uint32 page_id
+        +serialize() PackedByteArray
+        +deserialize(PackedByteArray, offset) NaniteCluster
+        +get_serialized_size() size_t
     }
     class NaniteClusterNode {
-        +AABB    bounds
-        +Vec3    cone_axis
-        +float   cone_cutoff
-        +float   error
-        +uint32  left_child
-        +uint32  right_child
-        +uint32  first_cluster
-        +uint32  cluster_count
-        +uint32  page_id
-        +uint32  depth
+        +AABB bounds
+        +Vector3 cone_axis
+        +float cone_cutoff
+        +float error
+        +uint32 left_child
+        +uint32 right_child
+        +uint32 first_cluster
+        +uint32 cluster_count
+        +uint32 page_id
+        +uint32 depth
     }
     class NaniteMeshResource {
         +PackedByteArray vertex_data
-        +PackedByteArray cluster_index_data
         +PackedByteArray clusters_data
         +PackedByteArray nodes_data
         +PackedByteArray page_table_data
+        +PackedByteArray meshlet_vertices_data
+        +PackedByteArray meshlet_triangles_data
+        +PackedByteArray materials_data
         +Ref~ArrayMesh~ shadow_mesh
-        +TypedArray~Material~ materials
-        +build_from_arrays(PackedArrays)
+        +Ref~BuilderConfig~ build_config
+        +int cluster_count
+        +int node_count
+        +int page_count
+        +get_max_lod_level() int
+        +save(String) Error
+        +load(String) Error
+    }
+    class NaniteBuilder {
+        +build(Ref~ArrayMesh~) Ref~NaniteMeshResource~
+        +static build_from_resource(Ref~Resource~) Ref~NaniteMeshResource~
+        -preprocess_mesh(vertices, indices, normals, uvs) bool
+        -build_leaf_clusters() bool
+        -build_hierarchy() bool
+        -build_bvh() bool
+        -build_shadow_mesh() bool
+        -finalize_resource() Ref~NaniteMeshResource~
+        -clone_cluster_for_lod(cluster_idx, new_group_id) uint32_t
+        -BuilderConfig m_cfg
     }
     class PagePacker {
-        +pack(clusters, nodes, config)  PageTable
+        +pack(clusters, config) PageTable
         -sort_by_lod_then_locality(...)
-        -emit_page(clusters_subset)  PageEntry
+    }
+    class NaniteDebug {
+        +enum DisplayMode: NORMAL, NORMAL_WIREFRAME, CLUSTER_SOLID, CLUSTER_SOLID_WIREFRAME, WIREFRAME_ONLY, CLUSTER_SOLID_WITH_PARTITION_BORDER
+        +enum LODMode: NANITE_AUTO, FORCE_LOD_LEVEL
+        +enum DebugMode: NONE, CLUSTER_SOLID_COLOR, LOD_SOLID_COLOR, OVERDRAW_HEATMAP, PAGE_RESIDENCY, HZB_MIP_LEVELS, HZB_OCCLUSION
     }
 
     NaniteBuilder --> BuilderConfig : reads
-    NaniteBuilder --> meshoptimizer : calls
     NaniteBuilder --> NaniteCluster : produces
     NaniteBuilder --> NaniteClusterNode : produces
     NaniteBuilder --> NaniteMeshResource : outputs
-    NaniteBuilder --> PagePacker : delegates page packing
-    NaniteBuilder ..> ArrayMesh : consumes input
+    NaniteBuilder --> PagePacker : delegates
 ```
 
-### 8.4 流程图 — 离线构建主流程
+**NaniteCluster 序列化格式**（固定 68 字节 stride）：
+
+| 偏移 | 字段 | 类型 | 字节 |
+|------|------|------|------|
+| 0 | vertex_offset | uint32 | 4 |
+| 4 | triangle_offset | uint32 | 4 |
+| 8 | vertex_count | uint32 | 4 |
+| 12 | triangle_count | uint32 | 4 |
+| 16 | bounds.position.x/y/z | float3 | 12 |
+| 28 | bounds.size.x/y/z | float3 | 12 |
+| 40 | cone_axis.x/y/z | float3 | 12 |
+| 52 | cone_cutoff | float | 4 |
+| 56 | error | float | 4 |
+| 60 | group_id | uint32 | 4 |
+| 64 | material_index | uint32 | 4 |
+| 68 | (page_id 运行时分配，不序列化) | — | — |
+
+### 8.4 构建算法详解
+
+#### 8.4.1 顶点预处理 (preprocess_mesh)
+
+| 步骤 | 算法 | meshoptimizer API | 作用 |
+|------|------|-------------------|------|
+| 1 | 顶点去重 | `meshopt_generateVertexRemap()` | 基于 positions 合并重复顶点，remap table 同时应用于 positions / normals / UVs 三路属性流 |
+| 2 | 三路属性重映射 | `meshopt_remapVertexBuffer()` (positions + normals + UVs) + `meshopt_remapIndexBuffer()` | 应用 remap table 到所有属性流，缺少 normals/UVs 时填充默认值 (0,1,0) / (0,0) |
+| 3 | 顶点缓存优化 | `meshopt_optimizeVertexCache()` | 重排三角形顺序，使顶点在 GPU 顶点缓存中的命中率最大化（Tom Forsyth 算法） |
+| 4 | 顶点预取优化 | `meshopt_optimizeVertexFetchRemap()` | 生成 fetch remap table，同时应用于三路属性流，重排顶点 buffer 使内存访问局部性最大化 |
+
+顶点数据最终以 32B stride 存储：`pos.xyz (3f) + normal.xyz (3f) + uv.xy (2f) = 8 floats`。
+
+#### 8.4.2 叶子层聚类 (build_leaf_clusters)
+
+| 步骤 | 算法 | 关键参数 |
+|------|------|---------|
+| 1 | Meshlet 构建 | `meshopt_buildMeshletsFlex(max_v=64, min_t=32, max_t=128, cone=0.5, split=0.5)` |
+| 2 | Meshlet 内部优化 | `meshopt_optimizeMeshletLevel(level=3)` |
+| 3 | 包围盒计算 | `meshopt_computeMeshletBounds()` → bounds + cone_axis + cone_cutoff |
+
+叶子 cluster 属性：`error=0`（L0 无简化误差）、`group_id=0`。
+
+**退化法线锥防御**：当 `meshopt_computeMeshletBounds` 返回退化 `cone_axis=(0,0,0)` 时（常见于简化后具有相消法线的父 meshlet），builder 指定备用单位轴 `Vector3(0,1,0)` 并设 `cone_cutoff=-1.0f`（全球面锥，表示无法安全背面剔除）。
+
+#### 8.4.3 层次化简化 (build_hierarchy)
+
+采用 UE5 Nanite 风格的"4相邻簇合并 → 分区独立简化"算法：
 
 ```mermaid
 flowchart TD
-    Start([Input: ArrayMesh]) --> Pre[0. 预处理]
-    Pre --> Pre1[meshopt_generateVertexRemap]
-    Pre1 --> Pre2[meshopt_optimizeVertexCache]
-    Pre2 --> Pre3[meshopt_optimizeVertexFetch]
-    Pre3 --> L0[1. 叶子层 L0 聚类]
-
-    L0 --> L0a[meshopt_buildMeshletsFlex<br/>max_vertices=64<br/>max_triangles=128<br/>cone_weight=0.5]
-    L0a --> L0b[for each meshlet:<br/>meshopt_optimizeMeshletLevel L3]
-    L0b --> L0c[for each meshlet:<br/>meshopt_computeMeshletBounds<br/>→ bounds + cone]
-    L0c --> L0d[L0 簇列表, error=0]
-
-    L0d --> Loop{cluster_count > 1?}
-    Loop -- Yes --> Part[2a. meshopt_partitionClusters<br/>target_partition_size=4<br/>将当前层 cluster 按空间邻近性分组<br/>每组 ~4 个相邻 cluster]
-    Part --> ForEach[2b. for each partition]
-    ForEach --> Merge[2c. 合并 partition 内 4 簇<br/>index + vertex 子集<br/>仅合并该 partition 局部几何]
-    Merge --> Lock[2d. 计算 vertex_lock<br/>标记 partition 边界顶点<br/>边界顶点 = 出现在 >=2 个原始 cluster 中的顶点]
-    Lock --> Simp[2e. meshopt_simplifyWithAttributes<br/>target=原/2, target_error=0.5<br/>options=LockBorder+Regularize<br/>分区独立简化, 锁住边界保证裂缝消除]
-    Simp --> Recluster[2f. meshopt_buildMeshletsFlex<br/>简化结果再切 2 簇]
-    Recluster --> Bounds2[2g. parent.error = max child error<br/>parent.bounds = union]
-    Bounds2 --> Append[2h. tree.append parent]
-    Append --> NextPart{还有 partition?}
-    NextPart -- Yes --> ForEach
-    NextPart -- No --> Loop
-
-    Loop -- No --> BVH[3. BVH 装配<br/>展开层次 → 线性 node 数组]
-    BVH --> Aux[4. 辅助数据生成]
-    Aux --> Shadow[5. 粗 LOD Shadow Mesh 生成]
-    Shadow --> Ser[6. 序列化]
-    Ser --> Out([Output: NaniteMeshResource])
-
-    style L0 fill:#c8e6c9,stroke:#2e7d32
-    style Part fill:#e3f2fd,stroke:#1565c0
-    style Simp fill:#fff3e0,stroke:#e65100
-    style Shadow fill:#fce4ec,stroke:#c62828
+    Start["当前层 cluster 列表"] --> Check{cluster_count > 1<br/>and lod < max_lod?}
+    Check -- "是" --> Part["meshopt_partitionClusters<br/>target=4 (空间相邻聚类)"]
+    Part --> Loop["对每个 partition (~4 相邻簇)"]
+    Loop --> Merge["局部合并 partition 的 index + vertex 子集<br/>(非全局合并)"]
+    Merge --> Lock["计算 vertex_lock<br/>跨簇共享顶点 (>=2簇) = 边界顶点"]
+    Lock --> Simplify["meshopt_simplifyWithAttributes<br/>target=50%, LockBorder+Regularize<br/>vertex_lock 锁定边界顶点"]
+    Simplify --> Bailout{简化结果 < min_triangles?}
+    Bailout -- "是" --> Clone["clone_cluster_for_lod()<br/>克隆原 cluster 到新 LOD<br/>(仅修改 group_id)"]
+    Bailout -- "否" --> Recluster["meshopt_buildMeshletsFlex<br/>简化结果重聚类"]
+    Clone --> Parent["parent.error = max(child.errors, result_error)<br/>parent.bounds = union(child.bounds)<br/>parent.group_id = current_lod + 1"]
+    Recluster --> Parent
+    Parent --> NextPart{还有 partition?}
+    NextPart -- "是" --> Loop
+    NextPart -- "否" --> Check
+    Check -- "否" --> Done["层次化完成"]
+    
+    style Simplify fill:#fff3e0,stroke:#e65100
+    style Clone fill:#fce4ec,stroke:#c62828
 ```
 
-### 8.5 时序图 — 层次化构建(单个 mesh)
+**关键设计要点**：
+
+- **局部合并 vs 全局合并**：每个 partition 独立合并其内 cluster 的 vertex + index 子集，不做全局合并。这保留了空间局部性，对后续 GPU culling 和 streaming 友好。
+- **vertex_lock 边界检测**：统计每个顶点被 partition 内多少个原始 cluster 引用，`>=2` 的顶点标记为边界顶点（vertex_lock）。
+- **LockBorder + Regularize 双重锁定**：`meshopt_simplifyWithAttributes` 的 `options` 参数锁定 mesh 边界，`vertex_lock` 参数锁定 partition 间共享边界，保证 crack-free LOD 过渡。
+- **clone_cluster_for_lod**：当 partition 只有 1 个 cluster，或简化结果过少时，原 cluster 被克隆到新 LOD 层级（仅修改 `group_id`，共享同一 meshlet 数据），避免数据丢失。
+
+#### 8.4.4 BVH 装配 (build_bvh)
+
+| 步骤 | 方法 | 说明 |
+|------|------|------|
+| 1 | `linearize_bvh_recursive()` | 递归遍历 hierarchy tree，将每个 MERGE 节点及其子节点展平为线性 `NaniteClusterNode` 数组 |
+| 2 | `build_binary_chain()` | 将 MERGE 节点的多个源子节点链转为二叉树（二分叉），每个节点最多两个子节点 |
+
+叶子节点 `left_child = right_child = UINT32_MAX`，`first_cluster` 与 `cluster_count` 指向 `clusters` 数组。
+
+#### 8.4.5 粗 LOD Shadow Mesh (build_shadow_mesh)
+
+从所有 cluster 中选取 `group_id` 等于 `shadow_lod_depth`（或最接近的不超过该值的 LOD）的 cluster，解码其三角形并合并为一个 `ArrayMesh`。
+
+**AABB 角点注入**：将原始 mesh 的 AABB 8 个角点作为额外顶点追加到 `vertices` 数组（不参与 `indices`），确保 shadow mesh 的 AABB 完整覆盖原始 mesh。这修复了仅选取单个 LOD 层 cluster 时 X 轴负方向覆盖不足的问题。
+
+#### 8.4.6 Page 划分 (PagePacker)
+
+| 步骤 | 说明 |
+|------|------|
+| 1 | 按 LOD 层级（`group_id`）+ 空间局部性（Morton 码 3D）排序所有 cluster |
+| 2 | 按 `config.page_size_bytes`（默认 64KB）切分为 Page |
+| 3 | 每个 cluster 分配 `page_id`，输出 `PageTable` |
+
+### 8.5 序列化与导出数据格式
+
+#### 8.5.1 NaniteMeshResource 数据字段
+
+| 数据 | 格式 | 说明 |
+|------|------|------|
+| `vertex_data` | `PackedByteArray` | 原始顶点池，stride 32B (pos.xyz + normal.xyz + uv.xy = 8 floats) |
+| `clusters_data` | `PackedByteArray` | `NaniteCluster` 序列化二进制，固定 68B stride |
+| `nodes_data` | `PackedByteArray` | `NaniteClusterNode` 序列化二进制，固定 stride |
+| `page_table_data` | `PackedByteArray` | `PageTable` 序列化二进制 |
+| `meshlet_vertices_data` | `PackedByteArray` | `uint32[]` 全局顶点索引池，cluster 的 `vertex_offset/vertex_count` 索引此数组 |
+| `meshlet_triangles_data` | `PackedByteArray` | `uint8[]` 微索引池，cluster 的 `triangle_offset`（字节偏移）指向此数组，每个三角形 3 字节 |
+| `materials_data` | `PackedByteArray` | 材质数据，32B per material (vec4 base_color + vec4 metallic_roughness_pad) |
+| `shadow_mesh` | `Ref<ArrayMesh>` | 粗 LOD 阴影 mesh |
+| `build_config` | `Ref<BuilderConfig>` | 构建参数回溯 |
+
+#### 8.5.2 两种序列化路径
+
+**路径 A：Godot 原生**（`.tres` / `.res`）
+- 所有 `PackedByteArray` 字段通过 `GDPROPERTY` 绑定，`ResourceSaver` / `ResourceLoader` 自动序列化
+- `shadow_mesh` 和 `build_config` 作为 `Ref<>` 子资源一并保存
+
+**路径 B：自定义 `.nanite` 二进制格式**
+
+```
+char[4]   magic = "NANM"
+uint32    version = 3
+uint32    vertex_data_size, then vertex_data bytes       (raw stride 32 B)
+uint32    clusters_data_size, then clusters_data bytes    (68 B per cluster)
+uint32    nodes_data_size, then nodes_data bytes
+uint32    page_table_data_size, then page_table_data bytes
+uint32    materials_data_size, then materials_data bytes   (v2+)
+uint32    meshlet_vertices_data_size, then bytes            (v3+)
+uint32    meshlet_triangles_data_size, then bytes           (v3+)
+uint32    cluster_count, node_count, page_count (trailer)
+```
+
+> `build_config` 和 `shadow_mesh` 不包含在 `.nanite` 文件中（Godot 侧元数据，如需可从源 mesh 重新构建）。
+
+**版本历史**：
+- v1：原始格式（NaniteCluster 64B，无 materials，meshopt 压缩 vertex_data，meshlet 数据交织在 clusters_data 中）
+- v2：NaniteCluster 68B（新增 material_index）；新增 materials_data blob
+- v3：meshlet 顶点/索引数据从 clusters_data 分离到独立的 `meshlet_vertices_data` + `meshlet_triangles_data`；`vertex_data` 改为原始格式（不再 meshopt 压缩）
+
+### 8.6 构建参数与可调性
+
+| 参数 | 类型 | 默认值 | 影响 |
+|---|---|---|---|
+| `max_vertices` | int | 64 | 兼容 mesh shader；过大撑爆寄存器 |
+| `max_triangles` | int | 128 | Nanite 标准；256 增大 dispatch |
+| `min_triangles` | int | 32 | 尾簇允许低于此值 |
+| `cone_weight` | double | 0.5 | 0=不顾法线锥，1=强约束 |
+| `partition_size` | int | 4 | 4→1 标准；8→1 简化更激进 |
+| `simplification_ratio` | double | 0.5 | 每层简化到一半 |
+| `target_error` | double | 0.5 | 相对误差上限 |
+| `lock_partition_border` | bool | true | 锁边防 crack |
+| `meshlet_optimize_level` | int | 3 | 0=最快，3=平衡，9=最慢 |
+| `max_lod_levels` | int | 16 | 最大 LOD 层级数 |
+| `page_size_bytes` | int | 65536 | 64KB/页 |
+| `shadow_lod_depth` | int | 3 | 粗 LOD 取哪个 group_id |
+
+`is_valid()` 校验：`max_vertices >= 32`、`max_triangles >= 32`、`partition_size >= 2`、`page_size_bytes >= 4096`、`shadow_lod_depth >= 1`。
+
+### 8.7 资源转换入口
+
+#### 8.7.1 build_from_resource 接口
+
+`NaniteBuilder::build_from_resource(Ref<Resource>)` 静态方法接受多种输入类型：
+
+| 输入类型 | 处理方式 |
+|---------|---------|
+| `ArrayMesh` | 直接提取 surface 数组 |
+| `ImporterMesh` | gltf/glb 导入产物，调用 `get_mesh()` 转 ArrayMesh |
+| `PackedScene` | 递归遍历场景树所有 `MeshInstance3D`，合并 mesh surface |
+| `MeshInstance3D` | 取 `mesh` 属性，按 ArrayMesh/ImporterMesh 路径处理 |
+
+内部合并所有 surface 到单个 vertex/index 池（按顶点偏移调整 index），然后调用 `build()` 走完整管线。
+
+#### 8.7.2 编辑器入口
+
+| 入口 | 触发方式 | 实现类 |
+|------|---------|--------|
+| FileSystem 右键菜单 | 选中 .gltf/.glb/.fbx/.obj/.tres 右键 → "Convert to Nanite..." | `NaniteConversionContextMenu : EditorContextMenuPlugin` |
+| Inspector 按钮 | 选中 `ArrayMesh` 资源或 `MeshInstance3D` 节点 → Inspector 顶部 "Convert to Nanite..." 按钮 | `EditorInspectorPluginNanite::parse_begin()` |
+
+两个入口共享同一流程：弹 `EditorFileDialog` (save, `*.nanite.tres`) → 调 `build_from_resource()` → `ResourceSaver::save()` → EditorLog 输出统计。
+
+**不接入自动导入的原因**：大模型构建 100K tri 耗时约 190ms，频繁重导入会卡 UI。手动触发让用户明确控制何时构建。
+
+### 8.8 预览界面设计
+
+#### 8.8.1 预览面板结构
+
+`NaniteMeshEditor` 继承 `SubViewportContainer`，采用**二维正交下拉列表**设计：
+
+```
+NaniteMeshEditor (SubViewportContainer)
+├── SubViewport (独立 World3D)
+│   ├── Camera3D (透视相机, 可缩放/平移/聚焦)
+│   ├── DirectionalLight3D × 2 (双光源)
+│   └── Node3D (rotation_node, 鼠标拖拽旋转)
+│       ├── MeshInstance3D (solid_instance, 实体渲染)
+│       ├── MeshInstance3D (wire_instance, 线框叠加)
+│       ├── MeshInstance3D (partition_border_instance, partition边界叠加)
+│       └── MeshInstance3D (dimmed_instance, 选中簇时其余簇半透明)
+├── HBoxContainer (ui_bar, UI 工具栏)
+│   ├── OptionButton (display_mode_btn) — List 1
+│   ├── OptionButton (lod_mode_btn)      — List 2
+│   └── SpinBox (force_lod_spinner)      — List 2 子控件
+└── Label (stats_label, 构建统计)
+```
+
+**独立渲染约束**（关键设计）：Stage 0 预览渲染**完全独立于 Nanite GPU 管线**——不挂 `CompositorEffect`、不调用 `nanite_cull.glsl` / `nanite_rasterize.glsl` / `nanite_material_resolve.glsl`、也不写 `NaniteServer` 调试状态。所有渲染代码限制在 `nanite/editor/` 模块内，使用 Godot 标准 `MeshInstance3D` + `ArrayMesh` + `StandardMaterial3D` 经由引擎自带 forward 管线绘制。
+
+#### 8.8.2 Display Mode（6 种）
+
+来自 `NaniteDebug::DisplayMode` 枚举：
+
+| 模式 | 枚举值 | solid_instance | wire_instance / partition_border_instance |
+|------|--------|---------------|------------------------------------------|
+| Normal | `NORMAL` | shadow_mesh + Lambert | 隐藏 |
+| Normal + Wireframe | `NORMAL_WIREFRAME` | shadow_mesh + Lambert | `build_wire_from_array_mesh(shadow_mesh)` 白色线框 |
+| Cluster Solid | `CLUSTER_SOLID` | `build_cluster_mesh(force_lod, true)` + per-vertex HSV | 隐藏 |
+| Cluster Solid + Wireframe | `CLUSTER_SOLID_WIREFRAME` | 同上 | `build_cluster_wire_mesh(force_lod)` 白色线框 |
+| Wireframe Only | `WIREFRAME_ONLY` | 隐藏 | `build_cluster_wire_mesh(force_lod)` 白色线框 |
+| Cluster Solid + Partition Border | `CLUSTER_SOLID_WITH_PARTITION_BORDER` | `build_cluster_mesh(force_lod, true)` + per-vertex HSV | `build_partition_border_wire(resource, force_lod)` 黄色线框 (depth-test disabled) |
+
+> 旧 `DebugMode` 枚举（7 项：NONE / CLUSTER_SOLID_COLOR / LOD_SOLID_COLOR / OVERDRAW_HEATMAP / PAGE_RESIDENCY / HZB_MIP_LEVELS / HZB_OCCLUSION）保留供 Stage 1 GPU pipeline (`nanite_material_resolve.glsl`) 继续使用。
+
+**Partition Border 可视化**：`build_partition_border_wire()` 函数对指定 LOD 的 cluster 执行 `meshopt_partitionClusters(target=4)` 重建分区，统计每个顶点被多少个 cluster 引用（`>=2` = 边界顶点），提取两端均为边界顶点的边，去重后生成黄色 `PRIMITIVE_LINES` 线段。
+
+#### 8.8.3 LOD Mode（2 种）
+
+来自 `NaniteDebug::LODMode` 枚举：
+
+| 模式 | 枚举值 | 行为 |
+|------|--------|------|
+| Nanite (auto cull + LOD) | `NANITE_AUTO` | Stage 1 的 GPU Nanite 管线自动 LOD 选择。Stage 0 选择此项弹 `WARN_PRINT` 并 fallback 到 Force LOD Level 0 |
+| Force LOD Level | `FORCE_LOD_LEVEL` | CPU 侧解码指定 `group_id` 的 cluster，通过 `SpinBox` 选择 LOD 层级（0=最精细，n=最粗糙）。Stage 0 默认此项 |
+
+`SpinBox` 范围 `0..max_lod_level`，由 `NaniteMeshResource::get_max_lod_level()` 扫描 `clusters_data`（68B stride）返回最大 `group_id` 得到。
+
+#### 8.8.4 相机控制
+
+| 操作 | 输入 | 实现 |
+|------|------|------|
+| 旋转 | 左键拖拽（无 Shift） | 修改 `rot_x/rot_y`，更新 `rotation_node` 变换 |
+| 缩放 | 鼠标滚轮 | `camera_distance *= 0.9`（UP）/ `* 1.1`（DOWN），最小 0.01，调用 `_update_camera_transform()` |
+| 平移 | 中键拖拽 / Shift+左键拖拽 | 修改 `pan_offset`，速度 = `camera_distance * 0.002`，调用 `_update_camera_transform()` |
+| 聚焦 | F 键 | `_focus_on_model()` — 根据 shadow_mesh AABB 长度设置 `camera_distance = aabb.size.length() * 1.2`，重置 `pan_offset = (0,0)`、`rot_x = -15°`、`rot_y = 30°` |
+
+`_update_camera_transform()` 计算相机位置：`Transform3D.origin = Vector3(pan_offset.x, pan_offset.y, camera_distance)`，相机朝向 `(0,0,0)`。
+
+#### 8.8.5 Cluster 选中与虚化
+
+在 `CLUSTER_SOLID` / `CLUSTER_SOLID_WIREFRAME` / `CLUSTER_SOLID_WITH_PARTITION_BORDER` 模式下：
+
+1. 左键点击（非拖拽，移动距离 < 5px）触发 `_ray_pick_cluster()`
+2. CPU 侧射线-三角形相交测试（Möller-Trumbore 算法），遍历当前 LOD 所有 cluster 三角形
+3. 命中时：`solid_instance` 仅渲染选中 cluster，`dimmed_instance` 以半透明灰色（alpha=0.2, `TRANSPARENCY_ALPHA` + `FLAG_DISABLE_DEPTH_TEST`）渲染其余 cluster
+4. ESC 键清除选中，切换 LOD/DisplayMode 也清除选中
+
+#### 8.8.6 渲染管线数据流
 
 ```mermaid
-sequenceDiagram
-    participant ST as ArrayMesh
-    participant B as NaniteBuilder
-    participant MO as meshoptimizer
-    participant PP as PagePacker
-    participant R as NaniteMeshResource
-
-    ST->>B: build(mesh)
-    B->>B: extract vertex/index arrays
-    B->>MO: meshopt_generateVertexRemap(...)
-    B->>MO: meshopt_optimizeVertexCache(...)
-    B->>MO: meshopt_buildMeshletsFlex(max_v=64, max_t=128, cone=0.5)
-    MO-->>B: meshlets_l0[], vertices[], triangles[]
-    B->>MO: meshopt_optimizeMeshletLevel(level=3) per meshlet
-    B->>MO: meshopt_computeMeshletBounds per meshlet
-    MO-->>B: bounds (sphere + cone)
-    Note over B: L0 完成, error=0
-
-    loop hierarchy levels
-        B->>MO: meshopt_partitionClusters(target=4)
-        MO-->>B: partition_id[] per cluster
-        loop each partition (~4 adjacent clusters)
-            B->>B: merge partition's 4 clusters' vertex/index subsets
-            B->>B: compute vertex_lock (border vertices shared by >=2 clusters)
-            B->>MO: meshopt_simplifyWithAttributes(target=原/2,<br/>options=LockBorder+Regularize)
-            MO-->>B: simplified_indices, result_error
-            B->>MO: meshopt_buildMeshletsFlex(simplified, ...)
-            B->>MO: meshopt_computeMeshletBounds per child
-            B->>B: parent.error = max(child.error, result_error)
-        end
-    end
-
-    B->>B: linearize hierarchy to node array
-    B->>MO: meshopt_generateProvokingIndexBuffer per cluster
-    B->>MO: meshopt_simplifyScale(verts)  # 误差归一化
-    B->>PP: pack(clusters, nodes, config)
-    PP-->>B: page_table
-    B->>B: build_shadow_mesh(clusters, nodes, verts, config.shadow_lod_depth)
-    B->>MO: meshopt_encodeMeshlet per cluster
-    B->>MO: meshopt_encodeVertexBuffer(vertex_pool)
-    B->>R: populate resource fields + shadow_mesh
-    B-->>ST: Ref~NaniteMeshResource~
+flowchart LR
+    UI["NaniteMeshEditor<br/>display_mode_btn + lod_mode_btn + force_lod_spinner"] --> DECODE["CPU-side cluster decoder<br/>(anonymous namespace)"]
+    RES["NaniteMeshResource<br/>clusters_data / vertex_data /<br/>meshlet_vertices_data /<br/>meshlet_triangles_data"] --> DECODE
+    DECODE -->|"filter group_id == force_lod_level<br/>+ optional per-cluster HSV color"| AM["Ref ArrayMesh triangles<br/>(pos + index + color)"]
+    DECODE -->|"p_emit_lines = true<br/>6 verts per triangle"| WM["Ref ArrayMesh PRIMITIVE_LINES<br/>(pos only)"]
+    AM --> MI["solid_instance<br/>FLAG_ALBEDO_FROM_VERTEX_COLOR"]
+    WM --> WI["wire_instance / partition_border_instance<br/>SHADING_MODE_UNSHADED"]
+    SHADOW["shadow_mesh"] -.->|"Normal modes<br/>skip cluster decode"| AM
+    MI --> VP["Preview SubViewport<br/>(no Nanite compositor)"]
+    WI --> VP
 ```
 
-### 8.6 关键代码骨架
+#### 8.8.7 构建统计
 
-#### 8.6.1 预处理 + 叶子层聚类
+| 显示字段 | 来源 |
+|---------|------|
+| Clusters / Nodes / Pages | `NaniteMeshResource::cluster_count` / `node_count` / `page_count` |
+| Shadow mesh tris | `shadow_mesh->surface_get_array_index_len()` / 3 |
+| Est. GPU | `(vertex_data + clusters_data + nodes_data + page_table_data) / (1024*1024)` |
+| Max LOD Level | `NaniteMeshResource::get_max_lod_level()` |
 
-```cpp
-// nanite/offline/nanite_builder.cpp
-#include <thirdparty/meshoptimizer/meshoptimizer.h>
+### 8.9 编辑器集成
 
-Ref<NaniteMeshResource> NaniteBuilder::build(const Ref<ArrayMesh> &p_mesh) {
-    ERR_FAIL_COND_V(p_mesh.is_null() || p_mesh->get_surface_count() == 0, {});
+#### 8.9.1 类图
 
-    // ===== 0. 预处理 =====
-    Array arrays = p_mesh->surface_get_arrays(0);
-    PackedVector3Array positions = arrays[Mesh::ARRAY_VERTEX];
-    PackedInt32Array    indices32 = arrays[Mesh::ARRAY_INDEX];
-
-    // 重新打包 Vector3(16B stride) → 紧凑 float3(12B)
-    LocalVector<float> verts_pos;
-    verts_pos.resize(positions.size() * 3);
-    for (int i = 0; i < positions.size(); i++) {
-        verts_pos[i * 3 + 0] = positions[i].x;
-        verts_pos[i * 3 + 1] = positions[i].y;
-        verts_pos[i * 3 + 2] = positions[i].z;
+```mermaid
+classDiagram
+    class NaniteMeshEditor {
+        +edit(Ref~NaniteMeshResource~) void
+        -_rebuild_preview() void
+        -_update_camera_transform() void
+        -_focus_on_model() void
+        -_ray_pick_cluster(Vector2) int
+        -_on_display_mode_selected(int) void
+        -_on_lod_mode_selected(int) void
+        -_on_force_lod_changed(double) void
+        -SubViewport viewport
+        -MeshInstance3D solid_instance
+        -MeshInstance3D wire_instance
+        -MeshInstance3D partition_border_instance
+        -MeshInstance3D dimmed_instance
+        -OptionButton display_mode_btn
+        -OptionButton lod_mode_btn
+        -SpinBox force_lod_spinner
+        -Label stats_label
+        -HBoxContainer ui_bar
+        -float camera_distance
+        -Vector2 pan_offset
+        -int selected_cluster_index
+    }
+    class NaniteMeshResourceEditorWindow {
+        +edit(Ref~NaniteMeshResource~) void
+        -NaniteMeshEditor viewer
+    }
+    class EditorInspectorPluginNanite {
+        +can_handle(Object) bool
+        +parse_begin(Object) void
+    }
+    class NaniteEditorPlugin {
+        +handles(Object) bool
+        +edit(Object) void
+        +make_visible(bool) void
+        -NaniteMeshResourceEditorWindow viewer_window
+    }
+    class NaniteConversionContextMenu {
+        +get_options(Vector String) void
+        -_on_convert_callback(Variant) void
+    }
+    class NaniteResourcePreviewGenerator {
+        +handles(String) bool
+        +generate(Ref Resource, Size2, Dictionary) Ref Texture2D
     }
 
-    // 0a. 顶点 remap(合并重复)
-    LocalVector<unsigned int> remap;
-    remap.resize(positions.size());
-    size_t unique_count = meshopt_generateVertexRemap(
-        remap.ptr(), reinterpret_cast<const unsigned int *>(indices32.ptr()),
-        indices32.size(), verts_pos.ptr(), positions.size(), sizeof(float) * 3);
-
-    // 0b. 应用 remap → 紧凑 vertex/index buffer
-    LocalVector<float> compact_verts;
-    compact_verts.resize(unique_count * 3);
-    meshopt_remapVertexBuffer(compact_verts.ptr(), verts_pos.ptr(),
-                              positions.size(), sizeof(float) * 3, remap.ptr());
-    LocalVector<unsigned int> compact_indices;
-    compact_indices.resize(indices32.size());
-    meshopt_remapIndexBuffer(compact_indices.ptr(),
-        reinterpret_cast<const unsigned int *>(indices32.ptr()),
-        indices32.size(), remap.ptr());
-
-    // 0c. 顶点 cache + fetch 优化
-    LocalVector<unsigned int> opt_indices;
-    opt_indices.resize(compact_indices.size());
-    meshopt_optimizeVertexCache(opt_indices.ptr(), compact_indices.ptr(),
-                                compact_indices.size(), unique_count);
-
-    // ===== 1. 叶子层 L0 聚类 =====
-    size_t meshlet_bound = meshopt_buildMeshletsBound(
-        opt_indices.size(), config.max_vertices, config.min_triangles);
-
-    LocalVector<meshopt_Meshlet> meshlets;
-    meshlets.resize(meshlet_bound);
-    LocalVector<unsigned int> meshlet_vertices;
-    meshlet_vertices.resize(meshlet_bound * config.max_vertices);
-    LocalVector<unsigned char> meshlet_triangles;
-    meshlet_triangles.resize(meshlet_bound * config.max_triangles * 3);
-
-    size_t meshlet_count = meshopt_buildMeshletsFlex(
-        meshlets.ptr(), meshlet_vertices.ptr(), meshlet_triangles.ptr(),
-        opt_indices.ptr(), opt_indices.size(),
-        compact_verts.ptr(), unique_count, sizeof(float) * 3,
-        config.max_vertices, config.min_triangles, config.max_triangles,
-        config.cone_weight, config.split_factor);
-
-    // 每簇内部 reorder + bounds + error=0
-    LocalVector<NaniteCluster> l0_clusters;
-    l0_clusters.resize(meshlet_count);
-    for (size_t i = 0; i < meshlet_count; i++) {
-        meshopt_Meshlet &m = meshlets[i];
-        meshopt_optimizeMeshletLevel(
-            meshlet_vertices.ptr() + m.vertex_offset, m.vertex_count,
-            meshlet_triangles.ptr() + m.triangle_offset, m.triangle_count,
-            config.meshlet_optimize_level);
-
-        meshopt_Bounds b = meshopt_computeMeshletBounds(
-            meshlet_vertices.ptr() + m.vertex_offset,
-            meshlet_triangles.ptr() + m.triangle_offset, m.triangle_count,
-            compact_verts.ptr(), unique_count, sizeof(float) * 3);
-
-        NaniteCluster &c = l0_clusters[i];
-        c.vertex_offset    = m.vertex_offset;
-        c.triangle_offset  = m.triangle_offset;
-        c.vertex_count     = m.vertex_count;
-        c.triangle_count   = m.triangle_count;
-        c.bounds           = AABB(Vector3(b.center[0]-b.radius, b.center[1]-b.radius, b.center[2]-b.radius),
-                                   Vector3(b.radius*2, b.radius*2, b.radius*2));
-        c.cone_axis        = Vector3(b.cone_axis[0], b.cone_axis[1], b.cone_axis[2]);
-        c.cone_cutoff      = b.cone_cutoff;
-        c.error            = 0.0f;
-    }
-
-    // ===== 2. 层次化构建 =====
-    LocalVector<NaniteClusterNode> nodes;
-    build_hierarchy(l0_clusters, compact_verts, unique_count, nodes);
-
-    // ===== 3-6. BVH 装配 + 辅助数据 + Shadow Mesh + 序列化 =====
-    return finalize_resource(l0_clusters, nodes, compact_verts,
-                              meshlet_vertices, meshlet_triangles, p_mesh);
-}
+    SubViewportContainer <|-- NaniteMeshEditor
+    AcceptDialog <|-- NaniteMeshResourceEditorWindow
+    EditorInspectorPlugin <|-- EditorInspectorPluginNanite
+    EditorPlugin <|-- NaniteEditorPlugin
+    EditorContextMenuPlugin <|-- NaniteConversionContextMenu
+    EditorResourcePreviewGenerator <|-- NaniteResourcePreviewGenerator
+    NaniteEditorPlugin --> EditorInspectorPluginNanite : registers
+    NaniteEditorPlugin --> NaniteConversionContextMenu : registers
+    NaniteEditorPlugin --> NaniteResourcePreviewGenerator : registers
+    NaniteEditorPlugin --> NaniteMeshResourceEditorWindow : creates
+    NaniteMeshResourceEditorWindow --> NaniteMeshEditor : hosts
+    EditorInspectorPluginNanite --> NaniteBuilder : calls build_from_resource
+    NaniteConversionContextMenu --> NaniteBuilder : calls build_from_resource
 ```
 
-#### 8.6.2 层次化构建(自底向上)
+#### 8.9.2 Inspector Convert 按钮
 
-```cpp
-void NaniteBuilder::build_hierarchy(LocalVector<NaniteCluster> &p_clusters,
-                                      const LocalVector<float> &p_verts,
-                                      size_t p_vertex_count,
-                                      LocalVector<NaniteClusterNode> &r_nodes) {
-    LocalVector<NaniteCluster> current_level = p_clusters;
-    LocalVector<NaniteCluster> next_level;
-    uint32_t depth = 0;
+`EditorInspectorPluginNanite::can_handle()` 仅对 `ArrayMesh` 资源和 `MeshInstance3D` 节点返回 `true`（**不**处理 `NaniteMeshResource`）。`parse_begin()` 在 Inspector 顶部添加 "Convert to Nanite" 按钮，点击后弹保存对话框 → 调 `build_from_resource()` → `ResourceSaver::save()`。
 
-    while (current_level.size() > 1) {
-        depth++;
-        next_level.clear();
+#### 8.9.3 独立预览窗口
 
-        // 2a. meshopt_partitionClusters 把簇按 4 个一组分组
-        // (构造 cluster_indices + cluster_index_counts 后调用)
-        LocalVector<unsigned int> partition_ids;
-        partition_ids.resize(current_level.size());
-        size_t partition_count = meshopt_partitionClusters(
-            partition_ids.ptr(),
-            cluster_indices.ptr(), cluster_indices.size(),
-            cluster_index_counts.ptr(), current_level.size(),
-            p_verts.ptr(), p_vertex_count, sizeof(float) * 3,
-            config.partition_size);
+`NaniteMeshResourceEditorWindow`（继承 `AcceptDialog`）在双击 `.nanite.tres` 时弹出：
 
-        // 2b. 对每个 partition:合并 → 简化 → 再聚类
-        LocalVector<LocalVector<uint32_t>> partitions;
-        partitions.resize(partition_count);
-        for (size_t i = 0; i < current_level.size(); i++) {
-            partitions[partition_ids[i]].push_back(i);
-        }
-
-        for (const auto &p_cluster_idxs : partitions) {
-            if (p_cluster_idxs.size() < 2) {
-                for (uint32_t cid : p_cluster_idxs) {
-                    next_level.push_back(current_level[cid]);
-                }
-                continue;
-            }
-
-            // 合并 partition → 临时 index buffer
-            LocalVector<unsigned int> merged_indices;
-            // ... (合并簇三角形)
-
-            // 2c. 计算 vertex_lock:锁住跨 partition 共享的顶点
-            LocalVector<unsigned char> vertex_lock;
-            vertex_lock.resize(p_vertex_count);
-            compute_partition_vertex_locks(...);
-
-            // 2d. meshopt_simplifyWithAttributes
-            float result_error = 0.0f;
-            size_t target = (size_t)(merged_indices.size() * config.simplification_ratio);
-            unsigned int options = meshopt_SimplifyLockBorder
-                                 | meshopt_SimplifyRegularize;
-
-            size_t simplified_count = meshopt_simplifyWithAttributes(
-                simplified_indices.ptr(), merged_indices.ptr(), merged_indices.size(),
-                p_verts.ptr(), p_vertex_count, sizeof(float) * 3,
-                nullptr, 0, nullptr, 0,
-                vertex_lock.ptr(),
-                target, config.target_error, options, &result_error);
-
-            // 2e. 再用 buildMeshletsFlex 切成 2 个新簇
-            size_t child_count = meshopt_buildMeshletsFlex(...);
-
-            // 2f. 装配父节点 + 子簇
-            NaniteClusterNode parent;
-            parent.error = 0.0f;
-            for (size_t k = 0; k < child_count; k++) {
-                // computeMeshletBounds → child bounds + cone
-                parent.error  = MAX(parent.error, result_error);
-                parent.bounds = parent.bounds.merge(child.bounds);
-            }
-            r_nodes.push_back(parent);
-            next_level.push_back(parent_as_cluster);
-        }
-        current_level = next_level;
-    }
-}
+```
+EditorNode → 查找 handles() 返回 true 的 EditorPlugin
+    → NaniteEditorPlugin::handles(NaniteMeshResource*) → true
+    → NaniteEditorPlugin::edit(p_object)
+        → 创建/复用 NaniteMeshResourceEditorWindow
+        → viewer_window->edit(resource)
+            → 内嵌 NaniteMeshEditor::edit(resource)
+            → popup_centered_clamped(Size2(800, 600))
 ```
 
-#### 8.6.3 粗 LOD Shadow Mesh 生成
+窗口关闭时 `hide()` 不销毁，下次 `edit()` 复用。
 
-构建完成后，从层次结构中提取指定深度的 cluster，展开为标准 `ArrayMesh`，供 GDExtension 桥接通过 `mesh_set_shadow_mesh` 使用：
+#### 8.9.4 资源缩略图
 
-```cpp
-Ref<ArrayMesh> NaniteBuilder::build_shadow_mesh(
-        const LocalVector<NaniteCluster> &p_clusters,
-        const LocalVector<NaniteClusterNode> &p_nodes,
-        const LocalVector<float> &p_verts,
-        const LocalVector<unsigned int> &p_meshlet_vertices,
-        const LocalVector<unsigned char> &p_meshlet_triangles,
-        int p_shadow_lod_depth) {
-
-    // 找到指定深度的节点,合并 cluster 三角形
-    LocalVector<uint32_t> shadow_cluster_ids;
-    for (uint32_t i = 0; i < p_nodes.size(); i++) {
-        const NaniteClusterNode &node = p_nodes[i];
-        if (node.depth <= p_shadow_lod_depth && node.cluster_count > 0) {
-            for (uint32_t c = node.first_cluster;
-                 c < node.first_cluster + node.cluster_count; c++) {
-                shadow_cluster_ids.push_back(c);
-            }
-        }
-    }
-
-    // 展开 meshlet micro-index 为标准 triangle list
-    LocalVector<Vector3> shadow_positions;
-    LocalVector<int> shadow_indices;
-    uint32_t vertex_offset = 0;
-    for (uint32_t cid : shadow_cluster_ids) {
-        const NaniteCluster &cluster = p_clusters[cid];
-        for (uint32_t t = 0; t < cluster.triangle_count; t++) {
-            // meshlet 8-bit local index → global vertex id
-            uint32_t v0 = p_meshlet_vertices[cluster.vertex_offset +
-                         p_meshlet_triangles[cluster.triangle_offset + t * 3 + 0]];
-            uint32_t v1 = p_meshlet_vertices[cluster.vertex_offset +
-                         p_meshlet_triangles[cluster.triangle_offset + t * 3 + 1]];
-            uint32_t v2 = p_meshlet_vertices[cluster.vertex_offset +
-                         p_meshlet_triangles[cluster.triangle_offset + t * 3 + 2]];
-            shadow_indices.push_back(vertex_offset + v0);
-            shadow_indices.push_back(vertex_offset + v1);
-            shadow_indices.push_back(vertex_offset + v2);
-        }
-        for (uint32_t v = 0; v < cluster.vertex_count; v++) {
-            uint32_t vid = p_meshlet_vertices[cluster.vertex_offset + v];
-            shadow_positions.push_back(Vector3(
-                p_verts[vid * 3 + 0], p_verts[vid * 3 + 1], p_verts[vid * 3 + 2]));
-        }
-        vertex_offset += cluster.vertex_count;
-    }
-
-    // 构建标准 ArrayMesh
-    Ref<ArrayMesh> shadow_mesh;
-    shadow_mesh.instantiate();
-    Array arrays;
-    arrays.resize(Mesh::ARRAY_MAX);
-    PackedVector3Array pos_array;
-    PackedInt32Array idx_array;
-    for (const Vector3 &p : shadow_positions) pos_array.push_back(p);
-    for (int idx : shadow_indices) idx_array.push_back(idx);
-    arrays[Mesh::ARRAY_VERTEX] = pos_array;
-    arrays[Mesh::ARRAY_INDEX] = idx_array;
-    shadow_mesh->add_surface_from_arrays(Mesh::PRIMITIVE_TRIANGLES, arrays);
-    return shadow_mesh;
-}
-```
-
-### 8.7 构建参数与可调性
-
-构建参数通过 `BuilderConfig` 暴露，支持在编辑器预览界面中实时调整并重新构建：
-
-| 参数 | 默认值 | 影响 | 可调位置 |
-|---|---|---|---|
-| `max_vertices` | 64 | 兼容 mesh shader;过大撑爆寄存器 | Inspector 高级 |
-| `max_triangles` | 128 | Nanite 标准;256 增大 dispatch | Inspector 高级 |
-| `cone_weight` | 0.5 | 0=不顾法线锥,1=强约束 | Inspector |
-| `partition_size` | 4 | 4→1 标准;8→1 简化更激进 | Inspector |
-| `simplification_ratio` | 0.5 | 每层简化到一半 | Inspector |
-| `target_error` | 0.5 (relative) | 相对误差上限 | Inspector |
-| `meshlet_optimize_level` | 3 | 0=最快,3=平衡,9=最慢 | Inspector 高级 |
-| `page_size_bytes` | 65536 | 64KB/页 | Inspector 高级 |
-| `shadow_lod_depth` | 3 | 粗 LOD 取哪个深度层 | Inspector (粗 LOD 预览) |
-| `lock_partition_border` | true | 锁边防 crack | Inspector 高级 |
-
-**参数调整流程**：用户在 Inspector 中修改 `BuilderConfig` → 触发 `NaniteBuilder::build()` 重新构建 → 自动更新 `NaniteMeshResource` → 预览界面即时刷新 → 调试可视化验证效果。
-
-### 8.8 与预览界面和调试可视化的集成
-
-离线构建完成后，通过编辑器模块（下一章）实现预览和调试：
-
-1. **构建后即时预览**：`NaniteBuilder::build()` 返回的 `NaniteMeshResource` 直接传递给 `NaniteMeshEditor::edit()`，自动切换到 **Cluster 纯色模式**验证簇划分质量；
-2. **LOD 层级验证**：在预览界面切换到 **LOD 着色模式**，直观查看不同深度的簇分布，确认 `simplification_ratio` 和 `target_error` 效果；
-3. **粗 LOD 预览**：调整 `shadow_lod_depth` 参数后，预览界面切换到 **Wireframe 叠加模式**，同时显示 Nanite mesh 和粗 LOD shadow_mesh 的线框对比；
-4. **参数迭代**：修改 `BuilderConfig` 后自动重新构建，构建统计（cluster 数 / node 数 / page 数 / 粗 LOD tri 数）在 `stats_label` 中实时更新；
-5. **资源预览缩略图**：`NaniteResourcePreviewGenerator` 用粗 LOD `shadow_mesh` 渲染缩略图，不启动 Nanite GPUPipeline，避免性能开销。
-
-### 8.9 序列化
-
-每个 cluster 用 `meshopt_encodeMeshlet` 单独编码，运行时按 page 加载并 `meshopt_decodeMeshlet` 解码：
-
-```cpp
-// 离线写盘
-void NaniteMeshResource::serialize(const LocalVector<NaniteCluster> &p_clusters,
-                                     const LocalVector<unsigned int> &p_meshlet_vertices,
-                                     const LocalVector<unsigned char> &p_meshlet_triangles) {
-    FileAccessRef f = FileAccess::open("res://mesh.nanite", FileAccess::WRITE);
-    f->store_buffer("NANM", 4);  // magic
-    f->store_32(1);               // version
-
-    for (const NaniteCluster &c : p_clusters) {
-        size_t bound = meshopt_encodeMeshletBound(c.vertex_count, c.triangle_count);
-        LocalVector<unsigned char> encoded;
-        encoded.resize(bound);
-        size_t encoded_size = meshopt_encodeMeshlet(
-            encoded.ptr(), bound,
-            p_meshlet_vertices.ptr() + c.vertex_offset, c.vertex_count,
-            p_meshlet_triangles.ptr() + c.triangle_offset, c.triangle_count);
-
-        f->store_32(c.vertex_count);
-        f->store_32(c.triangle_count);
-        f->store_32(encoded_size);
-        f->store_buffer(encoded.ptr(), encoded_size);
-    }
-}
-
-// 运行时 page-in 时解码
-void PageCache::decode_page(uint32_t p_page_id) {
-    FileAccessRef f = FileAccess::open("res://mesh.nanite", FileAccess::READ);
-    for (const ClusterEntry &e : page_table[p_page_id].entries) {
-        f->seek(e.file_offset);
-        uint32_t vcount = f->get_32();
-        uint32_t tcount = f->get_32();
-        uint32_t esize  = f->get_32();
-        LocalVector<unsigned char> encoded;
-        encoded.resize(esize);
-        f->get_buffer(encoded.ptrw(), esize);
-
-        meshopt_decodeMeshlet(staging_vertex_ptr + e.vertex_offset, vcount,
-                               sizeof(unsigned int),
-                               staging_index_ptr + e.triangle_offset, tcount,
-                               sizeof(unsigned int),
-                               encoded.ptr(), esize);
-    }
-}
-```
+`NaniteResourcePreviewGenerator` 使用 `shadow_mesh`（粗 LOD ArrayMesh）生成 FileSystem dock 缩略图，不启动 Nanite GPUPipeline。
 
 ### 8.10 辅助数据汇总
 
@@ -1521,27 +1438,25 @@ void PageCache::decode_page(uint32_t p_page_id) {
 | `bounds.center/radius` | vec3/float | `meshopt_computeMeshletBounds` | 视锥/HZB 遮挡剔除 |
 | `cone_axis/cutoff` | vec3/float | `meshopt_Bounds.cone_axis/cutoff` | 背面剔除 |
 | `error` | float | `meshopt_simplifyWithAttributes` × `meshopt_simplifyScale` | LOD 选择 |
-| `group_id` | uint32 | `meshopt_partitionClusters` partition_id | crack-free 渲染 |
+| `group_id` | uint32 | `meshopt_partitionClusters` partition_id | crack-free 渲染 + LOD 过滤 |
 | `material_index` | uint32 | surface 来源 | 间接绘制按材质分组 |
 | `page_id` | uint32 | `PagePacker` 基于 morton 排序后切页 | 磁盘流式加载 |
 | `left_child/right_child` | uint32 | 构建时层次结构展开 | GPU 栈式 BVH 遍历 |
-| `provoking_vertex` | — | `meshopt_generateProvokingIndexBuffer` | VisBuffer flat 取 triangle_id |
 
 ### 8.11 三桥接下离线构建的差异
 
 | 维度 | GDExtension | Module | Deep |
 |---|---|---|---|
 | meshoptimizer 调用 | GDExtension 内 `#include <meshoptimizer.h>` SCons 编译 | 直接 `#include <thirdparty/meshoptimizer/meshoptimizer.h>` | 同 Module + 可改 SurfaceTool |
-| 触发构建 | EditorImporter → `NaniteBuilder::build()` | 同左 | 编辑器导入自动判断(面数>阈值) |
+| 触发构建 | EditorInspectorPlugin + ContextMenu → `NaniteBuilder::build_from_resource()` | 同左 | 编辑器导入自动判断(面数>阈值) |
 | 多线程 | GDExtension 起后台 Thread | `WorkerThreadPool` | 同 Module + ResourceSaver 集成 |
 | 粗 LOD Shadow Mesh | **必须生成**，供 `mesh_set_shadow_mesh` 使用 | 可选(动态 GPU shadow) | 不需要(完全打通) |
-| 序列化 | 自定义二进制 + `.res` 元数据 | 同左 | 可扩展 `.scn`/`.res` 原生格式 |
-| 用户体验 | 导入后手动挂 NaniteMeshResource | 同左但 Inspector 自动建议 | 自动：导入高面数 mesh 自动生成 Nanite |
+| 序列化 | `.nanite.tres` (Godot 原生) + `.nanite` (自定义二进制 v3) | 同左 | 可扩展 `.scn`/`.res` 原生格式 |
 
 ### 8.12 边界情况与限制
 
 1. **三角形数过少的 mesh**(< 128 tri)：不构建 Nanite，直接走标准 mesh；
-2. **多 surface mesh**：每个 surface 独立构建 BVH，vertex pool 共享，`material_index` 区分；
+2. **多 surface mesh**：所有 surface 合并为单 ArrayMesh 后构建，`material_index` 区分；
 3. **Morph Target / Blend Shape**：Nanite 不支持运行时形变，自动 fallback 到标准 mesh；
 4. **Skeleton deformation**：Nanite 不支持 bone-skinned mesh，fallback 到标准 mesh；
 5. **超大 mesh**(> 100M tri)：离线构建内存占用大，需流式处理 + 多线程；
@@ -1549,733 +1464,15 @@ void PageCache::decode_page(uint32_t p_page_id) {
 
 ---
 
-## 9. 编辑器模块：预览界面与调试可视化
-
-### 9.1 概述
-
-离线构建完成后，用户需要在 Inspector 中预览 Nanite mesh 并能切换可视化模式验证构建质量。参照 Godot 内置的 `MeshEditor`(`editor/scene/3d/mesh_editor_plugin.h`)，设计 `NaniteMeshEditor`。
-
-**Stage 0 重构后的预览面板设计原则**：将原本分散的"调试模式 + 线框按钮 + 包围盒按钮"三个独立控件，重组为**两个正交维度的下拉列表**，让用户从"看什么"和"用哪个 LOD"两个独立角度选择，避免模式组合爆炸：
-
-| 维度 | 控件 | 选项数 | 影响 shader |
-|------|------|--------|------------|
-| 显示模式 (Display Mode) | 列表1 | 5 项 | `nanite_material_resolve.glsl` 的 `display_mode` push constant |
-| LOD 模式 (LOD Mode) | 列表2 | 2 类×N 等级 | `nanite_cull.glsl` 的 `lod_mode` + `force_lod_level` push constant |
-
-> 高级调试可视化（Overdraw 热力图 / HZB mip 可视化 / Page Residency 等）作为 Stage 2+ 的补充能力，不进入 Stage 0 主流程面板。
-
-### 9.2 类图
-
-```mermaid
-classDiagram
-    class SubViewportContainer {
-        <<Godot built-in>>
-    }
-    class NaniteMeshEditor {
-        -SubViewport viewport
-        -NaniteMeshInstance3D preview_instance
-        -Node3D rotation_node
-        -Camera3D camera
-        -DirectionalLight3D light1
-        -DirectionalLight3D light2
-        -OptionButton display_mode_btn
-        -OptionButton lod_mode_btn
-        -SpinBox force_lod_spinner
-        -Label stats_label
-        +edit(p_resource: Ref~NaniteMeshResource~) void
-        -_on_display_mode_selected(p_index: int) void
-        -_on_lod_mode_selected(p_index: int) void
-        -_on_force_lod_changed(p_value: int) void
-    }
-    class NaniteDebug {
-        <<Stage 0 重构>>
-        -DisplayMode display_mode
-        -LODMode lod_mode
-        -int force_lod_level
-        -bool show_bounds
-        +set_display_mode(p_mode: int) void
-        +set_lod_mode(p_mode: int) void
-        +set_force_lod_level(p_level: int) void
-    }
-    class EditorInspectorPluginNanite {
-        +can_handle(p_object: Object) bool
-        +parse_begin(p_object: Object) void
-    }
-    class NaniteEditorPlugin {
-        +get_plugin_name() String
-    }
-    class NaniteResourcePreviewGenerator {
-        +handles(p_type: String) bool
-        +generate(p_from: Ref~Resource~, p_size: Size2, p_metadata: Dictionary) Ref~Texture2D~
-    }
-    class EditorInspectorPlugin {
-        <<Godot built-in>>
-    }
-    class EditorPlugin {
-        <<Godot built-in>>
-    }
-
-    SubViewportContainer <|-- NaniteMeshEditor
-    EditorInspectorPlugin <|-- EditorInspectorPluginNanite
-    EditorPlugin <|-- NaniteEditorPlugin
-    EditorResourcePreviewGenerator <|-- NaniteResourcePreviewGenerator
-    EditorInspectorPluginNanite --> NaniteMeshEditor : creates in parse_begin
-    NaniteEditorPlugin --> EditorInspectorPluginNanite : registers
-    NaniteEditorPlugin --> NaniteResourcePreviewGenerator : registers
-    NaniteMeshEditor ..> NaniteDebug : writes via NaniteServer setter
-```
-
-### 9.3 预览界面功能 — 两个正交下拉列表
-
-#### 列表1：显示模式（DisplayMode）
-
-控制 `nanite_material_resolve.glsl` 的输出方式，5 个选项：
-
-| 序号 | 名称 | 视觉效果 | material_resolve shader 行为 |
-|------|------|----------|----------------------------|
-| 0 | Normal | 真实材质 Lambert 着色 | `display_mode == 0` → 读 material_ssbo base_color/metallic/roughness，Lambert diffuse + ambient |
-| 1 | Normal + Wireframe | 真实材质 + 三角形边线 | `display_mode == 1` → Lambert 输出 + barycentric 坐标任一分量 < epsilon 处叠加白色线 |
-| 2 | Cluster Solid (色块) | 每个簇一种唯一颜色 | `display_mode == 2` → 用 `cluster_id` hash 到 HSV 色环，覆盖材质色 |
-| 3 | Cluster Solid + Wireframe | 簇色块 + 三角形边线 | `display_mode == 3` → 簇 hash 色 + barycentric 边线叠加 |
-| 4 | Wireframe Only | 纯线框（黑底白线） | `display_mode == 4` → 仅 barycentric 边线处输出白色，其余输出背景色 |
-
-> Stage 0 即可实现 0/2/4 三种"纯色"模式；1/3 的"叠加线框"模式依赖 material_resolve shader 增加 barycentric 边检测分支，作为 Stage 0 后期补完项。
-
-#### 列表2：LOD 模式（LODMode）
-
-控制 `nanite_cull.glsl` 的 LOD 选择逻辑，2 类选项：
-
-| 序号 | 名称 | 行为 | Stage |
-|------|------|------|:-----:|
-| 0 | Nanite (auto cull + LOD) | 走完整 Nanite 流程：视锥剔除 + 背面剔除 + HZB 遮挡 + 基于 error 的自动 LOD 选择 | Stage 1 |
-| 1+ | Force LOD Level: N | 跳过自动剔除与 LOD 选择，cull shader 仅输出 `cluster.group_id == N` 的簇；用户通过 SpinBox 选择 0..max_lod_levels-1 | Stage 0 |
-
-- **Stage 0 默认值**：`LODMode = FORCE_LOD_LEVEL`，`force_lod_level = 0`（显示最细 LOD，便于验证 cluster 划分质量）
-- **Stage 0 中选项 0 (Nanite auto)** 在下拉中保留但显示 "(Stage 1)" 后缀，选中时弹 tooltip 提示"将在 Stage 1 实现"，实际行为回退到 Force LOD 0
-- **Stage 1 完成后**：选项 0 自动启用，走真实 cull + LOD 选择流程
-
-#### 构建统计
-
-| 显示字段 | 来源 |
-|---------|------|
-| Clusters / Nodes / Pages | `NaniteMeshResource::cluster_count` / `node_count` / `page_count` |
-| Shadow mesh tris | `shadow_mesh->get_faces() / 3` |
-| Est. GPU | `(vertex_data + clusters_data + nodes_data + materials_data) / (1024*1024)` |
-| Visible Clusters (当前帧) | `NaniteServer::get_visible_cluster_count()` |
-| Max LOD Level | `NaniteMeshResource::max_lod_level`（builder 构建 hierarchy 时的 `current_lod` 终值） |
-
-### 9.4 代码骨架
-
-```cpp
-// nanite/core/nanite_debug.h — Stage 0 重构后的二维枚举
-//
-// 设计要点（2026-07-28 实施）：
-//   - 新增 DisplayMode + LODMode 两个正交枚举用于 Stage 0 编辑器 preview
-//     面板。Stage 0 preview 渲染完全独立，不调用 NaniteServer 调试状态。
-//   - 旧 DebugMode 枚举（NONE / CLUSTER_SOLID_COLOR / ...）保留，继续供
-//     Stage 1 GPU pipeline (nanite_material_resolve.glsl) 使用，名字不变
-//     以避免破坏 Stage 1 测试与着色器代码。
-class NaniteDebug : public Object {
-    GDCLASS(NaniteDebug, Object);
-public:
-    // 列表1: 显示模式 (Stage 0 编辑器 preview 用)
-    enum DisplayMode {
-        NORMAL = 0,
-        NORMAL_WIREFRAME,
-        CLUSTER_SOLID,
-        CLUSTER_SOLID_WIREFRAME,
-        WIREFRAME_ONLY,
-    };
-    // 列表2: LOD 模式 (Stage 0 编辑器 preview 用)
-    enum LODMode {
-        NANITE_AUTO = 0,    // 自动剔除 + LOD 选择 (Stage 1 实现)
-        FORCE_LOD_LEVEL,    // 整体指定 LOD 等级
-    };
-    // Legacy: Stage 1 GPU pipeline 调试模式（保持原名以兼容旧测试）
-    enum DebugMode {
-        NONE = 0,
-        CLUSTER_SOLID_COLOR,
-        LOD_SOLID_COLOR,
-        OVERDRAW_HEATMAP,
-        PAGE_RESIDENCY,
-        HZB_MIP_LEVELS,
-        HZB_OCCLUSION,
-    };
-
-private:
-    DisplayMode display_mode = NORMAL;
-    LODMode lod_mode = FORCE_LOD_LEVEL; // Stage 0 默认强制 LOD 0
-    int force_lod_level = 0;            // 0 = 最细，n = 最粗
-    bool show_bounds = false;
-
-    DebugMode mode = NONE;             // Stage 1 GPU pipeline 状态
-    bool wireframe = false;
-
-public:
-    // Stage 0 API
-    void set_display_mode(int p_mode);
-    int get_display_mode() const;
-    DisplayMode get_display_mode_enum() const;
-
-    void set_lod_mode(int p_mode);
-    int get_lod_mode() const;
-    LODMode get_lod_mode_enum() const;
-
-    void set_force_lod_level(int p_level);
-    int get_force_lod_level() const;
-
-    void set_show_bounds(bool p_show);
-    bool get_show_bounds() const;
-
-    // Legacy Stage 1 API (nanite_material_resolve.glsl 仍读取此值)
-    void set_mode(int p_mode);
-    int get_mode() const;
-    DebugMode get_mode_enum() const;
-
-    void set_wireframe(bool p_wireframe);
-    bool get_wireframe() const;
-};
-```
-
-```cpp
-// nanite/editor/nanite_mesh_editor.h
-#pragma once
-#include "scene/gui/subviewport_container.h"
-#include "scene/3d/camera_3d.h"
-#include "scene/3d/light_3d.h"
-
-class SubViewport;
-class OptionButton;
-class SpinBox;
-class Label;
-class NaniteMeshInstance3D;
-
-class NaniteMeshEditor : public SubViewportContainer {
-    GDCLASS(NaniteMeshEditor, SubViewportContainer);
-
-    float rot_x = 0.0f;
-    float rot_y = 0.0f;
-
-    SubViewport *viewport = nullptr;
-    NaniteMeshInstance3D *preview_instance = nullptr;
-    Node3D *rotation_node = nullptr;
-    DirectionalLight3D *light1 = nullptr;
-    DirectionalLight3D *light2 = nullptr;
-    Camera3D *camera = nullptr;
-
-    // Stage 0 重构：两个正交下拉列表
-    OptionButton *display_mode_btn = nullptr; // 列表1: 显示模式
-    OptionButton *lod_mode_btn = nullptr;     // 列表2: LOD 模式
-    SpinBox *force_lod_spinner = nullptr;     // 列表2 子项: 强制 LOD 等级
-    Label *stats_label = nullptr;
-
-    void _on_display_mode_selected(int p_index);
-    void _on_lod_mode_selected(int p_index);
-    void _on_force_lod_changed(int p_value);
-    void _update_rotation();
-
-protected:
-    void _notification(int p_what);
-    void gui_input(const Ref<InputEvent> &p_event) override;
-
-public:
-    void edit(const Ref<NaniteMeshResource> &p_resource);
-    NaniteMeshEditor();
-};
-```
-
-```cpp
-// nanite/editor/nanite_mesh_editor.cpp — Stage 0 实现（独立于 Nanite GPU 管线）
-//
-// 关键约束（2026-07-28 用户澄清）：
-//   - preview 渲染完全独立，不依赖 CompositorEffect / nanite_cull.glsl /
-//     nanite_rasterize.glsl / nanite_material_resolve.glsl。
-//   - 也不调用 NaniteServer::set_debug_mode() — 所有渲染状态都本地保存在
-//     NaniteMeshEditor 实例内，避免与运行时场景的 NaniteServer 串扰。
-//   - 渲染代码限制在 nanite/editor/ 模块内。
-//
-// 实现策略：
-//   - 使用 Godot 标准 MeshInstance3D（不用 NaniteMeshInstance3D）
-//   - 构造函数不再调用 NaniteGDExtBridgeManager::attach_to_viewport()
-//   - CPU-side 解码 clusters_data → 临时 ArrayMesh → MeshInstance3D 渲染
-
-void NaniteMeshEditor::edit(const Ref<NaniteMeshResource> &p_resource) {
-    current_resource = p_resource;
-    if (current_resource.is_null()) {
-        solid_instance->set_mesh(Ref<Mesh>());
-        wire_instance->set_mesh(Ref<Mesh>());
-        stats_label->set_text("");
-        return;
-    }
-
-    // Force LOD SpinBox 范围: 0..max_lod_level (扫描 clusters_data 得到)
-    int max_lod = current_resource->get_max_lod_level();
-    force_lod_spinner->set_min(0);
-    force_lod_spinner->set_max(MAX(max_lod, 0));
-    if ((int)force_lod_spinner->get_value() > max_lod) {
-        force_lod_spinner->set_value(max_lod);
-    }
-
-    // 构建统计
-    int shadow_tris = 0;
-    Ref<ArrayMesh> shadow = current_resource->get_shadow_mesh();
-    if (shadow.is_valid()) {
-        for (int i = 0; i < shadow->get_surface_count(); ++i) {
-            int idx = shadow->surface_get_array_index_len(i);
-            shadow_tris += idx > 0 ? idx / 3
-                                  : shadow->surface_get_array_len(i) / 3;
-        }
-    }
-    String stats = vformat(
-        "Clusters: %d  |  Nodes: %d  |  Pages: %d\n"
-        "Shadow Tris: %d  |  Est. GPU: %.2f MB  |  Max LOD: %d",
-        current_resource->get_cluster_count(),
-        current_resource->get_node_count(),
-        current_resource->get_page_count(),
-        shadow_tris,
-        (current_resource->get_vertex_data().size() +
-         current_resource->get_clusters_data().size() +
-         current_resource->get_nodes_data().size() +
-         current_resource->get_page_table_data().size()) / (1024.0 * 1024.0),
-        max_lod);
-    stats_label->set_text(stats);
-
-    // 自动缩放相机适配 mesh bounds
-    if (shadow.is_valid() && shadow->get_aabb().size.length() > 0.0f) {
-        float distance = shadow->get_aabb().size.length() * 1.2f;
-        camera->set_position(Vector3(0, 0, distance));
-    }
-
-    _rebuild_preview(); // 根据 display_mode + lod_mode + force_lod 重建 mesh
-}
-
-// 核心重建逻辑：CPU-side 解码 clusters → ArrayMesh + 线框 PRIMITIVE_LINES ArrayMesh
-void NaniteMeshEditor::_rebuild_preview() {
-    if (!current_resource.is_valid()) {
-        solid_instance->set_mesh(Ref<Mesh>());
-        wire_instance->set_mesh(Ref<Mesh>());
-        return;
-    }
-
-    int display_id = display_mode_btn->get_selected_id();
-    int force_lod  = (int)force_lod_spinner->get_value();
-
-    Ref<ArrayMesh> solid_mesh;              // PRIMITIVE_TRIANGLES
-    Ref<ArrayMesh> wire_mesh;               // PRIMITIVE_LINES（边顶点展开）
-    bool wire_visible = false;
-    bool solid_visible = true;
-
-    if (display_id == NaniteDebug::NORMAL ||
-        display_id == NaniteDebug::NORMAL_WIREFRAME) {
-        // 直接用 shadow_mesh（粗 LOD ArrayMesh），不解码 cluster
-        solid_mesh = current_resource->get_shadow_mesh();
-        wire_visible = (display_id == NaniteDebug::NORMAL_WIREFRAME);
-        // 把 shadow_mesh 的三角形索引展开成边 → PRIMITIVE_LINES mesh
-        if (wire_visible && solid_mesh.is_valid()) {
-            wire_mesh = build_wire_from_array_mesh(solid_mesh);
-        }
-    } else {
-        // Cluster 解码模式：CPU 侧扫描 clusters_data + meshlet_*_data
-        bool per_cluster_colors =
-            (display_id == NaniteDebug::CLUSTER_SOLID ||
-             display_id == NaniteDebug::CLUSTER_SOLID_WIREFRAME);
-        solid_mesh = build_cluster_mesh(*current_resource, force_lod, per_cluster_colors);
-        wire_visible = (display_id == NaniteDebug::CLUSTER_SOLID_WIREFRAME ||
-                       display_id == NaniteDebug::WIREFRAME_ONLY);
-        if (wire_visible) {
-            // 直接从 cluster decode 出线框 mesh（每三角形 6 个顶点 = 3 条边）
-            wire_mesh = build_cluster_wire_mesh(*current_resource, force_lod);
-        }
-        if (display_id == NaniteDebug::WIREFRAME_ONLY) {
-            solid_visible = false;
-        }
-    }
-
-    solid_instance->set_mesh(solid_mesh);
-    wire_instance->set_mesh(wire_mesh);
-    wire_instance->set_visible(wire_visible && !wire_mesh.is_null());
-    solid_instance->set_visible(solid_visible && !solid_mesh.is_null());
-}
-
-// 三个 UI 回调都只触发本地 _rebuild_preview()，不调用 NaniteServer
-void NaniteMeshEditor::_on_display_mode_selected(int p_index) { _rebuild_preview(); }
-
-void NaniteMeshEditor::_on_lod_mode_selected(int p_index) {
-    int mode = lod_mode_btn->get_item_id(p_index);
-    if (mode == NaniteDebug::NANITE_AUTO) {
-        WARN_PRINT("Nanite auto cull + LOD selection is a Stage 1 feature. "
-                   "Falling back to Force LOD Level 0.");
-        lod_mode_btn->select(NaniteDebug::FORCE_LOD_LEVEL);
-        force_lod_spinner->set_value(0);
-    }
-    _rebuild_preview();
-}
-
-void NaniteMeshEditor::_on_force_lod_changed(double p_value) { _rebuild_preview(); }
-```
-
-**CPU 侧 cluster 解码器**（在 `nanite_mesh_editor.cpp` 内匿名命名空间）：
-
-```cpp
-// 顶点 stride 32B: pos.xyz (3f) + normal.xyz (3f) + uv.xy (2f)
-constexpr size_t kVertexStride = 32;
-
-// 解码所有 group_id == p_force_lod_level 的 cluster。
-//   p_emit_lines = false → 输出三角形 mesh（3 verts + 3 indices per tri，
-//                  可选 per-vertex color）
-//   p_emit_lines = true  → 输出 PRIMITIVE_LINES mesh（每三角形 6 个顶点
-//                  = 3 条边 (v0,v1) (v1,v2) (v2,v0)），p_indices/p_colors 不写入
-int decode_clusters_for_lod(const NaniteMeshResource &p_resource,
-                            int p_force_lod_level,
-                            bool p_per_cluster_colors,
-                            bool p_emit_lines,
-                            PackedVector3Array &p_verts,
-                            PackedInt32Array &p_indices,
-                            PackedColorArray &p_colors) {
-    const PackedByteArray &clusters_data = p_resource.get_clusters_data();
-    const PackedByteArray &vertex_data = p_resource.get_vertex_data();
-    const PackedByteArray &meshlet_vertices_data = p_resource.get_meshlet_vertices_data();
-    const PackedByteArray &meshlet_triangles_data = p_resource.get_meshlet_triangles_data();
-
-    const size_t cluster_stride = NaniteCluster::get_serialized_size(); // 68
-    const int cluster_count = p_resource.get_cluster_count();
-    // ... bounds checks ...
-
-    for (int ci = 0; ci < cluster_count; ++ci) {
-        NaniteCluster c = NaniteCluster::deserialize(clusters_data,
-                                                     ci * cluster_stride);
-        if ((int)c.group_id != p_force_lod_level) continue;
-
-        // 每个 cluster 的唯一 HSV 色（按 ci hash）
-        Color cluster_color = p_per_cluster_colors
-            ? Color::from_hsv((ci * 2654435761u) % 360 / 360.0f, 0.65f, 0.95f)
-            : Color(1, 1, 1);
-
-        for (uint32_t ti = 0; ti < c.triangle_count; ++ti) {
-            const uint8_t *tri = tri_base + c.triangle_offset + ti * 3;
-            // micro-index → meshlet_vertices_data 全局顶点索引 → vertex_data 位置
-            uint32_t g0 = mv[c.vertex_offset + tri[0]];
-            uint32_t g1 = mv[c.vertex_offset + tri[1]];
-            uint32_t g2 = mv[c.vertex_offset + tri[2]];
-            const float *vp0 = vp_base + g0 * (kVertexStride / sizeof(float));
-            // ...
-            if (p_emit_lines) {
-                p_verts.push_back(v0); p_verts.push_back(v1);
-                p_verts.push_back(v1); p_verts.push_back(v2);
-                p_verts.push_back(v2); p_verts.push_back(v0);
-            } else {
-                int base = p_verts.size();
-                p_verts.push_back(v0); p_verts.push_back(v1); p_verts.push_back(v2);
-                p_indices.push_back(base); p_indices.push_back(base+1); p_indices.push_back(base+2);
-                if (p_per_cluster_colors) {
-                    p_colors.push_back(cluster_color); p_colors.push_back(cluster_color); p_colors.push_back(cluster_color);
-                }
-            }
-        }
-    }
-}
-
-// 三种 ArrayMesh 构造 helper（都返回空 Ref 当解码失败时）：
-Ref<ArrayMesh> build_cluster_mesh(...);         // PRIMITIVE_TRIANGLES + 可选 ARRAY_COLOR
-Ref<ArrayMesh> build_cluster_wire_mesh(...);    // PRIMITIVE_LINES（cluster decode 路径）
-Ref<ArrayMesh> build_wire_from_array_mesh(...); // PRIMITIVE_LINES（从已有 ArrayMesh
-                                                //   的索引展开成边，Normal+Wire 路径用）
-```
-
-### 9.5 Preview 界面设计图
-
-#### 9.5.1 整体布局
-
-```
-┌──────────────────────────────────────────────────────────────────┐
-│  Nanite Mesh Editor (Inspector preview panel)                   │
-├──────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│   ┌──────────────────────────────────────────────────────────┐   │
-│   │                                                          │   │
-│   │                  3D Preview Viewport                      │   │
-│   │              (SubViewportContainer, 256×256)             │   │
-│   │                                                          │   │
-│   │                                                          │   │
-│   │       ← drag to rotate / wheel to zoom →                │   │
-│   │                                                          │   │
-│   │                                                          │   │
-│   └──────────────────────────────────────────────────────────┘   │
-│                                                                  │
-│   ┌── Display Mode ──────────────────────────────┐ ┌── LOD Mode ─────────────────────────┐
-│   │ [Normal                            ▼]        │ │ [Force LOD Level                ▼] │
-│   │ ┌────────────────────────────────────┐ │ │ ┌──────────────────────────────────┐ │
-│   │ │ Normal                              │ │ │ │ Nanite (auto cull + LOD) [S1]   │ │ │
-│   │ │ Normal + Wireframe                 │ │ │ │ Force LOD Level  ▼               │ │ │
-│   │ │ Cluster Solid                      │ │ │ └──────────────────────────────────┘ │ │
-│   │ │ Cluster Solid + Wireframe          │ │ │                                      │
-│   │ │ Wireframe Only                     │ │ │ LOD Level: [ 0 ▼] (0..3)            │
-│   │ └────────────────────────────────────┘ │ │                                      │
-│   └────────────────────────────────────────┘ └──────────────────────────────────────┘
-│                                                                  │
-│   ┌── Stats ─────────────────────────────────────────────────┐   │
-│   │ Clusters: 1024   Nodes: 259   Pages: 4                  │   │
-│   │ Shadow mesh tris: 5120   Est. GPU: ~3.2 MB              │   │
-│   │ Visible Clusters: 256 (current frame)                    │   │
-│   │ Max LOD Level: 3                                          │   │
-│   └────────────────────────────────────────────────────────┘   │
-│                                                                  │
-└──────────────────────────────────────────────────────────────────┘
-```
-
-#### 9.5.2 状态机：LOD 模式与 Force LOD 等级联动
-
-```mermaid
-stateDiagram-v2
-    [*] --> ForceLOD_0
-
-    state "LOD Mode = Force LOD Level" as ForceLOD {
-        [*] --> ForceLOD_0
-        ForceLOD_0 --> ForceLOD_1: spinner = 1
-        ForceLOD_1 --> ForceLOD_2: spinner = 2
-        ForceLOD_2 --> ForceLOD_1: spinner = 1
-        ForceLOD_1 --> ForceLOD_0: spinner = 0
-        ForceLOD_0 --> ForceLOD_N: spinner = N
-    }
-
-    state "LOD Mode = Nanite (auto)" as NaniteAuto {
-        [*] --> Warn_Stage1_NotReady
-        Warn_Stage1_NotReady --> AutoFallback: WARN_PRINT + 回退
-    }
-
-    ForceLOD --> NaniteAuto: 用户选 "Nanite (auto)"
-    NaniteAuto --> ForceLOD: Stage 0 自动回退 / Stage 1 后保留
-```
-
-#### 9.5.3 渲染管线数据流（Stage 0 独立路径）
-
-> **重要约束（2026-07-28 用户澄清）**：Stage 0 的 preview 渲染**完全独立于 Nanite GPU 渲染管线**——不依赖 `CompositorEffect`、不调用 `nanite_cull.glsl` / `nanite_rasterize.glsl` / `nanite_material_resolve.glsl`，也不需要 `NaniteServer` 已激活任何 bridge。所有渲染代码**限制在 nanite/editor/ 模块内**，使用 Godot 标准的 `MeshInstance3D` + `ArrayMesh` + `StandardMaterial3D` 经由引擎自带的 forward 管线绘制。这让 Stage 0 preview 在未编译任何桥接时也能工作，并避免了预览视口与运行时场景共 NaniteServer 调试状态导致的串扰问题。
-
-```mermaid
-flowchart LR
-    UI["NaniteMeshEditor<br/>display_mode_btn + lod_mode_btn + force_lod_spinner"] -->|"reads selected id"| DECODE["CPU-side cluster decoder<br/>(nanite/editor/nanite_mesh_editor.cpp)"]
-    RES["NaniteMeshResource (.tres)<br/>clusters_data / vertex_data /<br/>meshlet_vertices_data /<br/>meshlet_triangles_data"] --> DECODE
-    DECODE -->|"filter group_id == force_lod_level<br/>+ optional per-cluster HSV color"| AM["Ref&lt;ArrayMesh&gt; triangles<br/>(pos + index + color)"]
-    DECODE -->|"p_emit_lines = true<br/>6 verts per triangle (3 edges)"| WM["Ref&lt;ArrayMesh&gt; PRIMITIVE_LINES<br/>(pos only)"]
-    AM --> MI["MeshInstance3D (solid_instance)<br/>StandardMaterial3D<br/>FLAG_ALBEDO_FROM_VERTEX_COLOR=true"]
-    WM --> WI["MeshInstance3D (wire_instance)<br/>StandardMaterial3D<br/>SHADING_MODE_UNSHADED + 白色"]
-    SHADOW["shadow_mesh (coarse ArrayMesh)"] -.->|"Normal / Normal+Wire modes<br/>skip cluster decode"| AM
-    SHADOW -.->|"build_wire_from_array_mesh()<br/>iterate indices → line verts"| WM
-    MI -->|"forward pipeline"| VP["Preview SubViewport<br/>(no Nanite compositor attached)"]
-    WI -->|"forward pipeline"| VP
-
-    style DECODE fill:#fff3e0,stroke:#e65100
-    style AM fill:#e3f2fd,stroke:#1565c0
-    style WM fill:#f3e5f5,stroke:#6a1b9a
-    style VP fill:#e8f5e9,stroke:#2e7d32
-```
-
-**Stage 0 五种 Display Mode 的渲染策略**：
-
-| Mode | solid_instance 渲染内容 | wire_instance 渲染内容 | mesh 来源 |
-|------|------------------------|------------------------|----------|
-| Normal | shadow_mesh + Lambert StandardMaterial3D | 隐藏 | `NaniteMeshResource::shadow_mesh` |
-| Normal + Wireframe | shadow_mesh + Lambert StandardMaterial3D | `build_wire_from_array_mesh(shadow_mesh)` → PRIMITIVE_LINES + 白色 unshaded material | `shadow_mesh` |
-| Cluster Solid | `build_cluster_mesh(force_lod, true)` ArrayMesh + per-vertex HSV 色 + `FLAG_ALBEDO_FROM_VERTEX_COLOR` | 隐藏 | `clusters_data` + `vertex_data` + `meshlet_vertices_data` + `meshlet_triangles_data` |
-| Cluster Solid + Wireframe | 同 Cluster Solid 的 ArrayMesh | `build_cluster_wire_mesh(force_lod)` PRIMITIVE_LINES + 白色 unshaded material | 同上 |
-| Wireframe Only | 隐藏 | `build_cluster_wire_mesh(force_lod)` PRIMITIVE_LINES + 白色 unshaded material | 同 Cluster Solid |
-
-> **为什么用 PRIMITIVE_LINES 而非材质线框属性**：Godot 的 `BaseMaterial3D` 没有 `set_wireframe_enabled` 方法（`StandardMaterial3D` 也一样）。要在预览视口里画线框，必须把三角形索引展开成边顶点，构造 `PRIMITIVE_LINES` 类型的 ArrayMesh，再配合 unshaded 白色材质绘制。这也避开了不同渲染后端 (Vulkan / D3D12 / Metal) 对线框 mode 支持不一致的问题。
-
-**LOD 过滤逻辑**：
-
-- `LODMode = FORCE_LOD_LEVEL` (Stage 0 默认)：CPU decoder 在遍历 clusters 时跳过 `cluster.group_id != force_lod_level` 的簇；Spinbox 范围 `0..max_lod_level`，由 `NaniteMeshResource::get_max_lod_level()` 扫描 `clusters_data` 得到。
-- `LODMode = NANITE_AUTO` (Stage 1 预留)：选中时弹 `WARN_PRINT` 提示未实现，自动回退到 `FORCE_LOD_LEVEL` + level 0。
-
-**关键设计要点**：
-
-1. **不挂载 Compositor**：构造函数中**不再**调用 `NaniteGDExtBridgeManager::attach_to_viewport(viewport)`，避免预览视口被 Nanite GPU pipeline 接管，让 preview 行为可预测。
-2. **使用 MeshInstance3D 而非 NaniteMeshInstance3D**：避免触发 NaniteServer 的 instance 注册与 GPU pipeline 调度。
-3. **两个 MeshInstance3D 共享同一 mesh**：solid + wire 共用，只在 material override 与可见性上区分，避免重复几何上传。
-4. **不写 NaniteServer 调试状态**：预览切换不调用 `NaniteServer::set_debug_mode()`，避免影响运行时场景的渲染。
-5. **Stage 1 时可选接入 GPU pipeline**：当 NANITE_AUTO 选项启用时，可在 Stage 1 通过 `NaniteGDExtBridgeManager::attach_to_viewport` 重新挂载 compositor，使 preview 也能验证 cull/LOD 真实行为——但这是 Stage 1 的事，Stage 0 不做。
-
-#### 9.5.4 五种 Display Mode 视觉示意
-
-```
-Mode 0: Normal                Mode 1: Normal + Wireframe
-┌──────────────┐              ┌──────────────┐
-│ ████████████ │              │ ▓▓▓▓▓▓▓▓▓▓▓▓ │
-│ ████████████ │              │ ▓▓▓+-------+ │
-│ ████████████ │              │ ▓▓▓| ▲▲▲ | │
-│ ████████████ │              │ ▓▓▓| ▲▲▲ | │
-└──────────────┘              └──────────────┘
-  Lambert diffuse               Lambert + 白线
-
-Mode 2: Cluster Solid          Mode 3: Cluster Solid + Wireframe
-┌──────────────┐              ┌──────────────┐
-│ ▓▓▓▓▓▓▓▓▓▓▓▓ │              │ ▓▓▓▓▓▓▓▓▓▓▓▓ │
-│ ▒▒▒▒▒▓▓▓▓▒▒▒ │              │ ▒▒▒▒▒▓▓▓▓▒▒▒ │
-│ ▒▒▒▒▒▓▓▓▓▒▒▒ │              │ ▒▒▒▒▒▓▓+--+▓ │
-│ ▒▒▒▒▒▓▓▓▓▒▒▒ │              │ ▒▒▒▒▒▓▓|▲▲|▓ │
-└──────────────┘              └──────────────┘
-  每个 cluster 唯一色            cluster 色 + 白线
-
-Mode 4: Wireframe Only
-┌──────────────┐
-│              │
-│    +--+       │
-│   / ▲▲|       │
-│  +--+         │
-│              │
-└──────────────┘
-  黑底白线（仅三角形边）
-```
-
-### 9.6 InspectorPlugin 注册
-
-```cpp
-// nanite/editor/nanite_editor_plugin.h
-class EditorInspectorPluginNanite : public EditorInspectorPlugin {
-    GDCLASS(EditorInspectorPluginNanite, EditorInspectorPlugin);
-public:
-    virtual bool can_handle(Object *p_object) override {
-        return Object::cast_to<NaniteMeshResource>(p_object) != nullptr;
-    }
-    virtual void parse_begin(Object *p_object) override {
-        NaniteMeshResource *res = Object::cast_to<NaniteMeshResource>(p_object);
-        NaniteMeshEditor *editor = memnew(NaniteMeshEditor);
-        editor->edit(Ref<NaniteMeshResource>(res));
-        add_custom_control(editor);
-    }
-};
-
-class NaniteEditorPlugin : public EditorPlugin {
-    GDCLASS(NaniteEditorPlugin, EditorPlugin);
-public:
-    virtual String get_plugin_name() const override { return "Nanite"; }
-    NaniteEditorPlugin() {
-        Ref<EditorInspectorPluginNanite> plugin;
-        plugin.instantiate();
-        add_inspector_plugin(plugin);
-    }
-};
-```
-
-### 9.6 焦点管理（Stage 0 后已不需要）
-
-> **设计变更（2026-07-28）**：原本预览视口内的 `NaniteMeshInstance3D` 与场景中的实例走同一 Nanite GPU pipeline，因此 `NaniteServer::set_debug_mode()` 设置的调试模式对预览视口同样生效，需要靠焦点进出切换来隔离。Stage 0 重构后，预览渲染**完全独立于 Nanite GPU 管线**（详见 §9.5.3）——预览视口不再挂载 `CompositorEffect`，不再使用 `NaniteMeshInstance3D`，不再调用 `NaniteServer::set_debug_mode()`。所有 display mode 与 LOD 选择状态都保存在 `NaniteMeshEditor` 实例内的 `OptionButton` / `SpinBox` 中，因此**焦点进出预览视口时无需做任何状态隔离**。
-
-`_notification()` 在 Stage 0 实现中只是 no-op：
-
-```cpp
-void NaniteMeshEditor::_notification(int p_what) {
-    switch (p_what) {
-        case NOTIFICATION_FOCUS_ENTER:
-        case NOTIFICATION_FOCUS_EXIT:
-            // No-op: Stage 0 preview rendering is fully local; no
-            // NaniteServer debug state needs to be touched.
-            break;
-        default:
-            break;
-    }
-}
-```
-
-> **Stage 1 注意事项**：当 §9.5.3 的"Nanite (auto cull + LOD)"选项真正接入 GPU pipeline 后，预览视口会挂载自己的 `CompositorEffect`，那时若仍要让预览的调试模式与场景隔离，应改为给预览 SubViewport 单独分配一个 `NaniteDebug` 实例（而非共用 `NaniteServer` 的全局单例）。本节暂保留以记录这一 Stage 1 待办。
-
-### 9.7 构建后即时预览与资源转换入口
-
-构建完成后不需要经过磁盘，直接用内存中的 `NaniteMeshResource`：
-
-```cpp
-// nanite/editor/nanite_importer.cpp
-void NaniteImporter::_on_build_completed(Ref<NaniteMeshResource> p_resource) {
-    // 构建完成，立即在预览界面显示
-    if (preview_editor) {
-        preview_editor->edit(p_resource);
-    }
-    // Stage 0 重构后不再触碰 NaniteServer 调试状态——预览默认进入
-    // DisplayMode = Cluster Solid + LODMode = Force LOD 0，便于用户
-    // 直接验证 cluster 划分质量。如需切换模式由用户在预览面板操作。
-}
-```
-
-#### 9.7.1 资源转换入口设计（Stage 0 任务组 0.12）
-
-阶段 0 离线构建模块需要解决"用户如何把 .gltf / .glb / .fbx / .obj 等 Godot 可导入的 mesh 资源转换为 NaniteMeshResource"的产品入口问题。设计原则：**手动触发优于自动导入**，避免每次重新导入都重跑构建（大模型 >100K tri 构建耗时 >100ms 会卡 UI）。
-
-**接口层**：`NaniteBuilder::build_from_resource(Ref<Resource>)` 静态方法
-
-```cpp
-// nanite/core/nanite_builder.h
-class NaniteBuilder : public RefCounted {
-    GDCLASS(NaniteBuilder, RefCounted);
-public:
-    static Ref<NaniteMeshResource> build_from_resource(Ref<Resource> p_resource);
-};
-```
-
-`build_from_resource` 内部实现：
-1. 识别输入类型：`ArrayMesh` / `PackedScene` (gltf/glb/fbx 导入产物) / `MeshInstance3D` 节点
-2. 合并所有 surface 的 `ARRAY_VERTEX` + `ARRAY_INDEX` 到单个 vertex/index 池（按顶点偏移调整 index）
-3. 调用现有 `build(Ref<ArrayMesh>)` 走完整的 leaf→hierarchy→bvh→shadow→finalize 管线
-4. 返回 `NaniteMeshResource`
-
-**编辑器入口层**（两个并行 UI 入口）：
-
-| 入口 | 触发方式 | 实现类 |
-|------|---------|--------|
-| FileSystem 右键菜单 | 选中 .gltf/.glb/.fbx/.obj/.tres mesh 资源右键 → "Convert to Nanite..." | `NaniteConversionContextMenu : EditorContextMenuPlugin` |
-| Inspector 按钮 | 选中 `ArrayMesh` 资源或 `MeshInstance3D` 节点 → Inspector 顶部 "Convert to Nanite..." 按钮 | 扩展 `EditorInspectorPluginNanite::parse_begin()` |
-
-两个入口共享同一个构建+保存流程：
-```
-用户点击 → 弹 EditorFileDialog (save, *.nanite.tres) → 调 build_from_resource() →
-显示 EditorProgress (大模型时) → ResourceSaver::save() → EditorLog 输出统计
-```
-
-**不接入自动导入的原因**：
-- Godot 的 `EditorImportPlugin` / `EditorScenePostImport` 在每次重新导入时都跑构建
-- 大模型构建 100K tri 耗时约 190ms (见 perf benchmark)，频繁重导入会卡 UI
-- 自动导入还会导致 .gltf 文件每改一次都生成新 .nanite.tres，污染版本控制
-- 手动触发让用户明确控制何时构建，与 Unreal Engine 的 Nanite "Build" 按钮模式一致
-
-**NaniteImporter 类的关系**：原设计中 `NaniteImporter` (见类图 `nanite-overall-design.md:458-462`) 在阶段 0 不实现 EditorImportPlugin 形式，而是通过 `NaniteConversionContextMenu` + `EditorInspectorPluginNanite` 的 Convert 按钮提供手动触发的等价能力。原 `NaniteImporter` 接口 `import(source_file, save_path, options)` 的语义由 `_execute_option()` 间接实现。
-
-### 9.8 资源预览缩略图
-
-FileSystem 面板中的小图标，使用 `shadow_mesh`（粗 LOD ArrayMesh）生成，无需启动 Nanite GPUPipeline：
-
-```cpp
-// nanite/editor/nanite_resource_preview.h
-class NaniteResourcePreviewGenerator : public EditorResourcePreviewGenerator {
-    GDCLASS(NaniteResourcePreviewGenerator, EditorResourcePreviewGenerator);
-public:
-    virtual bool handles(const String &p_type) const override {
-        return p_type == "NaniteMeshResource";
-    }
-    virtual Ref<Texture2D> generate(const Ref<Resource> &p_from,
-                                     const Size2 &p_size,
-                                     Dictionary &p_metadata) const override {
-        // 用 shadow_mesh(粗 LOD ArrayMesh)生成缩略图
-        // 无需启动 Nanite GPUPipeline，直接用标准 Mesh 渲染
-        Ref<NaniteMeshResource> res = p_from;
-        if (res.is_valid() && res->shadow_mesh.is_valid()) {
-            return StandardResourcePreview::get_singleton()
-                ->generate(res->shadow_mesh, p_size, p_metadata);
-        }
-        return Ref<Texture2D>();
-    }
-};
-```
-
----
-
-## 10. 阶段一：GDExtension 桥接
+## 9. 阶段一：GDExtension 桥接
 
 > **阶段目标**：在使用 GDExtension 桥接层（`CompositorEffect` 接入）的情况下，**完整实现 Nanite 渲染** —— 包括 Cull（BVH 遍历 + 视锥/背面/HZB 遮挡剔除 + LOD 选择）、Rasterize（meshlet 解码 + 三角形软光栅化 + VisBuffer 写入）、HZB Build（层次化深度降采样）、Material Resolve（barycentric 插值 + Lambert 着色）四个 Pass 的真实算法实现，使 Stage 1 完成后即可在场景中放置 `NaniteMeshInstance3D` 看到真实 Nanite 渲染输出。
 >
 > **实现状态（2026-07-25）**：Stage 1 已实现完成（作为 module 内子目录 `nanite/bridge/`，通过 `NANITE_BRIDGE_GDEXT` 宏条件编译，而非独立 GDExtension 插件）。Task 1.1-1.15 框架已跑通，Task 1.16 真实渲染补完已合入（替代 1.5/1.11 占位实现）。Task 1.17 Compositor 自动挂接重构为 **`NaniteGDExtBridgeManager` 独立 singleton**（在桥接层）：核心 `NaniteServer` 不再持有 `Ref<NaniteGDExtBridge>`，改为只持有 `INaniteBridge *` 抽象指针；所有 gdext 专属逻辑（创建 Compositor / 监听 SceneTree / 遍历 `_viewports` group / 追加 effect 到用户 Compositor）集中在 `nanite/bridge/nanite_gdext_bridge_manager.h/cpp`，通过 `NaniteServer::set_bridge(INaniteBridge *)` setter 注入。覆盖三大目标 viewport：游戏运行时、Nanite preview 窗口、引擎 3D 工作区。doctest/GDScript 测试已编写（部分需 Vulkan 后端运行时验证）。详见 `nanite_doc/spec/stage1-gdext-bridge/` 下的 spec.md / tasks.md / checklist.md。
 >
-> **关键实现差异**（与下方原始设计的对照见 10.5 节，S1-05/S1-06/S1-07/S1-08 已在 Stage 1 内补完）。
+> **关键实现差异**（与下方原始设计的对照见 9.5 节，S1-05/S1-06/S1-07/S1-08 已在 Stage 1 内补完）。
 
-### 10.1 渲染管线流程图
+### 9.1 渲染管线流程图
 
 ```mermaid
 flowchart TB
@@ -2297,7 +1494,7 @@ flowchart TB
     style NANITE_MAT fill:#c8e6c9,stroke:#2e7d32
 ```
 
-### 10.2 时序图
+### 9.2 时序图
 
 ```mermaid
 sequenceDiagram
@@ -2334,7 +1531,7 @@ sequenceDiagram
     NS-->>CE: 返回
 ```
 
-### 10.3 代码骨架
+### 9.3 代码骨架
 
 ```cpp
 // nanite_bridge_gdext/nanite_gdext_bridge.h
@@ -2418,7 +1615,7 @@ void NaniteGDExtBridge::on_post_opaque_pass(const RenderData *p_render_data) {
 }
 ```
 
-### 10.4 阴影方案：粗 LOD
+### 9.4 阴影方案：粗 LOD
 
 ```cpp
 // nanite/nanite_mesh_resource.cpp
@@ -2436,7 +1633,7 @@ void NaniteMeshResource::setup_shadow_mesh() {
 }
 ```
 
-### 10.5 实现与设计差异对照
+### 9.5 实现与设计差异对照
 
 Stage 1 实现过程中发现 Godot 4.7.1 真实 API 与本节 10.3 代码骨架存在以下差异，已按实际 API 调整实现：
 
@@ -2453,7 +1650,7 @@ Stage 1 实现过程中发现 Godot 4.7.1 真实 API 与本节 10.3 代码骨架
 | S1-09 | `get_render_data()` 获取相机/投影 | `get_render_scene_data()` (RenderDataExtension) | 调研文档 D02 已纠正 |
 | S1-10 | HZB 测试 `correct_mip_count_for_resolution` / `downsample_takes_max_of_2x2` / `resize_handles_resolution_change` | `compute_mip_count_for_common_resolutions` / `init_and_build_smoke_test` / `downsample_takes_max_of_2x2` | 测试用例名略有不同但功能覆盖等价；`resize_handles_resolution_change` 未单独编写，由 `init_and_build_smoke_test` 间接覆盖 |
 
-### 10.6 实现验证状态
+### 9.6 实现验证状态
 
 Stage 1 验证分三层：
 
@@ -2465,9 +1662,9 @@ Stage 1 验证分三层：
 
 ---
 
-## 11. 阶段二：Module 桥接
+## 10. 阶段二：Module 桥接
 
-### 11.1 渲染管线流程图
+### 10.1 渲染管线流程图
 
 ```mermaid
 flowchart TB
@@ -2495,7 +1692,7 @@ flowchart TB
     style NANITE_MAT fill:#c8e6c9,stroke:#2e7d32
 ```
 
-### 11.2 时序图
+### 10.2 时序图
 
 ```mermaid
 sequenceDiagram
@@ -2541,7 +1738,7 @@ sequenceDiagram
     GPU-->>NS: 完成
 ```
 
-### 11.3 代码骨架
+### 10.3 代码骨架
 
 ```cpp
 // modules/nanite_bridge_module/nanite_module_bridge.h
@@ -2600,7 +1797,7 @@ void NaniteModuleBridge::on_shadow_pass(
 }
 ```
 
-### 11.4 Hook 安装策略
+### 10.4 Hook 安装策略
 
 ```cpp
 // modules/nanite_bridge_module/nanite_scene_cull_hook.h
@@ -2710,9 +1907,9 @@ sequenceDiagram
 
 ---
 
-## 12. 阶段三：Deep 桥接
+## 11. 阶段三：Deep 桥接
 
-### 12.1 渲染管线流程图
+### 11.1 渲染管线流程图
 
 ```mermaid
 flowchart TB
@@ -2738,7 +1935,7 @@ flowchart TB
     style GI fill:#fff3e0,stroke:#e65100
 ```
 
-### 12.2 时序图
+### 11.2 时序图
 
 ```mermaid
 sequenceDiagram
@@ -2782,7 +1979,7 @@ sequenceDiagram
     NS->>NS: 生成 SDFGI 体素/Nanite 几何信息
 ```
 
-### 12.3 Patch 骨架
+### 11.3 Patch 骨架
 
 **Patch 1: renderer_scene_cull.h/.cpp — 跳过 Nanite 实例的 CPU 剔除**
 
@@ -2867,7 +2064,7 @@ sequenceDiagram
 +	}
 ```
 
-### 12.4 Deep 桥接代码
+### 11.4 Deep 桥接代码
 
 ```cpp
 // nanite_bridge_deep/nanite_deep_bridge.h
@@ -2902,11 +2099,11 @@ public:
 
 ---
 
-## 13. 关键 API 对照表
+## 12. 关键 API 对照表
 
 > 本节基于 Godot 4.7.1 源码精确验证，是编码的直接依据。
 
-### 13.1 CompositorEffect
+### 12.1 CompositorEffect
 
 | 项目 | API | 源码位置 | 备注 |
 |------|-----|----------|------|
@@ -2916,20 +2113,20 @@ public:
 | PRE_OPAQUE 枚举 | `EFFECT_CALLBACK_TYPE_PRE_OPAQUE = 0` | `compositor_effect.h` | ✅ 不是 `BEFORE_OPAQUE_PASS` |
 | POST_OPAQUE 枚举 | `EFFECT_CALLBACK_TYPE_POST_OPAQUE = 1` | `compositor_effect.h` | ✅ 不是 `AFTER_OPAQUE_PASS` |
 
-### 13.2 RenderDataExtension
+### 12.2 RenderDataExtension
 
 | 项目 | API | 源码位置 | 备注 |
 |------|-----|----------|------|
 | 获取场景数据 | `RenderSceneData *get_render_scene_data() const` | `servers/rendering/storage/render_data_extension.h` | ✅ 返回 `RenderSceneData*`，不是 `get_render_data()` |
 | 获取渲染 buffer | `Ref<RenderSceneBuffers> get_render_scene_buffers() const` | `render_data_extension.h` | 获取 color/depth FB |
 
-### 13.3 RenderingServer — 阴影网格
+### 12.3 RenderingServer — 阴影网格
 
 | 项目 | API | 源码位置 | 备注 |
 |------|-----|----------|------|
 | 设置阴影网格 | `void mesh_set_shadow_mesh(RID p_mesh, RID p_shadow_mesh)` | `rendering_server.h:239` | ✅ ClassDB 绑定在 `.cpp:2389` |
 
-### 13.4 LightStorage RD — 阴影 Atlas
+### 12.4 LightStorage RD — 阴影 Atlas
 
 | 项目 | API | 源码位置 | 备注 |
 |------|-----|----------|------|
@@ -2937,20 +2134,20 @@ public:
 | 方向光阴影 FB | `RID direction_shadow_get_fb()` | `light_storage.h:1183` | 方向光专用 shadow FB |
 | 阴影 Rect | `bool light_instance_get_shadow_atlas_rect(RID p_light_instance, RID p_atlas, Vector2i &r_rect)` | `light_storage.h:684` | ✅ 不是 `shadow_atlas_get_quadrant_rect` |
 
-### 13.5 RendererSceneCull
+### 12.5 RendererSceneCull
 
 | 项目 | API | 源码位置 | 备注 |
 |------|-----|----------|------|
 | 渲染相机 | `void render_camera(Ref<RendererSceneCamera> p_camera, const CameraData &p_camera_data)` | `renderer_scene_cull.h` | ✅ 是 `render_camera`，不是 `_render_camera` |
 
-### 13.6 RenderForwardClustered
+### 12.6 RenderForwardClustered
 
 | 项目 | API | 源码位置 | 备注 |
 |------|-----|----------|------|
 | 阴影 Pass | `void _render_shadow_pass(RenderData *p_render_data, RID p_light, ...)` | `render_forward_clustered.h` | 阶段二/三 hook 目标 |
 | 渲染场景 | `void _render_scene(RenderData *p_render_data, ...)` | `render_forward_clustered.h` | 阶段三 patch 目标 |
 
-### 13.7 RenderingDevice — HZB 相关 API
+### 12.7 RenderingDevice — HZB 相关 API
 
 | 项目 | API | 源码位置 | 备注 |
 |------|-----|----------|------|
@@ -2963,9 +2160,9 @@ public:
 
 ---
 
-## 14. 验证与测试矩阵
+## 13. 验证与测试矩阵
 
-### 14.1 三桥接能力对照
+### 13.1 三桥接能力对照
 
 | 能力 | GDExtension | Module | Deep |
 |------|:-----------:|:------:|:----:|
@@ -2984,7 +2181,7 @@ public:
 | Nanite 调试可视化 | ✅ | ✅ | ✅ |
 | 流式加载(PageCache) | ✅ | ✅ | ✅ |
 
-### 14.2 测试场景
+### 13.2 测试场景
 
 | 编号 | 场景 | 测试重点 | 适用阶段 |
 |------|------|----------|-----------|
@@ -3007,11 +2204,11 @@ public:
 | T17 | HZB 调试可视化 | Mip 级别 / 遮挡结果可视化 | 全部 |
 | T18 | HZB 性能基准 | 1080p 构建耗时 < 0.1ms | 全部 |
 
-### 14.3 阶段验收标准
+### 13.3 阶段验收标准
 
 **阶段一(GDExtension)验收标准**：
 
-> **状态（2026-07-25）**：除"独立 .gdextension 插件"项外，其余项均已实现。Task 1.16 真实渲染补完（S1-05/06/07）+ Task 1.17 Compositor 自动挂接（S1-08）已合入后，原 PARTIAL 项全部升级为完整实现：BVH 遍历 / 可见性缓冲 / 材质解析（Lambert + barycentric 插值）+ CompositorEffect 每帧自动触发。Task 1.17 重构为 `NaniteGDExtBridgeManager` 独立 singleton 模式后，核心 `NaniteServer` 保持纯净（仅持有 `INaniteBridge *` 抽象指针），所有 gdext 专属挂接逻辑集中在桥接层。详见 10.5 节实现差异对照（S1-05/S1-06/S1-07/S1-08 已标注"已补完"）。
+> **状态（2026-07-25）**：除"独立 .gdextension 插件"项外，其余项均已实现。Task 1.16 真实渲染补完（S1-05/06/07）+ Task 1.17 Compositor 自动挂接（S1-08）已合入后，原 PARTIAL 项全部升级为完整实现：BVH 遍历 / 可见性缓冲 / 材质解析（Lambert + barycentric 插值）+ CompositorEffect 每帧自动触发。Task 1.17 重构为 `NaniteGDExtBridgeManager` 独立 singleton 模式后，核心 `NaniteServer` 保持纯净（仅持有 `INaniteBridge *` 抽象指针），所有 gdext 专属挂接逻辑集中在桥接层。详见 9.5 节实现差异对照（S1-05/S1-06/S1-07/S1-08 已标注"已补完"）。
 
 - [x] CompositorEffect PRE_OPAQUE 回调被正确触发 (Task 1.17 已补完：`NaniteGDExtBridgeManager` 创建 `default_compositor` 并通过 `SceneTree::node_added` + `_viewports` group 轮询双路径注入到游戏运行时 / Nanite preview 窗口 / 引擎 3D 工作区；引擎每帧触发 `render_visibility` / `render_material_resolve`)
 - [x] BVH 遍历 + LOD 选择在 GPU 正确执行 (Task 1.16.7 已补完：per-cluster parallel BVH-aware 测试 + parent-fallback LOD)
@@ -3046,7 +2243,7 @@ public:
 
 ---
 
-## 15. 与调研文档差异说明
+## 14. 与调研文档差异说明
 
 > 本节纠正 `nanite-godot-design.md` 调研文档中的 API 命名错误，确保编码使用正确名称。
 
