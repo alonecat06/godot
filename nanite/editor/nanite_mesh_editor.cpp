@@ -48,6 +48,7 @@
 #include "scene/main/viewport.h"
 #include "scene/resources/3d/world_3d.h"
 #include "scene/resources/material.h"
+#include "scene/resources/shader.h"
 
 #include <meshoptimizer.h>
 
@@ -561,6 +562,241 @@ Ref<ArrayMesh> build_partition_border_wire(const NaniteMeshResource &p_resource,
 	return mesh;
 }
 
+// Möller-Trumbore ray-triangle intersection. Returns the distance t along
+// the ray where the intersection occurs, or -1.0 if no intersection.
+// p_ray_origin and p_ray_dir are in the same coordinate space as the
+// triangle vertices.
+float ray_triangle_intersect(const Vector3 &p_ray_origin,
+		const Vector3 &p_ray_dir,
+		const Vector3 &p_v0, const Vector3 &p_v1, const Vector3 &p_v2) {
+	const float kEpsilon = 1e-7f;
+	Vector3 edge1 = p_v1 - p_v0;
+	Vector3 edge2 = p_v2 - p_v0;
+	Vector3 h = p_ray_dir.cross(edge2);
+	float a = edge1.dot(h);
+	if (a > -kEpsilon && a < kEpsilon) {
+		return -1.0f; // Ray parallel to triangle.
+	}
+	float f = 1.0f / a;
+	Vector3 s = p_ray_origin - p_v0;
+	float u = f * s.dot(h);
+	if (u < 0.0f || u > 1.0f) {
+		return -1.0f;
+	}
+	Vector3 q = s.cross(edge1);
+	float v = f * p_ray_dir.dot(q);
+	if (v < 0.0f || u + v > 1.0f) {
+		return -1.0f;
+	}
+	float t = f * edge2.dot(q);
+	if (t > kEpsilon) {
+		return t;
+	}
+	return -1.0f;
+}
+
+// Build a triangle ArrayMesh for a single cluster (by global cluster index).
+// Returns empty Ref on failure.
+Ref<ArrayMesh> build_single_cluster_mesh(const NaniteMeshResource &p_resource,
+		int p_force_lod_level,
+		int p_cluster_index) {
+	const PackedByteArray &clusters_data = p_resource.get_clusters_data();
+	const PackedByteArray &vertex_data = p_resource.get_vertex_data();
+	const PackedByteArray &meshlet_vertices_data = p_resource.get_meshlet_vertices_data();
+	const PackedByteArray &meshlet_triangles_data = p_resource.get_meshlet_triangles_data();
+
+	const int cluster_count = p_resource.get_cluster_count();
+	const size_t cluster_stride = NaniteCluster::get_serialized_size();
+
+	if (p_cluster_index < 0 || p_cluster_index >= cluster_count) {
+		return Ref<ArrayMesh>();
+	}
+	if (vertex_data.size() < (int)kVertexStride || meshlet_vertices_data.size() < 4 ||
+			meshlet_triangles_data.size() < 3) {
+		return Ref<ArrayMesh>();
+	}
+
+	NaniteCluster c = NaniteCluster::deserialize(clusters_data, (uint32_t)(p_cluster_index * cluster_stride));
+	if ((int)c.group_id != p_force_lod_level || c.vertex_count == 0 || c.triangle_count == 0) {
+		return Ref<ArrayMesh>();
+	}
+
+	const int total_vertex_count = vertex_data.size() / kVertexStride;
+	const uint32_t *mv = reinterpret_cast<const uint32_t *>(meshlet_vertices_data.ptr());
+	const int mv_count = meshlet_vertices_data.size() / 4;
+	const uint8_t *tri_base = meshlet_triangles_data.ptr();
+	const int tri_byte_count = meshlet_triangles_data.size();
+	const float *vp_base = reinterpret_cast<const float *>(vertex_data.ptr());
+
+	if ((int)c.vertex_offset < 0 || (int)(c.vertex_offset + c.vertex_count) > mv_count) {
+		return Ref<ArrayMesh>();
+	}
+	const uint32_t tri_bytes_needed = c.triangle_count * 3;
+	if ((uint64_t)c.triangle_offset + tri_bytes_needed > (uint64_t)tri_byte_count) {
+		return Ref<ArrayMesh>();
+	}
+
+	// Knuth-style hash for cluster color.
+	uint32_t h = (uint32_t)p_cluster_index * 2654435761u;
+	float hue = (float)(h % 360u) / 360.0f;
+	Color cluster_color = Color::from_hsv(hue, 0.65f, 0.95f);
+
+	PackedVector3Array verts;
+	PackedInt32Array indices;
+	PackedColorArray colors;
+	PackedVector3Array normals;
+	PackedVector2Array uvs;
+
+	for (uint32_t ti = 0; ti < c.triangle_count; ++ti) {
+		const uint8_t *tri_ptr = tri_base + c.triangle_offset + ti * 3;
+		uint8_t i0 = tri_ptr[0], i1 = tri_ptr[1], i2 = tri_ptr[2];
+		if (i0 >= c.vertex_count || i1 >= c.vertex_count || i2 >= c.vertex_count) {
+			continue;
+		}
+		uint32_t g0 = mv[c.vertex_offset + i0];
+		uint32_t g1 = mv[c.vertex_offset + i1];
+		uint32_t g2 = mv[c.vertex_offset + i2];
+		if (g0 >= (uint32_t)total_vertex_count || g1 >= (uint32_t)total_vertex_count || g2 >= (uint32_t)total_vertex_count) {
+			continue;
+		}
+		const float *vp0 = vp_base + g0 * (kVertexStride / sizeof(float));
+		const float *vp1 = vp_base + g1 * (kVertexStride / sizeof(float));
+		const float *vp2 = vp_base + g2 * (kVertexStride / sizeof(float));
+
+		int base = verts.size();
+		verts.push_back(Vector3(vp0[0], vp0[1], vp0[2]));
+		verts.push_back(Vector3(vp1[0], vp1[1], vp1[2]));
+		verts.push_back(Vector3(vp2[0], vp2[1], vp2[2]));
+		normals.push_back(Vector3(vp0[3], vp0[4], vp0[5]));
+		normals.push_back(Vector3(vp1[3], vp1[4], vp1[5]));
+		normals.push_back(Vector3(vp2[3], vp2[4], vp2[5]));
+		uvs.push_back(Vector2(vp0[6], vp0[7]));
+		uvs.push_back(Vector2(vp1[6], vp1[7]));
+		uvs.push_back(Vector2(vp2[6], vp2[7]));
+		indices.push_back(base);
+		indices.push_back(base + 1);
+		indices.push_back(base + 2);
+		colors.push_back(cluster_color);
+		colors.push_back(cluster_color);
+		colors.push_back(cluster_color);
+	}
+
+	if (verts.is_empty() || indices.is_empty()) {
+		return Ref<ArrayMesh>();
+	}
+
+	Array arrays;
+	arrays.resize(Mesh::ARRAY_MAX);
+	arrays[Mesh::ARRAY_VERTEX] = verts;
+	arrays[Mesh::ARRAY_NORMAL] = normals;
+	arrays[Mesh::ARRAY_TEX_UV] = uvs;
+	arrays[Mesh::ARRAY_INDEX] = indices;
+	arrays[Mesh::ARRAY_COLOR] = colors;
+	Ref<ArrayMesh> mesh;
+	mesh.instantiate();
+	mesh->add_surface_from_arrays(Mesh::PRIMITIVE_TRIANGLES, arrays);
+	return mesh;
+}
+
+// Build a triangle ArrayMesh for all clusters at the given LOD, EXCLUDING
+// the cluster at p_exclude_index. The returned mesh uses no per-cluster
+// colors — the dimmed material controls the color and alpha.
+Ref<ArrayMesh> build_cluster_mesh_excluding(const NaniteMeshResource &p_resource,
+		int p_force_lod_level,
+		int p_exclude_index) {
+	PackedVector3Array verts;
+	PackedInt32Array indices;
+	PackedColorArray colors;
+	PackedVector3Array normals;
+	PackedVector2Array uvs;
+
+	const PackedByteArray &clusters_data = p_resource.get_clusters_data();
+	const PackedByteArray &vertex_data = p_resource.get_vertex_data();
+	const PackedByteArray &meshlet_vertices_data = p_resource.get_meshlet_vertices_data();
+	const PackedByteArray &meshlet_triangles_data = p_resource.get_meshlet_triangles_data();
+
+	const int cluster_count = p_resource.get_cluster_count();
+	const size_t cluster_stride = NaniteCluster::get_serialized_size();
+
+	if (cluster_count <= 0 || clusters_data.size() < (int)(cluster_count * cluster_stride)) {
+		return Ref<ArrayMesh>();
+	}
+	if (vertex_data.size() < (int)kVertexStride || meshlet_vertices_data.size() < 4 ||
+			meshlet_triangles_data.size() < 3) {
+		return Ref<ArrayMesh>();
+	}
+
+	const int total_vertex_count = vertex_data.size() / kVertexStride;
+	const uint32_t *mv = reinterpret_cast<const uint32_t *>(meshlet_vertices_data.ptr());
+	const int mv_count = meshlet_vertices_data.size() / 4;
+	const uint8_t *tri_base = meshlet_triangles_data.ptr();
+	const int tri_byte_count = meshlet_triangles_data.size();
+	const float *vp_base = reinterpret_cast<const float *>(vertex_data.ptr());
+
+	for (int ci = 0; ci < cluster_count; ++ci) {
+		if (ci == p_exclude_index) {
+			continue;
+		}
+		NaniteCluster c = NaniteCluster::deserialize(clusters_data, (uint32_t)(ci * cluster_stride));
+		if ((int)c.group_id != p_force_lod_level || c.vertex_count == 0 || c.triangle_count == 0) {
+			continue;
+		}
+		if ((int)c.vertex_offset < 0 || (int)(c.vertex_offset + c.vertex_count) > mv_count) {
+			continue;
+		}
+		const uint32_t tri_bytes_needed = c.triangle_count * 3;
+		if ((uint64_t)c.triangle_offset + tri_bytes_needed > (uint64_t)tri_byte_count) {
+			continue;
+		}
+
+		for (uint32_t ti = 0; ti < c.triangle_count; ++ti) {
+			const uint8_t *tri_ptr = tri_base + c.triangle_offset + ti * 3;
+			uint8_t i0 = tri_ptr[0], i1 = tri_ptr[1], i2 = tri_ptr[2];
+			if (i0 >= c.vertex_count || i1 >= c.vertex_count || i2 >= c.vertex_count) {
+				continue;
+			}
+			uint32_t g0 = mv[c.vertex_offset + i0];
+			uint32_t g1 = mv[c.vertex_offset + i1];
+			uint32_t g2 = mv[c.vertex_offset + i2];
+			if (g0 >= (uint32_t)total_vertex_count || g1 >= (uint32_t)total_vertex_count || g2 >= (uint32_t)total_vertex_count) {
+				continue;
+			}
+			const float *vp0 = vp_base + g0 * (kVertexStride / sizeof(float));
+			const float *vp1 = vp_base + g1 * (kVertexStride / sizeof(float));
+			const float *vp2 = vp_base + g2 * (kVertexStride / sizeof(float));
+
+			int base = verts.size();
+			verts.push_back(Vector3(vp0[0], vp0[1], vp0[2]));
+			verts.push_back(Vector3(vp1[0], vp1[1], vp1[2]));
+			verts.push_back(Vector3(vp2[0], vp2[1], vp2[2]));
+			normals.push_back(Vector3(vp0[3], vp0[4], vp0[5]));
+			normals.push_back(Vector3(vp1[3], vp1[4], vp1[5]));
+			normals.push_back(Vector3(vp2[3], vp2[4], vp2[5]));
+			uvs.push_back(Vector2(vp0[6], vp0[7]));
+			uvs.push_back(Vector2(vp1[6], vp1[7]));
+			uvs.push_back(Vector2(vp2[6], vp2[7]));
+			indices.push_back(base);
+			indices.push_back(base + 1);
+			indices.push_back(base + 2);
+		}
+	}
+
+	if (verts.is_empty() || indices.is_empty()) {
+		return Ref<ArrayMesh>();
+	}
+
+	Array arrays;
+	arrays.resize(Mesh::ARRAY_MAX);
+	arrays[Mesh::ARRAY_VERTEX] = verts;
+	arrays[Mesh::ARRAY_NORMAL] = normals;
+	arrays[Mesh::ARRAY_TEX_UV] = uvs;
+	arrays[Mesh::ARRAY_INDEX] = indices;
+	Ref<ArrayMesh> mesh;
+	mesh.instantiate();
+	mesh->add_surface_from_arrays(Mesh::PRIMITIVE_TRIANGLES, arrays);
+	return mesh;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -575,6 +811,125 @@ void NaniteMeshEditor::_update_rotation() {
 	t.basis.rotate(Vector3(0, 1, 0), -rot_y);
 	t.basis.rotate(Vector3(1, 0, 0), -rot_x);
 	rotation_node->set_transform(t);
+	_update_camera_transform();
+}
+
+void NaniteMeshEditor::_update_camera_transform() {
+	// Camera position in rotation_node local space:
+	//   (pan_offset.x, pan_offset.y, camera_distance)
+	// The camera always looks at (0, 0, 0) in rotation_node local space.
+	Transform3D ct;
+	ct.origin = Vector3(pan_offset.x, pan_offset.y, camera_distance);
+	ct.basis = Basis::looking_at(-ct.origin.normalized(), Vector3(0, 1, 0));
+	camera->set_transform(ct);
+}
+
+void NaniteMeshEditor::_focus_on_model() {
+	if (current_resource.is_null()) {
+		return;
+	}
+
+	Ref<ArrayMesh> shadow_mesh = current_resource->get_shadow_mesh();
+	if (shadow_mesh.is_valid()) {
+		AABB aabb = shadow_mesh->get_aabb();
+		if (aabb.size.length() > 0.0) {
+			camera_distance = aabb.size.length() * 1.2f;
+		} else {
+			camera_distance = 3.0f;
+		}
+	} else {
+		camera_distance = 3.0f;
+	}
+
+	pan_offset = Vector2();
+	rot_x = Math::deg_to_rad(-15.0f);
+	rot_y = Math::deg_to_rad(30.0f);
+	_update_rotation();
+	_update_camera_transform();
+}
+
+int NaniteMeshEditor::_ray_pick_cluster(const Vector2 &p_screen_pos) {
+	if (current_resource.is_null()) {
+		return -1;
+	}
+
+	const PackedByteArray &clusters_data = current_resource->get_clusters_data();
+	const PackedByteArray &vertex_data = current_resource->get_vertex_data();
+	const PackedByteArray &meshlet_vertices_data = current_resource->get_meshlet_vertices_data();
+	const PackedByteArray &meshlet_triangles_data = current_resource->get_meshlet_triangles_data();
+
+	const int cluster_count = current_resource->get_cluster_count();
+	const size_t cluster_stride = NaniteCluster::get_serialized_size();
+	const int force_lod = (int)force_lod_spinner->get_value();
+
+	if (cluster_count <= 0 || clusters_data.size() < (int)(cluster_count * cluster_stride)) {
+		return -1;
+	}
+	if (vertex_data.size() < (int)kVertexStride || meshlet_vertices_data.size() < 4 ||
+			meshlet_triangles_data.size() < 3) {
+		return -1;
+	}
+
+	// Get ray in world space from the camera.
+	Vector3 ray_origin = camera->project_ray_origin(p_screen_pos);
+	Vector3 ray_dir = camera->project_ray_normal(p_screen_pos);
+
+	// Transform ray to rotation_node local space (where mesh instances live).
+	Transform3D inv_transform = rotation_node->get_global_transform().affine_inverse();
+	Vector3 local_origin = inv_transform.xform(ray_origin);
+	Vector3 local_dir = inv_transform.basis.xform(ray_dir).normalized();
+
+	const int total_vertex_count = vertex_data.size() / kVertexStride;
+	const uint32_t *mv = reinterpret_cast<const uint32_t *>(meshlet_vertices_data.ptr());
+	const int mv_count = meshlet_vertices_data.size() / 4;
+	const uint8_t *tri_base = meshlet_triangles_data.ptr();
+	const int tri_byte_count = meshlet_triangles_data.size();
+	const float *vp_base = reinterpret_cast<const float *>(vertex_data.ptr());
+
+	int best_cluster = -1;
+	float best_t = 1e30f;
+
+	for (int ci = 0; ci < cluster_count; ++ci) {
+		NaniteCluster c = NaniteCluster::deserialize(clusters_data, (uint32_t)(ci * cluster_stride));
+		if ((int)c.group_id != force_lod || c.vertex_count == 0 || c.triangle_count == 0) {
+			continue;
+		}
+		if ((int)c.vertex_offset < 0 || (int)(c.vertex_offset + c.vertex_count) > mv_count) {
+			continue;
+		}
+		const uint32_t tri_bytes_needed = c.triangle_count * 3;
+		if ((uint64_t)c.triangle_offset + tri_bytes_needed > (uint64_t)tri_byte_count) {
+			continue;
+		}
+
+		for (uint32_t ti = 0; ti < c.triangle_count; ++ti) {
+			const uint8_t *tri_ptr = tri_base + c.triangle_offset + ti * 3;
+			uint8_t i0 = tri_ptr[0], i1 = tri_ptr[1], i2 = tri_ptr[2];
+			if (i0 >= c.vertex_count || i1 >= c.vertex_count || i2 >= c.vertex_count) {
+				continue;
+			}
+			uint32_t g0 = mv[c.vertex_offset + i0];
+			uint32_t g1 = mv[c.vertex_offset + i1];
+			uint32_t g2 = mv[c.vertex_offset + i2];
+			if (g0 >= (uint32_t)total_vertex_count || g1 >= (uint32_t)total_vertex_count || g2 >= (uint32_t)total_vertex_count) {
+				continue;
+			}
+			const float *vp0 = vp_base + g0 * (kVertexStride / sizeof(float));
+			const float *vp1 = vp_base + g1 * (kVertexStride / sizeof(float));
+			const float *vp2 = vp_base + g2 * (kVertexStride / sizeof(float));
+			Vector3 v0(vp0[0], vp0[1], vp0[2]);
+			Vector3 v1(vp1[0], vp1[1], vp1[2]);
+			Vector3 v2(vp2[0], vp2[1], vp2[2]);
+
+			float t = ray_triangle_intersect(local_origin, local_dir, v0, v1, v2);
+			if (t > 0.0f && t < best_t) {
+				best_t = t;
+				best_cluster = ci;
+			}
+		}
+	}
+
+	return best_cluster;
 }
 
 void NaniteMeshEditor::_notification(int p_what) {
@@ -594,6 +949,7 @@ void NaniteMeshEditor::_notification(int p_what) {
 
 void NaniteMeshEditor::_on_display_mode_selected(int p_index) {
 	(void)p_index;
+	selected_cluster_index = -1; // Clear selection on mode change.
 	_rebuild_preview();
 }
 
@@ -601,6 +957,7 @@ void NaniteMeshEditor::_on_lod_mode_selected(int p_index) {
 	if (lod_mode_updating) {
 		return; // Prevent recursive signal from programmatic select().
 	}
+	selected_cluster_index = -1; // Clear selection on LOD mode change.
 	int mode = lod_mode_btn->get_item_id(p_index);
 	if (mode == NaniteDebug::NANITE_AUTO) {
 		// Stage 0 has no Nanite GPU cull/LOD pipeline; warn and fall back.
@@ -619,41 +976,140 @@ void NaniteMeshEditor::_on_lod_mode_selected(int p_index) {
 
 void NaniteMeshEditor::_on_force_lod_changed(double p_value) {
 	(void)p_value;
+	selected_cluster_index = -1; // Clear selection on LOD change.
 	_rebuild_preview();
 }
 
 void NaniteMeshEditor::gui_input(const Ref<InputEvent> &p_event) {
 	ERR_FAIL_COND(p_event.is_null());
 
-	Ref<InputEventMouseButton> mb = p_event;
-	if (mb.is_valid()) {
-		if (mb->get_button_index() == MouseButton::LEFT) {
-			// When the click is on the UI bar (HBoxContainer), skip drag
-			// handling so that child controls (OptionButton, SpinBox) can
-			// process the event. The event is NOT accepted here so it
-			// propagates normally to the child controls.
-			if (ui_bar && ui_bar->get_global_rect().has_point(mb->get_global_position())) {
+	// --- Keyboard shortcuts ---
+	Ref<InputEventKey> k = p_event;
+	if (k.is_valid() && k->is_pressed() && !k->is_echo()) {
+		if (k->get_keycode() == Key::F) {
+			_focus_on_model();
+			accept_event();
+			return;
+		}
+		if (k->get_keycode() == Key::ESCAPE) {
+			if (selected_cluster_index >= 0) {
+				selected_cluster_index = -1;
+				_rebuild_preview();
+				accept_event();
 				return;
 			}
+		}
+	}
+
+	// --- Mouse wheel: zoom ---
+	Ref<InputEventMouseButton> mb = p_event;
+	if (mb.is_valid()) {
+		// Skip events on the UI bar so child controls work.
+		if (ui_bar && ui_bar->get_global_rect().has_point(mb->get_global_position())) {
+			return;
+		}
+
+		if (mb->get_button_index() == MouseButton::WHEEL_UP) {
+			camera_distance = MAX(camera_distance * 0.9f, 0.01f);
+			_update_camera_transform();
+			accept_event();
+			return;
+		}
+		if (mb->get_button_index() == MouseButton::WHEEL_DOWN) {
+			camera_distance = MAX(camera_distance * 1.1f, 0.01f);
+			_update_camera_transform();
+			accept_event();
+			return;
+		}
+
+		if (mb->get_button_index() == MouseButton::LEFT) {
 			if (mb->is_pressed()) {
-				dragging = true;
+				click_pos = mb->get_position();
+				// Check Shift modifier for pan mode.
+				if (mb->is_shift_pressed()) {
+					shift_panning = true;
+					accept_event();
+				} else {
+					dragging = true;
+					accept_event();
+				}
+			} else {
+				// Button released.
+				if (shift_panning) {
+					shift_panning = false;
+					accept_event();
+				} else if (dragging) {
+					// Check if this was a click (not a drag) — if so, try
+					// cluster selection in Cluster Solid modes.
+					float drag_dist = (mb->get_position() - click_pos).length();
+					constexpr float kClickThreshold = 5.0f;
+					if (drag_dist < kClickThreshold) {
+						const int display_id = display_mode_btn->get_selected_id();
+						if (display_id == NaniteDebug::CLUSTER_SOLID ||
+								display_id == NaniteDebug::CLUSTER_SOLID_WIREFRAME ||
+								display_id == NaniteDebug::CLUSTER_SOLID_WITH_PARTITION_BORDER) {
+							int hit = _ray_pick_cluster(mb->get_position());
+							if (hit >= 0) {
+								selected_cluster_index = hit;
+								print_line(vformat("[nanite-pick] selected cluster %d", hit));
+							} else {
+								selected_cluster_index = -1;
+								print_line("[nanite-pick] no cluster hit — deselected");
+							}
+							_rebuild_preview();
+						}
+					}
+					dragging = false;
+					accept_event();
+				}
+			}
+			return;
+		}
+
+		if (mb->get_button_index() == MouseButton::MIDDLE) {
+			if (mb->is_pressed()) {
+				panning = true;
 				accept_event();
 			} else {
-				dragging = false;
+				panning = false;
 				accept_event();
 			}
+			return;
 		}
+
 		return;
 	}
 
+	// --- Mouse motion: pan / rotate ---
 	Ref<InputEventMouseMotion> mm = p_event;
-	if (mm.is_valid() && dragging) {
-		rot_x -= mm->get_relative().y * 0.01;
-		rot_y -= mm->get_relative().x * 0.01;
+	if (mm.is_valid()) {
+		if (panning) {
+			// Middle-button pan: move in screen space XY.
+			const float pan_speed = camera_distance * 0.002f;
+			pan_offset.x -= mm->get_relative().x * pan_speed;
+			pan_offset.y += mm->get_relative().y * pan_speed;
+			_update_camera_transform();
+			accept_event();
+			return;
+		}
+		if (shift_panning) {
+			// Shift + left-button pan: same as middle-button pan.
+			const float pan_speed = camera_distance * 0.002f;
+			pan_offset.x -= mm->get_relative().x * pan_speed;
+			pan_offset.y += mm->get_relative().y * pan_speed;
+			_update_camera_transform();
+			accept_event();
+			return;
+		}
+		if (dragging) {
+			// Left-button orbit rotation (existing behavior).
+			rot_x -= mm->get_relative().y * 0.01;
+			rot_y -= mm->get_relative().x * 0.01;
 
-		rot_x = CLAMP(rot_x, -Math::PI / 2, Math::PI / 2);
-		_update_rotation();
-		accept_event();
+			rot_x = CLAMP(rot_x, -Math::PI / 2, Math::PI / 2);
+			_update_rotation();
+			accept_event();
+		}
 	}
 }
 
@@ -662,6 +1118,9 @@ void NaniteMeshEditor::_rebuild_preview() {
 		print_line("[nanite-preview] no current_resource — clearing meshes");
 		solid_instance->set_mesh(Ref<Mesh>());
 		wire_instance->set_mesh(Ref<Mesh>());
+		partition_border_instance->set_mesh(Ref<Mesh>());
+		dimmed_instance->set_mesh(Ref<Mesh>());
+		dimmed_instance->set_visible(false);
 		return;
 	}
 
@@ -669,7 +1128,8 @@ void NaniteMeshEditor::_rebuild_preview() {
 	const int lod_mode = lod_mode_btn->get_selected_id();
 	const int force_lod = (int)force_lod_spinner->get_value();
 
-	print_line(vformat("[nanite-preview] display_id=%d lod_mode=%d force_lod=%d", display_id, lod_mode, force_lod));
+	print_line(vformat("[nanite-preview] display_id=%d lod_mode=%d force_lod=%d selected_cluster=%d",
+			display_id, lod_mode, force_lod, selected_cluster_index));
 
 	// Decide what to render in the solid pass + wireframe pass.
 	// - When LOD mode is FORCE_LOD_LEVEL: use cluster decode for ALL
@@ -684,30 +1144,42 @@ void NaniteMeshEditor::_rebuild_preview() {
 	// - WIREFRAME_ONLY: render only the wireframe overlay.
 	Ref<ArrayMesh> solid_mesh;
 	Ref<ArrayMesh> wire_mesh; // PRIMITIVE_LINES for wireframe overlay
+	Ref<ArrayMesh> dimmed_mesh; // Dimmed mesh for non-selected clusters
 	bool wire_visible = false;
 	bool solid_visible = true;
+	bool partition_border_visible = false;
+	bool dimmed_visible = false;
 
 	if (lod_mode == NaniteDebug::FORCE_LOD_LEVEL) {
 		// Stage 0: use cluster decode for all display modes.
-		const bool per_cluster_colors =
+		const bool is_cluster_solid_mode =
 				(display_id == NaniteDebug::CLUSTER_SOLID ||
 						display_id == NaniteDebug::CLUSTER_SOLID_WIREFRAME ||
 						display_id == NaniteDebug::CLUSTER_SOLID_WITH_PARTITION_BORDER);
-		solid_mesh = build_cluster_mesh(*current_resource.ptr(), force_lod, per_cluster_colors);
+		const bool per_cluster_colors = is_cluster_solid_mode;
+
+		// Handle cluster selection in Cluster Solid modes.
+		if (is_cluster_solid_mode && selected_cluster_index >= 0) {
+			// Render only the selected cluster as solid, all others dimmed.
+			solid_mesh = build_single_cluster_mesh(*current_resource.ptr(), force_lod, selected_cluster_index);
+			dimmed_mesh = build_cluster_mesh_excluding(*current_resource.ptr(), force_lod, selected_cluster_index);
+			dimmed_visible = !dimmed_mesh.is_null();
+		} else {
+			solid_mesh = build_cluster_mesh(*current_resource.ptr(), force_lod, per_cluster_colors);
+		}
+
 		wire_visible = (display_id == NaniteDebug::NORMAL_WIREFRAME ||
 						display_id == NaniteDebug::CLUSTER_SOLID_WIREFRAME ||
-						display_id == NaniteDebug::WIREFRAME_ONLY ||
-						display_id == NaniteDebug::CLUSTER_SOLID_WITH_PARTITION_BORDER);
-		if (wire_visible) {
-			if (display_id == NaniteDebug::CLUSTER_SOLID_WITH_PARTITION_BORDER) {
-				wire_mesh = build_partition_border_wire(*current_resource.ptr(), force_lod);
-				// Hide wire if partition border generation failed (e.g., at last LOD).
-				if (wire_mesh.is_null()) {
-					wire_visible = false;
-				}
-			} else {
-				wire_mesh = build_cluster_wire_mesh(*current_resource.ptr(), force_lod);
-			}
+						display_id == NaniteDebug::WIREFRAME_ONLY);
+		partition_border_visible = (display_id == NaniteDebug::CLUSTER_SOLID_WITH_PARTITION_BORDER);
+		if (partition_border_visible) {
+			// Partition border uses a dedicated overlay instance with
+			// depth-test disabled + stipple shader, so borders are always
+			// visible even when occluded by solid geometry.
+			wire_mesh = build_partition_border_wire(*current_resource.ptr(), force_lod);
+			partition_border_visible = !wire_mesh.is_null();
+		} else if (wire_visible) {
+			wire_mesh = build_cluster_wire_mesh(*current_resource.ptr(), force_lod);
 		}
 		if (display_id == NaniteDebug::WIREFRAME_ONLY) {
 			solid_visible = false;
@@ -725,20 +1197,27 @@ void NaniteMeshEditor::_rebuild_preview() {
 	wire_instance->set_mesh(wire_mesh);
 	wire_instance->set_visible(wire_visible && !wire_mesh.is_null());
 	solid_instance->set_visible(solid_visible && !solid_mesh.is_null());
+	// Partition border uses its own dedicated overlay instance (depth-test
+	// disabled, stipple shader). The mesh is only set when partition border
+	// mode is active; otherwise the instance is cleared and hidden.
+	partition_border_instance->set_mesh(partition_border_visible ? Ref<Mesh>(wire_mesh) : Ref<Mesh>());
+	partition_border_instance->set_visible(partition_border_visible);
+	// Dimmed instance: render ghosted clusters when a cluster is selected.
+	dimmed_instance->set_mesh(dimmed_mesh);
+	dimmed_instance->set_visible(dimmed_visible);
 
-	// Tint the wireframe material yellow for partition border mode to
-	// distinguish partition boundaries from regular cluster wireframes.
+	// Reset wireframe material tint to white (no longer needed for partition
+	// border mode — that uses its own dedicated instance + shader).
 	{
 		Ref<Material> wire_mat = wire_instance->get_material_override();
 		StandardMaterial3D *smat = Object::cast_to<StandardMaterial3D>(wire_mat.ptr());
 		if (smat) {
-			bool is_partition_border = (display_id == NaniteDebug::CLUSTER_SOLID_WITH_PARTITION_BORDER);
-			smat->set_albedo(is_partition_border ? Color(1.0f, 0.85f, 0.1f) : Color(1.0f, 1.0f, 1.0f));
+			smat->set_albedo(Color(1.0f, 1.0f, 1.0f));
 		}
 	}
 
-	print_line(vformat("[nanite-preview] final: solid_mesh_valid=%d wire_mesh_valid=%d solid_visible=%d wire_visible=%d",
-			(int)solid_mesh.is_valid(), (int)wire_mesh.is_valid(), (int)solid_visible, (int)wire_visible));
+	print_line(vformat("[nanite-preview] final: solid_mesh_valid=%d wire_mesh_valid=%d solid_visible=%d wire_visible=%d partition_border_visible=%d",
+			(int)solid_mesh.is_valid(), (int)wire_mesh.is_valid(), (int)solid_visible, (int)wire_visible, (int)partition_border_visible));
 }
 
 void NaniteMeshEditor::edit(const Ref<NaniteMeshResource> &p_resource) {
@@ -748,6 +1227,7 @@ void NaniteMeshEditor::edit(const Ref<NaniteMeshResource> &p_resource) {
 		print_line("[nanite-edit] resource is null");
 		solid_instance->set_mesh(Ref<Mesh>());
 		wire_instance->set_mesh(Ref<Mesh>());
+		partition_border_instance->set_mesh(Ref<Mesh>());
 		stats_label->set_text("");
 		return;
 	}
@@ -814,18 +1294,7 @@ void NaniteMeshEditor::edit(const Ref<NaniteMeshResource> &p_resource) {
 	stats_label->set_text(stats_text);
 
 	// Auto-fit camera distance based on shadow mesh AABB (if present).
-	if (shadow_mesh.is_valid()) {
-		AABB aabb = shadow_mesh->get_aabb();
-		if (aabb.size.length() > 0.0) {
-			float distance = aabb.size.length() * 1.2f;
-			camera->set_position(Vector3(0, 0, distance));
-		}
-	}
-
-	// Reset rotation to a pleasant default orientation.
-	rot_x = Math::deg_to_rad(-15.0f);
-	rot_y = Math::deg_to_rad(30.0f);
-	_update_rotation();
+	_focus_on_model();
 
 	_rebuild_preview();
 }
@@ -891,6 +1360,58 @@ NaniteMeshEditor::NaniteMeshEditor() {
 	}
 	rotation_node->add_child(wire_instance);
 	wire_instance->set_visible(false);
+
+	// Partition border instance: always-on-top dashed (stippled) yellow
+	// wireframe overlay. Uses a dedicated MeshInstance3D with depth-test
+	// disabled and a stipple discard shader so partition borders are visible
+	// through solid geometry. Only shown in CLUSTER_SOLID_WITH_PARTITION_BORDER
+	// mode.
+	partition_border_instance = memnew(MeshInstance3D);
+	{
+		Ref<ShaderMaterial> pmat;
+		pmat.instantiate();
+		Ref<Shader> pshader;
+		pshader.instantiate();
+		pshader->set_code(R"(
+shader_type spatial;
+render_mode unshaded, cull_disabled, depth_test_disabled;
+
+uniform vec4 albedo : source_color;
+
+void fragment() {
+	// Stipple pattern: discard every other 2-pixel block in a
+	// checkerboard pattern, producing a dashed-line appearance.
+	vec2 pixel = FRAGCOORD.xy;
+	float pattern = mod(pixel.x + pixel.y, 4.0);
+	if (pattern >= 2.0) {
+		discard;
+	}
+	ALBEDO = albedo.rgb;
+}
+)");
+		pmat->set_shader(pshader);
+		pmat->set_shader_parameter("albedo", Color(1.0f, 0.85f, 0.1f, 1.0f));
+		partition_border_instance->set_material_override(pmat);
+	}
+	rotation_node->add_child(partition_border_instance);
+	partition_border_instance->set_visible(false);
+
+	// Dimmed instance: semi-transparent gray overlay for non-selected
+	// clusters. Uses depth-test disabled so ghosted geometry doesn't
+	// occlude the selected cluster. Only visible when a cluster is selected.
+	dimmed_instance = memnew(MeshInstance3D);
+	{
+		Ref<StandardMaterial3D> dmat;
+		dmat.instantiate();
+		dmat->set_shading_mode(BaseMaterial3D::SHADING_MODE_UNSHADED);
+		dmat->set_transparency(BaseMaterial3D::TRANSPARENCY_ALPHA);
+		dmat->set_flag(BaseMaterial3D::FLAG_DISABLE_DEPTH_TEST, true);
+		dmat->set_cull_mode(BaseMaterial3D::CULL_DISABLED);
+		dmat->set_albedo(Color(0.3f, 0.3f, 0.3f, 0.2f));
+		dimmed_instance->set_material_override(dmat);
+	}
+	rotation_node->add_child(dimmed_instance);
+	dimmed_instance->set_visible(false);
 
 	set_custom_minimum_size(Size2(0, 150) * EDSCALE);
 

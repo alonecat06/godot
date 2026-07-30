@@ -79,8 +79,19 @@ private:
 	// solid_instance renders the shaded surface (Normal or Cluster Solid).
 	// wire_instance renders the white wireframe overlay (visible in modes
 	// NORMAL_WIREFRAME / CLUSTER_SOLID_WIREFRAME / WIREFRAME_ONLY).
+	// partition_border_instance renders the partition border wireframe
+	// overlay in CLUSTER_SOLID_WITH_PARTITION_BORDER mode. It uses a
+	// dedicated MeshInstance3D with depth-test disabled and a stipple
+	// (dashed) shader so partition borders are always visible even when
+	// occluded by solid geometry.
+	// dimmed_instance renders the dimmed (ghosted) clusters when a single
+	// cluster is selected in CLUSTER_SOLID modes. It uses a semi-transparent
+	// gray material with depth-test disabled so the ghosted geometry doesn't
+	// occlude the selected cluster.
 	MeshInstance3D *solid_instance = nullptr;
 	MeshInstance3D *wire_instance = nullptr;
+	MeshInstance3D *partition_border_instance = nullptr;
+	MeshInstance3D *dimmed_instance = nullptr;
 
 	// Stage 0 two-axis UI.
 	OptionButton *display_mode_btn = nullptr; // List 1: DisplayMode
@@ -92,11 +103,19 @@ private:
 	Ref<NaniteMeshResource> current_resource;
 
 	bool dragging = false;
+	bool panning = false; // Middle-button pan drag.
+	bool shift_panning = false; // Shift + left-button pan drag.
 	bool lod_mode_updating = false; // Guard against recursive item_selected signals.
 	float rot_x = 0.0f;
 	float rot_y = 0.0f;
+	float camera_distance = 3.0f; // Camera distance from rotation_node origin.
+	Vector2 pan_offset; // Camera XY offset in rotation_node local space.
+	Vector2 click_pos; // Mouse position at press, for distinguishing click vs drag.
+	int selected_cluster_index = -1; // -1 = no selection; >= 0 = global cluster index.
 
 	void _update_rotation();
+	void _update_camera_transform();
+	void _focus_on_model();
 	void _on_display_mode_selected(int p_index);
 	void _on_lod_mode_selected(int p_index);
 	void _on_force_lod_changed(double p_value);
@@ -107,6 +126,11 @@ private:
 	// resource. Cheap enough to run synchronously (<1 ms for typical
 	// meshes up to ~50 clusters / few thousand triangles).
 	void _rebuild_preview();
+
+	// CPU-side ray-triangle intersection test against the current LOD's
+	// decoded clusters. Returns the global cluster index of the first hit,
+	// or -1 if no cluster was hit.
+	int _ray_pick_cluster(const Vector2 &p_screen_pos);
 
 protected:
 	static void _bind_methods();
