@@ -870,7 +870,24 @@ bool NaniteBuilder::build_hierarchy() {
 			cluster_index_counts[c] = idx_count;
 		}
 
-		// 2) Partition clusters into groups of ~4 spatially adjacent clusters.
+		// 1b) Validate cluster indices and compute a safe vertex_count for
+		// meshopt_partitionClusters. The function asserts that every vertex
+		// index is < vertex_count. If the mesh has vertex indices that
+		// exceed the expected range (e.g. due to meshopt edge cases), we
+		// pass a vertex_count large enough to satisfy the assert.
+		size_t safe_vertex_count = vertex_count;
+		for (size_t i = 0; i < cluster_indices.size(); ++i) {
+			unsigned int v = cluster_indices[i];
+			if (v >= safe_vertex_count) {
+				safe_vertex_count = (size_t)v + 1;
+			}
+		}
+		if (safe_vertex_count != vertex_count) {
+			print_line(vformat("[nanite-build] WARNING: LOD %d: cluster_indices contain vertex %d >= vertex_count %d, using safe_vertex_count=%d",
+					current_lod, (uint64_t)(safe_vertex_count - 1), (uint64_t)vertex_count, (uint64_t)safe_vertex_count));
+		}
+
+		// 2) Partition clusters into groups of ~4 topologically adjacent clusters.
 		LocalVector<unsigned int> partition_ids;
 		partition_ids.resize(cluster_count);
 		size_t partition_count = meshopt_partitionClusters(
@@ -879,9 +896,9 @@ bool NaniteBuilder::build_hierarchy() {
 				cluster_indices.size(),
 				cluster_index_counts.ptr(),
 				cluster_count,
-				m_verts_pos.ptr(),
-				vertex_count,
-				vertex_stride,
+				nullptr,
+				safe_vertex_count,
+				0,
 				partition_size);
 
 		// 3) Group cluster indices by partition_id.

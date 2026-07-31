@@ -349,10 +349,10 @@ Ref<ArrayMesh> build_wire_from_array_mesh(const Ref<ArrayMesh> &p_src) {
 
 // Build partition border wireframes for the CURRENT LOD level.
 // Clusters at p_current_lod_level are grouped into partitions of ~4 using
-// spatial proximity. For each partition, the outer boundary edges of the
-// merged cluster set are extracted: an edge is a boundary edge if it
-// appears in exactly one triangle across all clusters in the partition
-// (i.e. it is not shared by any other triangle within the partition).
+// topology-based adjacency (vertex_positions=nullptr to avoid the
+// mergeSpatial pass that can merge topologically disconnected clusters).
+// For each partition, the outer boundary edges of the merged cluster set
+// are extracted (edges appearing in exactly 1 triangle).
 //
 // If p_filter_cluster_idx >= 0, only the partition containing that cluster
 // is rendered; all other partitions are skipped.
@@ -452,6 +452,14 @@ Ref<ArrayMesh> build_partition_border_wire(const NaniteMeshResource &p_resource,
 	}
 
 	// 3) Partition current LOD clusters into groups of ~4.
+	// Validate cluster indices to avoid meshopt assert(v < vertex_count) crash.
+	size_t safe_vertex_count = (size_t)total_vertex_count;
+	for (size_t i = 0; i < cluster_indices.size(); ++i) {
+		unsigned int v = cluster_indices[i];
+		if (v >= safe_vertex_count) {
+			safe_vertex_count = (size_t)v + 1;
+		}
+	}
 	LocalVector<unsigned int> partition_ids;
 	partition_ids.resize(cl_cluster_count);
 	size_t partition_count = meshopt_partitionClusters(
@@ -460,9 +468,9 @@ Ref<ArrayMesh> build_partition_border_wire(const NaniteMeshResource &p_resource,
 			cluster_indices.size(),
 			cluster_index_counts.ptr(),
 			cl_cluster_count,
-			vp_base,
-			total_vertex_count,
-			kVertexStride,
+			nullptr,
+			safe_vertex_count,
+			0,
 			4);
 
 	if (partition_count == 0 || partition_count == cl_cluster_count) {
@@ -896,15 +904,23 @@ Ref<ArrayMesh> build_partition_sibling_mesh(const NaniteMeshResource &p_resource
 
 	LocalVector<unsigned int> partition_ids;
 	partition_ids.resize(cl_cluster_count);
+	// Validate cluster indices to avoid meshopt assert(v < vertex_count) crash.
+	size_t safe_vc = (size_t)total_vertex_count;
+	for (size_t i = 0; i < cluster_indices.size(); ++i) {
+		unsigned int v = cluster_indices[i];
+		if (v >= safe_vc) {
+			safe_vc = (size_t)v + 1;
+		}
+	}
 	size_t partition_count = meshopt_partitionClusters(
 			partition_ids.ptr(),
 			cluster_indices.ptr(),
 			cluster_indices.size(),
 			cluster_index_counts.ptr(),
 			cl_cluster_count,
-			vp_base,
-			total_vertex_count,
-			kVertexStride,
+			nullptr,
+			safe_vc,
+			0,
 			4);
 
 	if (partition_count == 0 || partition_count == cl_cluster_count) {
