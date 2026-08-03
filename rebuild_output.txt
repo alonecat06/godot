@@ -1,0 +1,23 @@
+Godot Engine v4.7.1.rc.custom_build.63555b7fc (2026-07-28 12:21:48 UTC) - https://godotengine.org
+
+=== Rebuilding Nanite .tres from glTF ===
+Loading glTF: res://mesh/sm_Fountain_01_10_Monument_01.gltf
+Loaded source resource type: PackedScene
+Building NaniteMeshResource via NaniteBuilder.build_from_resource() ...
+Build completed in 116 ms
+  cluster_count = 1109
+  node_count     = 4320
+  page_count     = 2
+  vertex_data.size()         = 85376
+  clusters_data.size()       = 75412
+  meshlet_vertices_data.size()  = 297428
+  meshlet_triangles_data.size() = 268720
+  shadow_mesh is null? false
+Saving .tres: res://mesh/sm_Fountain_01_10_Monument_01.nanite.tres
+Save OK.
+Reloading .tres for verification ...
+  reloaded cluster_count = 1109
+  reloaded meshlet_vertices_data.size()  = 297428
+  reloaded meshlet_triangles_data.size() = 268720
+
+=== SUCCESS: .tres rebuilt with meshlet data ===

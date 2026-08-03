@@ -1,0 +1,2 @@
+ERROR: NaniteServer::init_engine_post: RenderingDevice is null; GPU pipeline will not be created.
+   at: NaniteServer::init_engine_post (nanite\core\nanite_server.cpp:117)

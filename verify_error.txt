@@ -1,0 +1,66 @@
+ERROR: NaniteServer::init_engine_post: RenderingDevice is null; GPU pipeline will not be created.
+   at: NaniteServer::init_engine_post (nanite\core\nanite_server.cpp:117)
+WARNING: LOD 1 coverage < 90% on at least one axis! (X=65.7%, Y=101.3%, Z=59.7%)
+   at: VariantUtilityFunctions::push_warning (core\variant\variant_utility.cpp:1033)
+   GDScript backtrace (most recent call first):
+       [0] _init (d:/Code/04_Engine/godot/verify_lod_fix.gd:121)
+WARNING: LOD 2 coverage < 90% on at least one axis! (X=65.7%, Y=101.3%, Z=54.9%)
+   at: VariantUtilityFunctions::push_warning (core\variant\variant_utility.cpp:1033)
+   GDScript backtrace (most recent call first):
+       [0] _init (d:/Code/04_Engine/godot/verify_lod_fix.gd:121)
+WARNING: LOD 3 coverage < 90% on at least one axis! (X=65.7%, Y=99.8%, Z=59.7%)
+   at: VariantUtilityFunctions::push_warning (core\variant\variant_utility.cpp:1033)
+   GDScript backtrace (most recent call first):
+       [0] _init (d:/Code/04_Engine/godot/verify_lod_fix.gd:121)
+WARNING: LOD 4 coverage < 90% on at least one axis! (X=65.7%, Y=99.5%, Z=54.9%)
+   at: VariantUtilityFunctions::push_warning (core\variant\variant_utility.cpp:1033)
+   GDScript backtrace (most recent call first):
+       [0] _init (d:/Code/04_Engine/godot/verify_lod_fix.gd:121)
+WARNING: LOD 5 coverage < 90% on at least one axis! (X=65.7%, Y=99.4%, Z=54.7%)
+   at: VariantUtilityFunctions::push_warning (core\variant\variant_utility.cpp:1033)
+   GDScript backtrace (most recent call first):
+       [0] _init (d:/Code/04_Engine/godot/verify_lod_fix.gd:121)
+WARNING: LOD 6 coverage < 90% on at least one axis! (X=65.7%, Y=99.5%, Z=54.9%)
+   at: VariantUtilityFunctions::push_warning (core\variant\variant_utility.cpp:1033)
+   GDScript backtrace (most recent call first):
+       [0] _init (d:/Code/04_Engine/godot/verify_lod_fix.gd:121)
+WARNING: LOD 7 coverage < 90% on at least one axis! (X=65.7%, Y=99.4%, Z=54.9%)
+   at: VariantUtilityFunctions::push_warning (core\variant\variant_utility.cpp:1033)
+   GDScript backtrace (most recent call first):
+       [0] _init (d:/Code/04_Engine/godot/verify_lod_fix.gd:121)
+WARNING: LOD 8 coverage < 90% on at least one axis! (X=65.7%, Y=100.6%, Z=54.7%)
+   at: VariantUtilityFunctions::push_warning (core\variant\variant_utility.cpp:1033)
+   GDScript backtrace (most recent call first):
+       [0] _init (d:/Code/04_Engine/godot/verify_lod_fix.gd:121)
+WARNING: LOD 9 coverage < 90% on at least one axis! (X=65.7%, Y=100.7%, Z=59.7%)
+   at: VariantUtilityFunctions::push_warning (core\variant\variant_utility.cpp:1033)
+   GDScript backtrace (most recent call first):
+       [0] _init (d:/Code/04_Engine/godot/verify_lod_fix.gd:121)
+WARNING: LOD 10 coverage < 90% on at least one axis! (X=65.7%, Y=100.7%, Z=56.6%)
+   at: VariantUtilityFunctions::push_warning (core\variant\variant_utility.cpp:1033)
+   GDScript backtrace (most recent call first):
+       [0] _init (d:/Code/04_Engine/godot/verify_lod_fix.gd:121)
+WARNING: LOD 11 coverage < 90% on at least one axis! (X=65.7%, Y=99.6%, Z=54.9%)
+   at: VariantUtilityFunctions::push_warning (core\variant\variant_utility.cpp:1033)
+   GDScript backtrace (most recent call first):
+       [0] _init (d:/Code/04_Engine/godot/verify_lod_fix.gd:121)
+WARNING: LOD 12 coverage < 90% on at least one axis! (X=65.7%, Y=99.6%, Z=54.9%)
+   at: VariantUtilityFunctions::push_warning (core\variant\variant_utility.cpp:1033)
+   GDScript backtrace (most recent call first):
+       [0] _init (d:/Code/04_Engine/godot/verify_lod_fix.gd:121)
+WARNING: LOD 13 coverage < 90% on at least one axis! (X=65.7%, Y=99.6%, Z=54.9%)
+   at: VariantUtilityFunctions::push_warning (core\variant\variant_utility.cpp:1033)
+   GDScript backtrace (most recent call first):
+       [0] _init (d:/Code/04_Engine/godot/verify_lod_fix.gd:121)
+WARNING: LOD 14 coverage < 90% on at least one axis! (X=65.7%, Y=99.4%, Z=54.7%)
+   at: VariantUtilityFunctions::push_warning (core\variant\variant_utility.cpp:1033)
+   GDScript backtrace (most recent call first):
+       [0] _init (d:/Code/04_Engine/godot/verify_lod_fix.gd:121)
+WARNING: LOD 15 coverage < 90% on at least one axis! (X=65.7%, Y=99.6%, Z=54.9%)
+   at: VariantUtilityFunctions::push_warning (core\variant\variant_utility.cpp:1033)
+   GDScript backtrace (most recent call first):
+       [0] _init (d:/Code/04_Engine/godot/verify_lod_fix.gd:121)
+WARNING: LOD 16 coverage < 90% on at least one axis! (X=65.7%, Y=99.5%, Z=54.7%)
+   at: VariantUtilityFunctions::push_warning (core\variant\variant_utility.cpp:1033)
+   GDScript backtrace (most recent call first):
+       [0] _init (d:/Code/04_Engine/godot/verify_lod_fix.gd:121)
