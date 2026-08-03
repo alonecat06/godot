@@ -929,7 +929,7 @@ Godot 在 `thirdparty/meshoptimizer/`(版本 1.1)和 `modules/meshoptimizer/` �
 |---|---|
 | 切叶子 cluster(128 tri) | `meshopt_buildMeshletsFlex` |
 | 计算簇包围盒 + 法线锥 | `meshopt_computeMeshletBounds` |
-| 簇分组(4 簇→1 父) | `meshopt_partitionClusters` |
+| 簇分组(4 簇→1 父, 纯拓扑邻接图) | `meshopt_partitionClusters` (vertex_positions=nullptr) |
 | QEM 简化(支持属性/锁边) | `meshopt_simplifyWithAttributes` |
 | 误差尺度归一化 | `meshopt_simplifyScale` |
 | Meshlet 内部 reorder | `meshopt_optimizeMeshletLevel` |
@@ -1100,36 +1100,87 @@ classDiagram
 
 #### 8.4.3 层次化简化 (build_hierarchy)
 
-采用 UE5 Nanite 风格的"4相邻簇合并 → 分区独立简化"算法：
+采用 UE5 Nanite 风格的"4相邻簇合并 → 分区独立简化"算法。**关键改进**：`meshopt_partitionClusters` 采用**纯拓扑邻接图分区模式**（`vertex_positions = nullptr`），避免 meshopt 内部的 `mergeSpatial` 空间后处理破坏拓扑连通性（详见 8.4.3.1）：
 
 ```mermaid
 flowchart TD
     Start["当前层 cluster 列表"] --> Check{cluster_count > 1<br/>and lod < max_lod?}
-    Check -- "是" --> Part["meshopt_partitionClusters<br/>target=4 (空间相邻聚类)"]
-    Part --> Loop["对每个 partition (~4 相邻簇)"]
+    Check -- "是" --> Part["meshopt_partitionClusters<br/>target=4 (纯拓扑邻接图, vertex_positions=nullptr)"]
+    Part --> Loop["对每个 partition (~4 拓扑相邻簇)"]
     Loop --> Merge["局部合并 partition 的 index + vertex 子集<br/>(非全局合并)"]
     Merge --> Lock["计算 vertex_lock<br/>跨簇共享顶点 (>=2簇) = 边界顶点"]
     Lock --> Simplify["meshopt_simplifyWithAttributes<br/>target=50%, LockBorder+Regularize<br/>vertex_lock 锁定边界顶点"]
     Simplify --> Bailout{简化结果 < min_triangles?}
     Bailout -- "是" --> Clone["clone_cluster_for_lod()<br/>克隆原 cluster 到新 LOD<br/>(仅修改 group_id)"]
     Bailout -- "否" --> Recluster["meshopt_buildMeshletsFlex<br/>简化结果重聚类"]
-    Clone --> Parent["parent.error = max(child.errors, result_error)<br/>parent.bounds = union(child.bounds)<br/>parent.group_id = current_lod + 1"]
+    Clone --> Parent["parent.error = max(child.errors, result_error)<br/>parent.bounds = union(child_bounds)<br/>parent.group_id = current_lod + 1"]
     Recluster --> Parent
     Parent --> NextPart{还有 partition?}
     NextPart -- "是" --> Loop
     NextPart -- "否" --> Check
     Check -- "否" --> Done["层次化完成"]
-    
+
     style Simplify fill:#fff3e0,stroke:#e65100
     style Clone fill:#fce4ec,stroke:#c62828
+    style Part fill:#e3f2fd,stroke:#1565c0
 ```
 
 **关键设计要点**：
 
+- **纯拓扑分区（核心改进）**：`meshopt_partitionClusters` 调用传 `vertex_positions = nullptr`，仅依赖 cluster 间共享顶点构建邻接图做贪心堆合并，**完全跳过 `mergeSpatial` 空间后处理**。这保证每个 partition 内的 cluster 集合在拓扑上是连通的（共享边/顶点），从而让 border-vertex locking 在 partition 边界处始终有效，避免简化产生裂缝。meshopt 的拓扑模式本身已近似 SAH：`pickGroupToMerge` 用共享顶点数作为合并代价，共享顶点越多 = 接触面越大 = 合并后包围盒增量越小。
 - **局部合并 vs 全局合并**：每个 partition 独立合并其内 cluster 的 vertex + index 子集，不做全局合并。这保留了空间局部性，对后续 GPU culling 和 streaming 友好。
-- **vertex_lock 边界检测**：统计每个顶点被 partition 内多少个原始 cluster 引用，`>=2` 的顶点标记为边界顶点（vertex_lock）。
+- **vertex_lock 边界检测**：统计每个顶点被 partition 内多少个原始 cluster 引用，`>=2` 的顶点标记为边界顶点（vertex_lock）。由于 partition 拓扑连通，边界顶点集合非空，LockBorder 约束始终生效。
 - **LockBorder + Regularize 双重锁定**：`meshopt_simplifyWithAttributes` 的 `options` 参数锁定 mesh 边界，`vertex_lock` 参数锁定 partition 间共享边界，保证 crack-free LOD 过渡。
 - **clone_cluster_for_lod**：当 partition 只有 1 个 cluster，或简化结果过少时，原 cluster 被克隆到新 LOD 层级（仅修改 `group_id`，共享同一 meshlet 数据），避免数据丢失。
+
+##### 8.4.3.1 拓扑连通性保障（cluster 聚合算法改进）
+
+> 详见迭代文档 `nanite_doc/spec/stage0-offline-build/iteration-cluster_aggregation.md`。
+
+**问题现象**：在 LOD ≥ 5 的高层级，原方案（`vertex_positions` 传入真实顶点位置）产生的 partition 内多个 cluster 并非拓扑连通——同一 partition 内的 cluster 之间不共享边或顶点，整个 partition 在空间上是断裂的。导致：
+
+- **简化质量下降**：`meshopt_simplifyWithAttributes` 对非连通网格做 border-vertex locking 时，锁定条件（顶点被 ≥2 个 cluster 引用）在断裂处失效，locked vertex 集合为空，LockBorder 约束退化为无约束，简化时可能产生裂缝。
+- **预览异常**：partition border 显示为多条不连通的轮廓线。
+
+**根因**：meshoptimizer `partition.cpp` 中 `meshopt_partitionClusters` 的 `mergeSpatial()` 后处理。当 `vertex_positions != nullptr` 时触发，构建空间 KD-tree + 递归二分 + `mergeLeaf()` 纯按 `boundsScore`（空间近邻）合并，**完全绕过 Phase 1 构建的拓扑邻接图**。cluster 数量少时（如 LOD 5 仅 44 个），`mergeSpatial` 会将空间上近但拓扑不连通的小 partition 强行合并，产生断裂。
+
+**最终方案**：三处 `meshopt_partitionClusters` 调用（`build_hierarchy()` + 编辑器 `build_partition_border_wire` + `build_partition_sibling_mesh`）均将 `vertex_positions` 参数改为 `nullptr`：
+
+```cpp
+// 修改前（触发 mergeSpatial，破坏拓扑连通性）：
+size_t partition_count = meshopt_partitionClusters(
+    partition_ids.ptr(),
+    cluster_indices.ptr(), cluster_indices.size(),
+    cluster_index_counts.ptr(), cluster_count,
+    m_verts_pos.ptr(),      // 顶点位置 → 触发 mergeSpatial
+    vertex_count, vertex_stride,
+    partition_size);
+
+// 修改后（纯拓扑邻接图分区，保证拓扑连通）：
+size_t partition_count = meshopt_partitionClusters(
+    partition_ids.ptr(),
+    cluster_indices.ptr(), cluster_indices.size(),
+    cluster_index_counts.ptr(), cluster_count,
+    nullptr,                // 纯拓扑邻接图分区
+    0, 0,                   // vertex_count/stride（NULL 时被忽略）
+    partition_size);
+```
+
+**方案优势**：
+
+| 维度 | 说明 |
+|------|------|
+| 拓扑连通 | ✓ Phase 1 拓扑驱动聚合保证 partition 内 cluster 共享顶点 |
+| 空间紧凑 | meshopt 的拓扑模式本身已近似 SAH（共享顶点数 ≈ 接触面 ≈ 包围盒增量） |
+| 维护成本 | 仅 3 行改动，完全依赖 meshoptimizer 库，不引入独立代码 |
+| 长链截断 | partition 内简化网格经 `meshopt_buildMeshletsFlex` re-cluster 后，parent cluster 空间紧凑，长链被截断 |
+| BVH/LOD 不受影响 | BVH 基于 re-cluster 后的 parent cluster 包围盒；LOD 误差由 `target_error` 控制 |
+
+**边界情况**：
+
+- **单 cluster partition**：不与任何 cluster 共享顶点的 cluster 成为单 cluster partition，由 `clone_cluster_for_lod()` 直接 promote 到 parent LOD。
+- **邻接图不连通**（多组件 mesh）：每个连通分量自然划分为独立 partition(s)，正确行为——不应合并不连通组件。
+- **弱连通（共享顶点极少）**：仅共享 1 个顶点的两个 cluster 仍被视为连通，但 `pickGroupToMerge` 评分低，通常被分到不同 partition；即使被合并，1 个共享顶点也足以让 border-vertex locking 标记该顶点为 locked。
 
 #### 8.4.4 BVH 装配 (build_bvh)
 
@@ -1286,7 +1337,7 @@ NaniteMeshEditor (SubViewportContainer)
 
 > 旧 `DebugMode` 枚举（7 项：NONE / CLUSTER_SOLID_COLOR / LOD_SOLID_COLOR / OVERDRAW_HEATMAP / PAGE_RESIDENCY / HZB_MIP_LEVELS / HZB_OCCLUSION）保留供 Stage 1 GPU pipeline (`nanite_material_resolve.glsl`) 继续使用。
 
-**Partition Border 可视化**：`build_partition_border_wire()` 函数对指定 LOD 的 cluster 执行 `meshopt_partitionClusters(target=4)` 重建分区，对每个 partition 合并其内所有 cluster 的三角形，统计每条边（无向，key = `min_v << 32 | max_v`）在 partition 内被多少个三角形引用，**仅保留恰好出现 1 次的边**——即 partition 整体的外轮廓边界（未被同 partition 内其他三角形共享的边）。这与早期"提取被 ≥2 cluster 共享的顶点构成的边"不同：外轮廓描述 partition 与外部的边界，而非 cluster 间的内部接缝。结果生成黄色 `PRIMITIVE_LINES` 线段，由 `partition_border_solid_instance`（depth-test enabled）和 `partition_border_instance`（stipple shader, depth-test disabled）配对渲染。
+**Partition Border 可视化**：`build_partition_border_wire()` 函数对指定 LOD 的 cluster 执行 `meshopt_partitionClusters(target=4, vertex_positions=nullptr)` 重建分区（纯拓扑模式，与构建时策略一致，保证 partition 拓扑连通），对每个 partition 合并其内所有 cluster 的三角形，统计每条边（无向，key = `min_v << 32 | max_v`）在 partition 内被多少个三角形引用，**仅保留恰好出现 1 次的边**——即 partition 整体的外轮廓边界（未被同 partition 内其他三角形共享的边）。由于 partition 拓扑连通，外轮廓形成连续闭合的轮廓线。结果生成黄色 `PRIMITIVE_LINES` 线段，由 `partition_border_solid_instance`（depth-test enabled）和 `partition_border_instance`（stipple shader, depth-test disabled）配对渲染。
 
 #### 8.8.3 LOD Mode（2 种）
 
