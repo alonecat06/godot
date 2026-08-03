@@ -439,39 +439,54 @@ Ref<ArrayMesh> build_partition_border_wire(const NaniteMeshResource &p_resource,
 		return Ref<ArrayMesh>();
 	}
 
-	// 2) Build cluster_indices and cluster_index_counts for meshopt_partitionClusters.
-	LocalVector<unsigned int> cluster_indices;
-	LocalVector<unsigned int> cluster_index_counts;
-	cluster_index_counts.resize(cl_cluster_count);
-	for (size_t i = 0; i < cl_cluster_count; ++i) {
-		const ClusterInfo &info = cur_lod_clusters[i];
-		cluster_index_counts[i] = (unsigned int)info.tri_indices.size();
-		for (unsigned int idx : info.tri_indices) {
-			cluster_indices.push_back(idx);
-		}
-	}
-
-	// 3) Partition current LOD clusters into groups of ~4.
-	// Validate cluster indices to avoid meshopt assert(v < vertex_count) crash.
-	size_t safe_vertex_count = (size_t)total_vertex_count;
-	for (size_t i = 0; i < cluster_indices.size(); ++i) {
-		unsigned int v = cluster_indices[i];
-		if (v >= safe_vertex_count) {
-			safe_vertex_count = (size_t)v + 1;
-		}
-	}
+	// 2) Partition current LOD clusters. Prefer stored partition_ids from
+	// the resource (accurate); fall back to meshopt recompute if unavailable.
 	LocalVector<unsigned int> partition_ids;
 	partition_ids.resize(cl_cluster_count);
-	size_t partition_count = meshopt_partitionClusters(
-			partition_ids.ptr(),
-			cluster_indices.ptr(),
-			cluster_indices.size(),
-			cluster_index_counts.ptr(),
-			cl_cluster_count,
-			nullptr,
-			safe_vertex_count,
-			0,
-			4);
+	size_t partition_count = 0;
+
+	PackedByteArray pid_blob = p_resource.get_partition_ids_data();
+	if (pid_blob.size() >= (int)(cluster_count * sizeof(uint32_t))) {
+		// Read stored partition_ids — these are the exact IDs from build time.
+		const uint32_t *pid_base = reinterpret_cast<const uint32_t *>(pid_blob.ptr());
+		for (size_t i = 0; i < cl_cluster_count; ++i) {
+			uint32_t cidx = cur_lod_clusters[i].cluster_idx;
+			uint32_t pid = pid_base[cidx];
+			partition_ids[i] = pid;
+			if (pid != UINT32_MAX && (size_t)(pid + 1) > partition_count) {
+				partition_count = pid + 1;
+			}
+		}
+	} else {
+		// Fall back: recompute partitions with meshopt (less accurate).
+		LocalVector<unsigned int> cluster_indices;
+		LocalVector<unsigned int> cluster_index_counts;
+		cluster_index_counts.resize(cl_cluster_count);
+		for (size_t i = 0; i < cl_cluster_count; ++i) {
+			const ClusterInfo &info = cur_lod_clusters[i];
+			cluster_index_counts[i] = (unsigned int)info.tri_indices.size();
+			for (unsigned int idx : info.tri_indices) {
+				cluster_indices.push_back(idx);
+			}
+		}
+		size_t safe_vertex_count = (size_t)total_vertex_count;
+		for (size_t i = 0; i < cluster_indices.size(); ++i) {
+			unsigned int v = cluster_indices[i];
+			if (v >= safe_vertex_count) {
+				safe_vertex_count = (size_t)v + 1;
+			}
+		}
+		partition_count = meshopt_partitionClusters(
+				partition_ids.ptr(),
+				cluster_indices.ptr(),
+				cluster_indices.size(),
+				cluster_index_counts.ptr(),
+				cl_cluster_count,
+				nullptr,
+				safe_vertex_count,
+				0,
+				3);
+	}
 
 	if (partition_count == 0 || partition_count == cl_cluster_count) {
 		return Ref<ArrayMesh>();
@@ -890,38 +905,52 @@ Ref<ArrayMesh> build_partition_sibling_mesh(const NaniteMeshResource &p_resource
 		return Ref<ArrayMesh>();
 	}
 
-	// 2) Partition clusters.
-	LocalVector<unsigned int> cluster_indices;
-	LocalVector<unsigned int> cluster_index_counts;
-	cluster_index_counts.resize(cl_cluster_count);
-	for (size_t i = 0; i < cl_cluster_count; ++i) {
-		const ClusterInfo &info = cur_lod_clusters[i];
-		cluster_index_counts[i] = (unsigned int)info.tri_indices.size();
-		for (unsigned int idx : info.tri_indices) {
-			cluster_indices.push_back(idx);
-		}
-	}
-
+	// 2) Partition clusters. Prefer stored partition_ids from the resource.
 	LocalVector<unsigned int> partition_ids;
 	partition_ids.resize(cl_cluster_count);
-	// Validate cluster indices to avoid meshopt assert(v < vertex_count) crash.
-	size_t safe_vc = (size_t)total_vertex_count;
-	for (size_t i = 0; i < cluster_indices.size(); ++i) {
-		unsigned int v = cluster_indices[i];
-		if (v >= safe_vc) {
-			safe_vc = (size_t)v + 1;
+	size_t partition_count = 0;
+
+	PackedByteArray pid_blob = p_resource.get_partition_ids_data();
+	if (pid_blob.size() >= (int)(cluster_count * sizeof(uint32_t))) {
+		const uint32_t *pid_base = reinterpret_cast<const uint32_t *>(pid_blob.ptr());
+		for (size_t i = 0; i < cl_cluster_count; ++i) {
+			uint32_t cidx = cur_lod_clusters[i].cluster_idx;
+			uint32_t pid = pid_base[cidx];
+			partition_ids[i] = pid;
+			if (pid != UINT32_MAX && (size_t)(pid + 1) > partition_count) {
+				partition_count = pid + 1;
+			}
 		}
+	} else {
+		// Fall back: recompute partitions with meshopt.
+		LocalVector<unsigned int> cluster_indices;
+		LocalVector<unsigned int> cluster_index_counts;
+		cluster_index_counts.resize(cl_cluster_count);
+		for (size_t i = 0; i < cl_cluster_count; ++i) {
+			const ClusterInfo &info = cur_lod_clusters[i];
+			cluster_index_counts[i] = (unsigned int)info.tri_indices.size();
+			for (unsigned int idx : info.tri_indices) {
+				cluster_indices.push_back(idx);
+			}
+		}
+		size_t safe_vc = (size_t)total_vertex_count;
+		for (size_t i = 0; i < cluster_indices.size(); ++i) {
+			unsigned int v = cluster_indices[i];
+			if (v >= safe_vc) {
+				safe_vc = (size_t)v + 1;
+			}
+		}
+		partition_count = meshopt_partitionClusters(
+				partition_ids.ptr(),
+				cluster_indices.ptr(),
+				cluster_indices.size(),
+				cluster_index_counts.ptr(),
+				cl_cluster_count,
+				nullptr,
+				safe_vc,
+				0,
+				3);
 	}
-	size_t partition_count = meshopt_partitionClusters(
-			partition_ids.ptr(),
-			cluster_indices.ptr(),
-			cluster_indices.size(),
-			cluster_index_counts.ptr(),
-			cl_cluster_count,
-			nullptr,
-			safe_vc,
-			0,
-			4);
 
 	if (partition_count == 0 || partition_count == cl_cluster_count) {
 		return Ref<ArrayMesh>();
@@ -1093,7 +1122,7 @@ int NaniteMeshEditor::_ray_pick_cluster(const Vector2 &p_screen_pos) {
 
 	const int cluster_count = current_resource->get_cluster_count();
 	const size_t cluster_stride = NaniteCluster::get_serialized_size();
-	const int force_lod = (int)force_lod_spinner->get_value();
+	const int force_lod = force_lod_level;
 
 	if (cluster_count <= 0 || clusters_data.size() < (int)(cluster_count * cluster_stride)) {
 		return -1;
@@ -1165,6 +1194,88 @@ int NaniteMeshEditor::_ray_pick_cluster(const Vector2 &p_screen_pos) {
 	return best_cluster;
 }
 
+void NaniteMeshEditor::_cycle_cluster_in_partition(int p_direction) {
+	// Only active in Cluster Solid + Partition Border mode with a selection.
+	const int display_id = current_display_mode;
+	if (display_id != NaniteDebug::CLUSTER_SOLID_WITH_PARTITION_BORDER) {
+		return;
+	}
+	if (selected_cluster_index < 0 || current_resource.is_null()) {
+		return;
+	}
+
+	const int cluster_count = current_resource->get_cluster_count();
+	if (selected_cluster_index >= cluster_count) {
+		return;
+	}
+
+	// Need stored partition_ids — without them we can't reliably identify
+	// partition siblings (meshopt recompute is order-sensitive and may
+	// differ from build-time data).
+	PackedByteArray pid_blob = current_resource->get_partition_ids_data();
+	if (pid_blob.size() < (int)(cluster_count * sizeof(uint32_t))) {
+		print_line("[nanite-cycle] no stored partition_ids_data — cannot cycle");
+		return;
+	}
+	const uint32_t *pid_base = reinterpret_cast<const uint32_t *>(pid_blob.ptr());
+	const uint32_t target_pid = pid_base[selected_cluster_index];
+	if (target_pid == UINT32_MAX) {
+		print_line("[nanite-cycle] selected cluster has no partition_id");
+		return;
+	}
+
+	// Collect all clusters in the same LOD + same partition (sorted by
+	// global cluster index for stable navigation).
+	const int force_lod = force_lod_level;
+	const size_t cluster_stride = NaniteCluster::get_serialized_size();
+	const PackedByteArray &clusters_data = current_resource->get_clusters_data();
+
+	LocalVector<int> siblings;
+	for (int ci = 0; ci < cluster_count; ++ci) {
+		if (pid_base[ci] != target_pid) {
+			continue;
+		}
+		NaniteCluster c = NaniteCluster::deserialize(clusters_data,
+				(uint32_t)(ci * cluster_stride));
+		if ((int)c.group_id != force_lod) {
+			continue;
+		}
+		siblings.push_back(ci);
+	}
+
+	if (siblings.size() <= 1) {
+		print_line(vformat("[nanite-cycle] partition %d has %d siblings — nothing to cycle",
+				(int)target_pid, (int)siblings.size()));
+		return;
+	}
+
+	// Find current position and advance (wrapping).
+	int cur_pos = -1;
+	for (size_t i = 0; i < siblings.size(); ++i) {
+		if (siblings[i] == selected_cluster_index) {
+			cur_pos = (int)i;
+			break;
+		}
+	}
+	if (cur_pos < 0) {
+		return; // Should not happen, defensive.
+	}
+
+	int new_pos = cur_pos + (p_direction > 0 ? 1 : -1);
+	if (new_pos < 0) {
+		new_pos = (int)siblings.size() - 1; // Wrap backwards.
+	} else if (new_pos >= (int)siblings.size()) {
+		new_pos = 0; // Wrap forwards.
+	}
+
+	int new_cluster = siblings[new_pos];
+	print_line(vformat("[nanite-cycle] partition=%d cur=%d(pos %d/%d) -> new=%d(pos %d)",
+			(int)target_pid, selected_cluster_index, cur_pos, (int)siblings.size(),
+			new_cluster, new_pos));
+	selected_cluster_index = new_cluster;
+	_rebuild_preview();
+}
+
 void NaniteMeshEditor::_notification(int p_what) {
 	switch (p_what) {
 		case NOTIFICATION_FOCUS_ENTER: {
@@ -1181,36 +1292,67 @@ void NaniteMeshEditor::_notification(int p_what) {
 }
 
 void NaniteMeshEditor::_on_display_mode_selected(int p_index) {
-	(void)p_index;
+	if (updating_ui) {
+		return;
+	}
+	current_display_mode = display_mode_btn->get_item_id(p_index);
 	selected_cluster_index = -1; // Clear selection on mode change.
 	_rebuild_preview();
 }
 
 void NaniteMeshEditor::_on_lod_mode_selected(int p_index) {
-	if (lod_mode_updating) {
-		return; // Prevent recursive signal from programmatic select().
+	if (updating_ui) {
+		return;
 	}
-	selected_cluster_index = -1; // Clear selection on LOD mode change.
 	int mode = lod_mode_btn->get_item_id(p_index);
 	if (mode == NaniteDebug::NANITE_AUTO) {
-		// Stage 0 has no Nanite GPU cull/LOD pipeline; warn and fall back.
+		// Stage 0 has no Nanite GPU cull/LOD pipeline; warn and revert.
 		WARN_PRINT("Nanite auto cull + LOD selection is a Stage 1 feature. "
-				   "Falling back to Force LOD Level 0.");
-		lod_mode_updating = true;
+				   "Falling back to Force LOD Level.");
+		updating_ui = true;
 		lod_mode_btn->select(NaniteDebug::FORCE_LOD_LEVEL);
-		lod_mode_updating = false;
-		force_lod_spinner->set_visible(true);
-		force_lod_spinner->set_value(0);
-	} else {
-		force_lod_spinner->set_visible(true);
+		updating_ui = false;
+		return;
 	}
+	current_lod_mode = NaniteDebug::FORCE_LOD_LEVEL;
+	selected_cluster_index = -1;
+	_refresh_lod_buttons();
 	_rebuild_preview();
 }
 
-void NaniteMeshEditor::_on_force_lod_changed(double p_value) {
-	(void)p_value;
-	selected_cluster_index = -1; // Clear selection on LOD change.
-	_rebuild_preview();
+void NaniteMeshEditor::_on_lod_minus_pressed() {
+	if (force_lod_level > 0) {
+		force_lod_level--;
+		selected_cluster_index = -1;
+		_refresh_lod_buttons();
+		_rebuild_preview();
+	}
+}
+
+void NaniteMeshEditor::_on_lod_plus_pressed() {
+	if (force_lod_level < max_lod_level) {
+		force_lod_level++;
+		selected_cluster_index = -1;
+		_refresh_lod_buttons();
+		_rebuild_preview();
+	}
+}
+
+void NaniteMeshEditor::_refresh_lod_buttons() {
+	// Show the [-] [N] [+] row only when LOD Mode == Force LOD Level.
+	bool show_row = (current_lod_mode == NaniteDebug::FORCE_LOD_LEVEL);
+	if (lod_buttons_row) {
+		lod_buttons_row->set_visible(show_row);
+	}
+	if (lod_value_label) {
+		lod_value_label->set_text(vformat("%d", force_lod_level));
+	}
+	if (lod_minus_button) {
+		lod_minus_button->set_disabled(force_lod_level <= 0);
+	}
+	if (lod_plus_button) {
+		lod_plus_button->set_disabled(force_lod_level >= max_lod_level);
+	}
 }
 
 void NaniteMeshEditor::gui_input(const Ref<InputEvent> &p_event) {
@@ -1219,7 +1361,7 @@ void NaniteMeshEditor::gui_input(const Ref<InputEvent> &p_event) {
 	// --- Keyboard ---
 	Ref<InputEventKey> k = p_event;
 	if (k.is_valid() && k->is_pressed()) {
-		// F / ESC: single press only (no echo / key repeat).
+		// F / ESC / Page Up / Page Down: single press only (no echo / key repeat).
 		if (!k->is_echo()) {
 			if (k->get_keycode() == Key::F) {
 				_focus_on_model();
@@ -1233,6 +1375,18 @@ void NaniteMeshEditor::gui_input(const Ref<InputEvent> &p_event) {
 					accept_event();
 					return;
 				}
+			}
+			// Page Up / Page Down: cycle selection within the same partition
+			// in Cluster Solid + Partition Border mode.
+			if (k->get_keycode() == Key::PAGEUP) {
+				_cycle_cluster_in_partition(-1);
+				accept_event();
+				return;
+			}
+			if (k->get_keycode() == Key::PAGEDOWN) {
+				_cycle_cluster_in_partition(+1);
+				accept_event();
+				return;
 			}
 		}
 
@@ -1277,9 +1431,23 @@ void NaniteMeshEditor::gui_input(const Ref<InputEvent> &p_event) {
 	// --- Mouse wheel: zoom ---
 	Ref<InputEventMouseButton> mb = p_event;
 	if (mb.is_valid()) {
-		// Skip events on the UI bar so child controls work.
+		// Skip wheel events over the top-right UI overlay so the controls
+		// (dropdowns / LOD adjust row) can receive them.
 		if (ui_bar && ui_bar->get_global_rect().has_point(mb->get_global_position())) {
-			return;
+			// ui_bar spans the full rect (PRESET_FULL_RECT); narrow the skip
+			// to the actual VBox area on the right by checking its children.
+			bool over_control = false;
+			if (display_mode_btn && display_mode_btn->get_global_rect().has_point(mb->get_global_position())) {
+				over_control = true;
+			} else if (lod_mode_btn && lod_mode_btn->get_global_rect().has_point(mb->get_global_position())) {
+				over_control = true;
+			} else if (lod_buttons_row && lod_buttons_row->is_visible() &&
+					lod_buttons_row->get_global_rect().has_point(mb->get_global_position())) {
+				over_control = true;
+			}
+			if (over_control) {
+				return;
+			}
 		}
 
 		if (mb->get_button_index() == MouseButton::WHEEL_UP) {
@@ -1317,7 +1485,7 @@ void NaniteMeshEditor::gui_input(const Ref<InputEvent> &p_event) {
 					float drag_dist = (mb->get_position() - click_pos).length();
 					constexpr float kClickThreshold = 5.0f;
 					if (drag_dist < kClickThreshold) {
-						const int display_id = display_mode_btn->get_selected_id();
+						const int display_id = current_display_mode;
 						if (display_id == NaniteDebug::CLUSTER_SOLID ||
 								display_id == NaniteDebug::CLUSTER_SOLID_WIREFRAME ||
 								display_id == NaniteDebug::CLUSTER_SOLID_WITH_PARTITION_BORDER) {
@@ -1402,9 +1570,9 @@ void NaniteMeshEditor::_rebuild_preview() {
 		return;
 	}
 
-	const int display_id = display_mode_btn->get_selected_id();
-	const int lod_mode = lod_mode_btn->get_selected_id();
-	const int force_lod = (int)force_lod_spinner->get_value();
+	const int display_id = current_display_mode;
+	const int lod_mode = current_lod_mode;
+	const int force_lod = force_lod_level;
 
 	print_line(vformat("[nanite-preview] display_id=%d lod_mode=%d force_lod=%d selected_cluster=%d",
 			display_id, lod_mode, force_lod, selected_cluster_index));
@@ -1516,52 +1684,25 @@ void NaniteMeshEditor::_rebuild_preview() {
 
 	print_line(vformat("[nanite-preview] final: solid_mesh_valid=%d wire_mesh_valid=%d solid_visible=%d wire_visible=%d partition_border_visible=%d",
 			(int)solid_mesh.is_valid(), (int)wire_mesh.is_valid(), (int)solid_visible, (int)wire_visible, (int)partition_border_visible));
+
+	// Refresh stats label so selected cluster / partition details stay in
+	// sync with the current selection + display mode + force_lod.
+	_update_stats_label();
 }
 
-void NaniteMeshEditor::edit(const Ref<NaniteMeshResource> &p_resource) {
-	current_resource = p_resource;
-
+void NaniteMeshEditor::_update_stats_label() {
+	if (stats_label == nullptr) {
+		return;
+	}
 	if (current_resource.is_null()) {
-		print_line("[nanite-edit] resource is null");
-		solid_instance->set_mesh(Ref<Mesh>());
-		wire_instance->set_mesh(Ref<Mesh>());
-		partition_border_solid_instance->set_mesh(Ref<Mesh>());
-		partition_border_instance->set_mesh(Ref<Mesh>());
 		stats_label->set_text("");
 		return;
 	}
 
-	print_line(vformat("[nanite-edit] resource loaded: cluster_count=%d node_count=%d page_count=%d",
-			current_resource->get_cluster_count(), current_resource->get_node_count(), current_resource->get_page_count()));
-	print_line(vformat("[nanite-edit] blob sizes: vd=%d cd=%d nd=%d pt=%d md=%d mvd=%d mtd=%d",
-			current_resource->get_vertex_data().size(),
-			current_resource->get_clusters_data().size(),
-			current_resource->get_nodes_data().size(),
-			current_resource->get_page_table_data().size(),
-			current_resource->get_materials_data().size(),
-			current_resource->get_meshlet_vertices_data().size(),
-			current_resource->get_meshlet_triangles_data().size()));
-	print_line(vformat("[nanite-edit] shadow_mesh valid=%d", (int)current_resource->get_shadow_mesh().is_valid()));
-
-	// Refresh the Force LOD SpinBox range from the resource's max LOD.
-	const int max_lod = current_resource->get_max_lod_level();
-	force_lod_spinner->set_min(0);
-	force_lod_spinner->set_max(MAX(max_lod, 0));
-	if ((int)force_lod_spinner->get_value() > max_lod) {
-		force_lod_spinner->set_value(max_lod);
-	}
-
-	// Default to Force LOD 0 if this is a fresh load.
-	if (!force_lod_spinner->is_visible()) {
-		force_lod_spinner->set_visible(true);
-		force_lod_spinner->set_value(0);
-	}
-
-	// Build stats label text: cluster/node/page counts + shadow triangle
-	// count + estimated memory (sum of all blob sizes in MB) + max LOD level.
 	const int cluster_count = current_resource->get_cluster_count();
 	const int node_count = current_resource->get_node_count();
 	const int page_count = current_resource->get_page_count();
+	const int max_lod = current_resource->get_max_lod_level();
 
 	int shadow_tri_count = 0;
 	Ref<ArrayMesh> shadow_mesh = current_resource->get_shadow_mesh();
@@ -1590,7 +1731,104 @@ void NaniteMeshEditor::edit(const Ref<NaniteMeshResource> &p_resource) {
 			"Shadow Tris: %d  |  Est. GPU: %.2f MB  |  Max LOD: %d",
 			cluster_count, node_count, page_count,
 			shadow_tri_count, total_mb, max_lod);
+
+	// Append selected cluster + partition details when a cluster is picked
+	// in a Cluster Solid mode.
+	const int display_id = current_display_mode;
+	const bool is_cluster_solid_mode =
+			(display_id == NaniteDebug::CLUSTER_SOLID ||
+					display_id == NaniteDebug::CLUSTER_SOLID_WIREFRAME ||
+					display_id == NaniteDebug::CLUSTER_SOLID_WITH_PARTITION_BORDER);
+
+	if (is_cluster_solid_mode && selected_cluster_index >= 0 &&
+			selected_cluster_index < cluster_count) {
+		const size_t cluster_stride = NaniteCluster::get_serialized_size();
+		const PackedByteArray &clusters_data = current_resource->get_clusters_data();
+		NaniteCluster c = NaniteCluster::deserialize(clusters_data,
+				(uint32_t)(selected_cluster_index * cluster_stride));
+
+		// Read partition_id from the stored blob (matches build-time data).
+		// UINT32_MAX means no partition data available (e.g. optimize_size export).
+		uint32_t partition_id = UINT32_MAX;
+		PackedByteArray pid_blob = current_resource->get_partition_ids_data();
+		const uint32_t *pid_base = nullptr;
+		if (pid_blob.size() >= (int)(cluster_count * sizeof(uint32_t))) {
+			pid_base = reinterpret_cast<const uint32_t *>(pid_blob.ptr());
+			partition_id = pid_base[selected_cluster_index];
+		}
+
+		// Count sibling clusters in the same LOD + same partition.
+		int partition_cluster_count = 0;
+		if (partition_id != UINT32_MAX && pid_base != nullptr) {
+			const int force_lod = force_lod_level;
+			for (int ci = 0; ci < cluster_count; ++ci) {
+				NaniteCluster oc = NaniteCluster::deserialize(clusters_data,
+						(uint32_t)(ci * cluster_stride));
+				if ((int)oc.group_id != force_lod) {
+					continue;
+				}
+				if (pid_base[ci] == partition_id) {
+					partition_cluster_count++;
+				}
+			}
+		}
+
+		const AABB &b = c.bounds;
+		stats_text += vformat("\n--- Selected Cluster ---\n"
+				"Index: %d  |  LOD: %d  |  Material: %d\n"
+				"Verts: %d  |  Tris: %d  |  Error: %.4f\n"
+				"Bounds: (%.2f,%.2f,%.2f) Size: (%.2f,%.2f,%.2f)\n"
+				"Partition ID: %d  |  Clusters in Partition: %d",
+				selected_cluster_index,
+				c.group_id,
+				c.material_index,
+				c.vertex_count,
+				c.triangle_count,
+				c.error,
+				b.position.x, b.position.y, b.position.z,
+				b.size.x, b.size.y, b.size.z,
+				(partition_id == UINT32_MAX ? -1 : (int)partition_id),
+				partition_cluster_count);
+	}
+
 	stats_label->set_text(stats_text);
+}
+
+void NaniteMeshEditor::edit(const Ref<NaniteMeshResource> &p_resource) {
+	current_resource = p_resource;
+
+	if (current_resource.is_null()) {
+		print_line("[nanite-edit] resource is null");
+		solid_instance->set_mesh(Ref<Mesh>());
+		wire_instance->set_mesh(Ref<Mesh>());
+		partition_border_solid_instance->set_mesh(Ref<Mesh>());
+		partition_border_instance->set_mesh(Ref<Mesh>());
+		stats_label->set_text("");
+		return;
+	}
+
+	print_line(vformat("[nanite-edit] resource loaded: cluster_count=%d node_count=%d page_count=%d",
+			current_resource->get_cluster_count(), current_resource->get_node_count(), current_resource->get_page_count()));
+	print_line(vformat("[nanite-edit] blob sizes: vd=%d cd=%d nd=%d pt=%d md=%d mvd=%d mtd=%d",
+			current_resource->get_vertex_data().size(),
+			current_resource->get_clusters_data().size(),
+			current_resource->get_nodes_data().size(),
+			current_resource->get_page_table_data().size(),
+			current_resource->get_materials_data().size(),
+			current_resource->get_meshlet_vertices_data().size(),
+			current_resource->get_meshlet_triangles_data().size()));
+	print_line(vformat("[nanite-edit] shadow_mesh valid=%d", (int)current_resource->get_shadow_mesh().is_valid()));
+
+	// Refresh the Force LOD range from the resource's max LOD level.
+	max_lod_level = current_resource->get_max_lod_level();
+	if (force_lod_level > max_lod_level) {
+		force_lod_level = MAX(max_lod_level, 0);
+	}
+	_refresh_lod_buttons();
+
+	// Build stats label text (general resource stats; selected cluster
+	// details are appended by _update_stats_label() when applicable).
+	_update_stats_label();
 
 	// Auto-fit camera distance based on shadow mesh AABB (if present).
 	_focus_on_model();
@@ -1732,14 +1970,19 @@ void fragment() {
 
 	set_custom_minimum_size(Size2(0, 150) * EDSCALE);
 
-	// Overlay HBoxContainer at the bottom holding the two dropdowns +
-	// SpinBox + spacer. Mirrors the layout in the design doc Section 9.5.
+	// Top-right overlay: HBoxContainer with PRESET_FULL_RECT + leading
+	// spacer pushes a VBoxContainer (holding the two dropdowns + the
+	// conditional LOD adjust row) to the top-right corner.
 	HBoxContainer *hb = memnew(HBoxContainer);
 	ui_bar = hb;
 	add_child(hb);
-	hb->set_anchors_and_offsets_preset(Control::PRESET_BOTTOM_WIDE, Control::PRESET_MODE_MINSIZE, 2);
+	hb->set_anchors_and_offsets_preset(Control::PRESET_FULL_RECT, Control::PRESET_MODE_MINSIZE, 0);
+	hb->add_spacer();
 
-	// List 1: Display Mode.
+	VBoxContainer *vb = memnew(VBoxContainer);
+	hb->add_child(vb);
+
+	// Dropdown 1: Display Mode.
 	display_mode_btn = memnew(OptionButton);
 	display_mode_btn->set_flat(true);
 	display_mode_btn->add_item("Normal", NaniteDebug::NORMAL);
@@ -1750,33 +1993,47 @@ void fragment() {
 	display_mode_btn->add_item("Cluster Solid + Partition Border", NaniteDebug::CLUSTER_SOLID_WITH_PARTITION_BORDER);
 	display_mode_btn->select(0);
 	display_mode_btn->set_custom_minimum_size(Size2(180, 0) * EDSCALE);
-	hb->add_child(display_mode_btn);
-	display_mode_btn->connect("item_selected",
+	vb->add_child(display_mode_btn);
+	display_mode_btn->connect(SceneStringName(item_selected),
 			callable_mp(this, &NaniteMeshEditor::_on_display_mode_selected));
 
-	// List 2: LOD Mode.
+	// Dropdown 2: LOD Mode.
 	lod_mode_btn = memnew(OptionButton);
 	lod_mode_btn->set_flat(true);
-	lod_mode_btn->add_item("Nanite (auto cull + LOD)  [Stage 1]", NaniteDebug::NANITE_AUTO);
+	lod_mode_btn->add_item("Nanite (auto) [Stage 1]", NaniteDebug::NANITE_AUTO);
 	lod_mode_btn->add_item("Force LOD Level", NaniteDebug::FORCE_LOD_LEVEL);
 	lod_mode_btn->select(NaniteDebug::FORCE_LOD_LEVEL);
-	lod_mode_btn->set_custom_minimum_size(Size2(220, 0) * EDSCALE);
-	hb->add_child(lod_mode_btn);
-	lod_mode_btn->connect("item_selected",
+	lod_mode_btn->set_custom_minimum_size(Size2(180, 0) * EDSCALE);
+	vb->add_child(lod_mode_btn);
+	lod_mode_btn->connect(SceneStringName(item_selected),
 			callable_mp(this, &NaniteMeshEditor::_on_lod_mode_selected));
 
-	// List 2 child: Force LOD Level SpinBox.
-	force_lod_spinner = memnew(SpinBox);
-	force_lod_spinner->set_min(0);
-	force_lod_spinner->set_max(0);
-	force_lod_spinner->set_value(0);
-	force_lod_spinner->set_visible(true);
-	force_lod_spinner->set_custom_minimum_size(Size2(80, 0) * EDSCALE);
-	hb->add_child(force_lod_spinner);
-	force_lod_spinner->connect("value_changed",
-			callable_mp(this, &NaniteMeshEditor::_on_force_lod_changed));
+	// Conditional LOD adjust row: [-] [N] [+], shown only when LOD Mode ==
+	// Force LOD Level.
+	lod_buttons_row = memnew(HBoxContainer);
+	vb->add_child(lod_buttons_row);
 
-	hb->add_spacer();
+	lod_minus_button = memnew(Button);
+	lod_minus_button->set_text("-");
+	lod_minus_button->set_tooltip_text("Decrease Force LOD Level");
+	lod_minus_button->connect(SceneStringName(pressed),
+			callable_mp(this, &NaniteMeshEditor::_on_lod_minus_pressed));
+	lod_buttons_row->add_child(lod_minus_button);
+
+	lod_value_label = memnew(Label);
+	lod_value_label->set_text("0");
+	lod_value_label->set_horizontal_alignment(HORIZONTAL_ALIGNMENT_CENTER);
+	lod_value_label->set_custom_minimum_size(Size2(24, 0) * EDSCALE);
+	lod_buttons_row->add_child(lod_value_label);
+
+	lod_plus_button = memnew(Button);
+	lod_plus_button->set_text("+");
+	lod_plus_button->set_tooltip_text("Increase Force LOD Level");
+	lod_plus_button->connect(SceneStringName(pressed),
+			callable_mp(this, &NaniteMeshEditor::_on_lod_plus_pressed));
+	lod_buttons_row->add_child(lod_plus_button);
+
+	_refresh_lod_buttons();
 
 	// Stats label overlay in the top-left of the preview area.
 	stats_label = memnew(Label);

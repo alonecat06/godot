@@ -102,6 +102,18 @@ PackedByteArray NaniteMeshResource::get_materials_data() const {
 	return materials_data;
 }
 
+void NaniteMeshResource::set_partition_ids_data(const PackedByteArray &p_data) {
+	partition_ids_data = p_data;
+}
+
+PackedByteArray NaniteMeshResource::get_partition_ids_data() const {
+	return partition_ids_data;
+}
+
+bool NaniteMeshResource::has_partition_ids() const {
+	return partition_ids_data.size() >= 4; // at least one uint32
+}
+
 void NaniteMeshResource::set_shadow_mesh(const Ref<ArrayMesh> &p_mesh) {
 	// Validate that the assigned resource is actually an ArrayMesh (or a
 	// subclass thereof). A null Ref is allowed — clears the field.
@@ -194,9 +206,13 @@ int NaniteMeshResource::get_max_lod_level() const {
 //   12 B) to raw (stride 32 B: position.xyz + normal.xyz + uv.xy); clusters_data
 //   changed from variable-length [meta+meshlet_bytes] per cluster to fixed
 //   68-byte metadata only; meshlet geometry moved into two new blobs
-//   (meshlet_vertices_data, meshlet_triangles_data). Old v2 files fail to
-//   load — rebuild from source mesh via NaniteBuilder.
-static const uint32_t NANITE_FORMAT_VERSION = 3;
+//   (meshlet_vertices_data, meshlet_triangles_data). Old v2 files fail to load
+//   — rebuild from source mesh via NaniteBuilder.
+// v3 → v4: added partition_ids_data blob (uint32 per cluster). v3 files still
+//   load — partition_ids_data is left empty and the viewer falls back to
+//   recomputing partitions. The clusters_data stride stays at 68 bytes.
+static const uint32_t NANITE_FORMAT_VERSION = 4;
+static const uint32_t NANITE_FORMAT_VERSION_V3 = 3;
 
 // Magic bytes spell "NANM" when written in little-endian byte order.
 static const uint8_t NANITE_MAGIC[4] = { 'N', 'A', 'N', 'M' };
@@ -277,6 +293,8 @@ Error NaniteMeshResource::save(const String &p_path) const {
 	nanite_store_blob(f.ptr(), materials_data);
 	nanite_store_blob(f.ptr(), meshlet_vertices_data); // Task 1.16.4
 	nanite_store_blob(f.ptr(), meshlet_triangles_data); // Task 1.16.4
+	// v4 — partition_ids_data (empty when optimize_size=true).
+	nanite_store_blob(f.ptr(), partition_ids_data); // v4
 
 	// Sanity trailer.
 	nanite_store_u32(f.ptr(), static_cast<uint32_t>(cluster_count));
@@ -301,8 +319,8 @@ Error NaniteMeshResource::load(const String &p_path) {
 
 	// Version.
 	const uint32_t version = nanite_load_u32(f.ptr());
-	if (version != NANITE_FORMAT_VERSION) {
-		ERR_FAIL_V_MSG(ERR_FILE_UNRECOGNIZED, vformat("NaniteMeshResource::load: unsupported .nanite version %u (expected %u).", version, NANITE_FORMAT_VERSION));
+	if (version != NANITE_FORMAT_VERSION && version != NANITE_FORMAT_VERSION_V3) {
+		ERR_FAIL_V_MSG(ERR_FILE_UNRECOGNIZED, vformat("NaniteMeshResource::load: unsupported .nanite version %u (expected %u or %u).", version, NANITE_FORMAT_VERSION, NANITE_FORMAT_VERSION_V3));
 	}
 
 	// Seven blob sections (v3 adds meshlet_vertices_data + meshlet_triangles_data — Task 1.16.4).
@@ -321,6 +339,14 @@ Error NaniteMeshResource::load(const String &p_path) {
 	ERR_FAIL_COND_V_MSG(blob_err != OK, blob_err, "NaniteMeshResource::load: meshlet_vertices_data truncated.");
 	blob_err = nanite_load_blob(f.ptr(), meshlet_triangles_data); // Task 1.16.4
 	ERR_FAIL_COND_V_MSG(blob_err != OK, blob_err, "NaniteMeshResource::load: meshlet_triangles_data truncated.");
+
+	// v4 — partition_ids_data blob. v3 files don't have this blob; leave empty.
+	if (version >= NANITE_FORMAT_VERSION) {
+		blob_err = nanite_load_blob(f.ptr(), partition_ids_data);
+		ERR_FAIL_COND_V_MSG(blob_err != OK, blob_err, "NaniteMeshResource::load: partition_ids_data truncated.");
+	} else {
+		partition_ids_data.clear();
+	}
 
 	// Sanity trailer.
 	cluster_count = static_cast<int>(nanite_load_u32(f.ptr()));
@@ -365,6 +391,11 @@ void NaniteMeshResource::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_meshlet_triangles_data", "data"), &NaniteMeshResource::set_meshlet_triangles_data);
 	ClassDB::bind_method(D_METHOD("get_meshlet_triangles_data"), &NaniteMeshResource::get_meshlet_triangles_data);
 	ADD_PROPERTY(PropertyInfo(Variant::PACKED_BYTE_ARRAY, "meshlet_triangles_data"), "set_meshlet_triangles_data", "get_meshlet_triangles_data");
+
+	// v4 — partition_ids_data blob.
+	ClassDB::bind_method(D_METHOD("set_partition_ids_data", "data"), &NaniteMeshResource::set_partition_ids_data);
+	ClassDB::bind_method(D_METHOD("get_partition_ids_data"), &NaniteMeshResource::get_partition_ids_data);
+	ADD_PROPERTY(PropertyInfo(Variant::PACKED_BYTE_ARRAY, "partition_ids_data"), "set_partition_ids_data", "get_partition_ids_data");
 
 	// Metadata resources.
 	ClassDB::bind_method(D_METHOD("set_shadow_mesh", "mesh"), &NaniteMeshResource::set_shadow_mesh);

@@ -54,7 +54,7 @@ public:
 	int min_triangles = 32;
 
 	// Partition / simplification.
-	int partition_size = 4;
+	int partition_size = 4; // meshopt max = target + target/3 = 4, so partitions cap at 4 clusters
 	double cone_weight = 0.5;
 	double split_factor = 0.5;
 	double simplification_ratio = 0.5;
@@ -66,6 +66,12 @@ public:
 	int max_lod_levels = 16;
 	int page_size_bytes = 65536;
 	int shadow_lod_depth = 3;
+
+	// When true, the builder omits partition_ids_data from the output resource
+	// to minimize file size. The editor viewer will fall back to recomputing
+	// partitions at runtime (less accurate). When false (default), partition
+	// IDs are saved for accurate partition visualization.
+	bool optimize_size = false;
 
 	void set_max_vertices(int p_value);
 	int get_max_vertices() const;
@@ -105,6 +111,9 @@ public:
 
 	void set_shadow_lod_depth(int p_value);
 	int get_shadow_lod_depth() const;
+
+	void set_optimize_size(bool p_value);
+	bool get_optimize_size() const;
 
 	// Returns true when every field meets its spec-mandated floor:
 	//   max_vertices       >= 32

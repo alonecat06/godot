@@ -86,6 +86,12 @@ private:
 	// Stage 1 simplified: emissive/IBL left to Stage 2+.
 	PackedByteArray materials_data;
 
+	// v4 — partition_ids_data: one uint32 per cluster (global cluster index),
+	// storing the partition_id assigned during build_hierarchy(). Empty when
+	// the resource was built with optimize_size=true or loaded from a v3 file.
+	// Used by the editor viewer for accurate partition visualization.
+	PackedByteArray partition_ids_data;
+
 	Ref<ArrayMesh> shadow_mesh;
 	Ref<BuilderConfig> build_config;
 
@@ -117,6 +123,12 @@ public:
 	void set_materials_data(const PackedByteArray &p_data);
 	PackedByteArray get_materials_data() const;
 
+	// v4 — partition IDs blob (uint32 per cluster). Empty when optimize_size
+	// was used or loaded from a v3 file.
+	void set_partition_ids_data(const PackedByteArray &p_data);
+	PackedByteArray get_partition_ids_data() const;
+	bool has_partition_ids() const;
+
 	void set_shadow_mesh(const Ref<ArrayMesh> &p_mesh);
 	Ref<ArrayMesh> get_shadow_mesh() const;
 
@@ -138,10 +150,10 @@ public:
 	// is editor-only and cheap to recompute on demand.
 	int get_max_lod_level() const;
 
-	// .nanite binary format. Magic = "NANM" (4 bytes), Version = 3 (uint32).
-	// Layout (v3, after Task 1.16.4):
+	// .nanite binary format. Magic = "NANM" (4 bytes), Version = 4 (uint32).
+	// Layout (v4):
 	//   char[4]   magic = "NANM"
-	//   uint32    version = 3
+	//   uint32    version = 4
 	//   uint32    vertex_data_size, then vertex_data bytes   (raw stride 32 B)
 	//   uint32    clusters_data_size, then clusters_data bytes (68 B per cluster)
 	//   uint32    nodes_data_size, then nodes_data bytes
@@ -149,6 +161,7 @@ public:
 	//   uint32    materials_data_size, then materials_data bytes   (v2+)
 	//   uint32    meshlet_vertices_data_size, then bytes            (v3+)
 	//   uint32    meshlet_triangles_data_size, then bytes           (v3+)
+	//   uint32    partition_ids_data_size, then bytes               (v4+)
 	//   uint32    cluster_count, node_count, page_count (trailer)
 	//   (build_config + shadow_mesh intentionally NOT included in .nanite;
 	//    they are Godot-side metadata only — re-build from source mesh if needed)
@@ -160,6 +173,9 @@ public:
 	//   v3: Task 1.16.4 — vertex_data now raw (stride 32 B: pos+normal+uv);
 	//       clusters_data now metadata-only (fixed 68 B stride); meshlet
 	//       geometry moved to meshlet_vertices_data + meshlet_triangles_data.
+	//   v4: added partition_ids_data blob (uint32 per cluster). Empty when
+	//       built with optimize_size=true. Old v3 files load with empty
+	//       partition_ids (viewer falls back to recompute).
 	Error save(const String &p_path) const;
 	Error load(const String &p_path);
 };

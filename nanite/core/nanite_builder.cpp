@@ -909,6 +909,9 @@ bool NaniteBuilder::build_hierarchy() {
 			if (pid < partition_count) {
 				partitions[pid].push_back(c);
 			}
+			// Save partition_id to the source cluster for the viewer.
+			const HierarchyNode &hn = m_hierarchy_tree[current_level_nodes[c]];
+			m_clusters[hn.cluster_idx].partition_id = pid;
 		}
 
 		print_line(vformat("[nanite-build] LOD %d -> %d: clusters=%d partitions=%d",
@@ -1660,6 +1663,22 @@ Ref<NaniteMeshResource> NaniteBuilder::finalize_resource() {
 		memcpy(clusters_data.ptrw(), clusters_buf.ptr(), clusters_buf.size());
 	}
 	res->set_clusters_data(clusters_data);
+
+	// ---- 2b) Partition IDs blob (v4) -----------------------------------
+	// One uint32 per cluster (indexed by global cluster index). Empty when
+	// optimize_size=true — the viewer will fall back to recomputing.
+	if (!m_cfg->optimize_size) {
+		const size_t pid_count = m_clusters.size();
+		PackedByteArray pid_data;
+		pid_data.resize(static_cast<int>(pid_count * sizeof(uint32_t)));
+		if (pid_count > 0) {
+			uint32_t *pids = reinterpret_cast<uint32_t *>(pid_data.ptrw());
+			for (size_t i = 0; i < pid_count; ++i) {
+				pids[i] = m_clusters[i].partition_id;
+			}
+		}
+		res->set_partition_ids_data(pid_data);
+	}
 
 	// ---- 3) Nodes: per-node serialize() concatenation --------------------
 	// Each NaniteClusterNode::serialize() returns a fixed 48-byte

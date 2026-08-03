@@ -136,6 +136,14 @@ int BuilderConfig::get_shadow_lod_depth() const {
 	return shadow_lod_depth;
 }
 
+void BuilderConfig::set_optimize_size(bool p_value) {
+	optimize_size = p_value;
+}
+
+bool BuilderConfig::get_optimize_size() const {
+	return optimize_size;
+}
+
 bool BuilderConfig::is_valid() const {
 	if (max_vertices < 32) {
 		return false;
@@ -207,6 +215,10 @@ void BuilderConfig::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_shadow_lod_depth", "shadow_lod_depth"), &BuilderConfig::set_shadow_lod_depth);
 	ClassDB::bind_method(D_METHOD("get_shadow_lod_depth"), &BuilderConfig::get_shadow_lod_depth);
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "shadow_lod_depth", PROPERTY_HINT_RANGE, "1,16,1"), "set_shadow_lod_depth", "get_shadow_lod_depth");
+
+	ClassDB::bind_method(D_METHOD("set_optimize_size", "optimize_size"), &BuilderConfig::set_optimize_size);
+	ClassDB::bind_method(D_METHOD("get_optimize_size"), &BuilderConfig::get_optimize_size);
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "optimize_size"), "set_optimize_size", "get_optimize_size");
 
 	ClassDB::bind_method(D_METHOD("is_valid"), &BuilderConfig::is_valid);
 }

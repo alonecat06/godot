@@ -70,6 +70,11 @@ struct NaniteCluster {
 	// Runtime-only — assigned by PagePacker, never serialized.
 	uint32_t page_id = 0;
 
+	// Runtime-only — partition_id from build_hierarchy(). UINT32_MAX means
+	// "not set" (e.g. loaded from a v3 file without partition data). Stored
+	// in a separate partition_ids_data blob, NOT in serialize().
+	uint32_t partition_id = UINT32_MAX;
+
 	// Serializes all fields except page_id. Returns a freshly-allocated
 	// PackedByteArray whose size() == get_serialized_size().
 	PackedByteArray serialize() const;

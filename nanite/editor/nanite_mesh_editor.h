@@ -34,8 +34,8 @@
 
 #include "editor/plugins/editor_plugin.h"
 #include "scene/gui/box_container.h"
+#include "scene/gui/button.h"
 #include "scene/gui/option_button.h"
-#include "scene/gui/spin_box.h"
 #include "scene/gui/label.h"
 #include "scene/gui/subviewport_container.h"
 #include "scene/3d/camera_3d.h"
@@ -95,19 +95,24 @@ private:
 	MeshInstance3D *partition_border_instance = nullptr;
 	MeshInstance3D *dimmed_instance = nullptr;
 
-	// Stage 0 two-axis UI.
-	OptionButton *display_mode_btn = nullptr; // List 1: DisplayMode
-	OptionButton *lod_mode_btn = nullptr; // List 2: LODMode
-	SpinBox *force_lod_spinner = nullptr; // List 2 child: force_lod_level
+	// Stage 0 two-axis UI. Two compact dropdowns top-right (DisplayMode +
+	// LODMode). When LODMode == FORCE_LOD_LEVEL, a [-] [N] [+] row appears
+	// below the LOD dropdown for adjusting the level.
+	OptionButton *display_mode_btn = nullptr; // Dropdown: DisplayMode.
+	OptionButton *lod_mode_btn = nullptr; // Dropdown: Nanite auto / Force LOD Level.
+	Button *lod_minus_button = nullptr; // Decrease force_lod_level.
+	Button *lod_plus_button = nullptr; // Increase force_lod_level.
+	Label *lod_value_label = nullptr; // Shows current force_lod_level.
+	HBoxContainer *lod_buttons_row = nullptr; // Wraps [-] [N] [+], shown only for Force LOD.
 	Label *stats_label = nullptr;
-	HBoxContainer *ui_bar = nullptr; // Bottom bar holding the dropdowns + SpinBox.
+	HBoxContainer *ui_bar = nullptr; // Top-right overlay container.
 
 	Ref<NaniteMeshResource> current_resource;
 
 	bool dragging = false;
 	bool panning = false; // Middle-button pan drag.
 	bool shift_panning = false; // Shift + left-button pan drag.
-	bool lod_mode_updating = false; // Guard against recursive item_selected signals.
+	bool updating_ui = false; // Guard against recursive signals while programmatically setting UI state.
 	float rot_x = 0.0f;
 	float rot_y = 0.0f;
 	float camera_distance = 3.0f; // Camera distance from rotation_node origin.
@@ -115,12 +120,20 @@ private:
 	Vector2 click_pos; // Mouse position at press, for distinguishing click vs drag.
 	int selected_cluster_index = -1; // -1 = no selection; >= 0 = global cluster index.
 
+	// Current DisplayMode (NaniteDebug::DisplayMode) and LOD mode + level.
+	int current_display_mode = 0; // Default NORMAL.
+	int current_lod_mode = 1; // Default FORCE_LOD_LEVEL (1). 0 = NANITE_AUTO.
+	int force_lod_level = 0; // Active force LOD level when current_lod_mode == FORCE_LOD_LEVEL.
+	int max_lod_level = 0; // Max LOD level from current_resource.
+
 	void _update_rotation();
 	void _update_camera_transform();
 	void _focus_on_model();
 	void _on_display_mode_selected(int p_index);
 	void _on_lod_mode_selected(int p_index);
-	void _on_force_lod_changed(double p_value);
+	void _on_lod_minus_pressed();
+	void _on_lod_plus_pressed();
+	void _refresh_lod_buttons(); // Update enabled state + label of LOD adjust row.
 
 	// Rebuild the preview ArrayMesh from current_resource based on the
 	// active DisplayMode + LODMode + force_lod_level. Called whenever the
@@ -129,10 +142,24 @@ private:
 	// meshes up to ~50 clusters / few thousand triangles).
 	void _rebuild_preview();
 
+	// Build and apply the stats_label text. Shows general resource stats
+	// always; when a cluster is selected in a Cluster Solid mode, appends
+	// that cluster's details (index, triangle/vertex counts, LOD level,
+	// error, bounds) and its partition's details (partition_id, sibling
+	// cluster count). Called from edit() and _rebuild_preview().
+	void _update_stats_label();
+
 	// CPU-side ray-triangle intersection test against the current LOD's
 	// decoded clusters. Returns the global cluster index of the first hit,
 	// or -1 if no cluster was hit.
 	int _ray_pick_cluster(const Vector2 &p_screen_pos);
+
+	// Cycle selection to the previous (p_direction < 0) or next
+	// (p_direction > 0) cluster within the same LOD + partition as the
+	// currently selected cluster. Wraps around at list boundaries. No-op
+	// unless in CLUSTER_SOLID_WITH_PARTITION_BORDER mode with a valid
+	// selection and stored partition_ids_data.
+	void _cycle_cluster_in_partition(int p_direction);
 
 protected:
 	static void _bind_methods();
