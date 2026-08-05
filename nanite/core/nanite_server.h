@@ -108,6 +108,18 @@ private:
 
 	int visible_cluster_count = 0;
 
+	// 光照缓存:每帧 render_material_resolve 前从场景的 DirectionalLight3D
+	// 采集(取第一个 enabled 的方向光)。没有方向光时用合理的默认值,
+	// 保证模型不会"黑乎乎"。light_dir 是 world space、归一化、指向被照面。
+	struct LightInfo {
+		Vector3 direction = Vector3(0.5f, 0.8f, 0.3f).normalized();
+		Color color = Color(1.0f, 1.0f, 1.0f, 1.0f);
+		float energy = 1.0f;
+		bool has_light = false;
+	};
+	LightInfo cached_light;
+	void _update_light_cache();
+
 protected:
 	static void _bind_methods();
 

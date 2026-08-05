@@ -221,8 +221,8 @@ void NaniteHZB::build(RenderingDevice *p_rd, const RID &p_depth_texture) {
 	Error err = p_rd->texture_copy(p_depth_texture, hzb_texture, Vector3(0, 0, 0), Vector3(0, 0, 0), Vector3(current_width, current_height, 1), 0, 0, 0, 0);
 	ERR_FAIL_COND(err != OK);
 
-	// Make the copy visible to the subsequent compute reads of mip 0.
-	p_rd->barrier();
+	// NOTE: 显式 barrier 已移除。RenderingDevice 自动在 texture_copy 与
+	// 后续 compute_list 之间插入内存屏障。
 
 	// Chain 8x8 compute dispatches: mip i reads mip i-1 and writes mip i.
 	RD::ComputeListID compute_list = p_rd->compute_list_begin();

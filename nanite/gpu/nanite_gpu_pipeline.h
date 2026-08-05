@@ -30,6 +30,8 @@
 
 #pragma once
 
+#include "core/math/color.h"
+#include "core/math/vector3.h"
 #include "core/templates/rid.h"
 #include "nanite/gpu/nanite_hzb.h"
 
@@ -45,6 +47,7 @@ class NaniteMeshData;
 //   3. dispatch_rasterize(rd, vis, count, md)    — soft-raster visible clusters
 //   4. dispatch_hzb_build(rd, depth_buffer)      — rebuild occlusion HZB
 //   5. dispatch_material_resolve(...)            — Task 1.11: vis -> color
+//   6. dispatch_composite(rd, engine_color)     — Task 1.18: color -> engine target
 //
 // The pipeline is a pure C++ class (no GDCLASS); lifetime is owned by the
 // NaniteServer singleton. It embeds a NaniteHZB so the caller doesn't have to
@@ -74,6 +77,8 @@ private:
 	RID rasterize_pipeline;
 	RID material_resolve_shader; // For Task 1.11
 	RID material_resolve_pipeline; // For Task 1.11
+	RID composite_shader; // Task 1.18 — composites color_buffer into engine target
+	RID composite_pipeline; // Task 1.18 — composites color_buffer into engine target
 
 	// Nearest+clamp sampler bound alongside the HZB texture in the cull set.
 	RID hzb_sampler;
@@ -98,6 +103,25 @@ private:
 	RID visible_count_buffer; // uint32_t[1]
 	uint32_t current_visible_capacity = 0;
 
+	// Cached uniform sets — rebuilt only when their dependent RIDs change
+	// (mesh swap, HZB texture RID change, screen buffer resize, etc.).
+	// Caching avoids per-frame uniform_set_create which exhausts D3D12
+	// descriptor heaps under sustained dispatch rates.
+	RID cull_uniform_set;
+	RID rasterize_uniform_set;
+	RID material_resolve_uniform_set;
+	RID composite_uniform_set;
+	// Composite uniform set depends on the engine color target RID, which
+	// changes when the viewport resizes; track it to know when to rebuild.
+	RID composite_last_engine_target;
+	// Cull/rasterize/material_resolve uniform sets depend on the mesh's
+	// SSBO RIDs; track them to know when to rebuild.
+	RID last_mesh_cluster_ssbo;
+	RID last_mesh_bvh_ssbo;
+	RID last_mesh_vertex_ssbo;
+	RID last_hzb_texture;
+
+	void _free_uniform_sets(RenderingDevice *p_rd);
 	void _free_screen_buffers(RenderingDevice *p_rd);
 	void _free_visible_buffers(RenderingDevice *p_rd);
 
@@ -125,13 +149,25 @@ public:
 
 	// Task 1.11: resolves the vis buffer into a shaded color image.
 	// Decodes (cluster_id << 8 | triangle_id) per pixel and writes a
-	// debug-mode-specific color (or Stage 1 placeholder gray for NONE) into
+	// debug-mode-specific color (or Stage 1 Lambert for NONE) into
 	// the internal color_buffer. p_debug_mode is a NaniteDebug::DebugMode
 	// value cast to int. If p_vis_buffer is invalid the pipeline's internal
 	// vis_buffer is used (caller convenience). p_model_matrix (Task 1.16.6)
 	// is the per-instance world transform (column-major float[16]); pass
-	// nullptr to use identity (only used by NONE-mode Lambert shading).
-	void dispatch_material_resolve(RenderingDevice *p_rd, const RID &p_vis_buffer, const NaniteMeshData *p_mesh_data, int p_debug_mode, const float *p_model_matrix);
+	// nullptr to use identity.
+	// p_light_dir / p_light_energy / p_light_color come from the scene's
+	// first DirectionalLight3D (collected by NaniteServer) and drive the
+	// NONE-mode Lambert shading; debug modes ignore them.
+	void dispatch_material_resolve(RenderingDevice *p_rd, const RID &p_vis_buffer, const NaniteMeshData *p_mesh_data, int p_debug_mode, const float *p_model_matrix, const Vector3 &p_light_dir, float p_light_energy, const Color &p_light_color);
+
+	// Task 1.18 (差距 1 修复) — composites the internal color_buffer into the
+	// engine's color target (the RID returned by
+	// RenderSceneBuffersRD::get_color_layer(0)). Only pixels where
+	// vis_buffer != 0 are written, so engine-rendered background is preserved.
+	// p_engine_color_target must be a valid RGBA8 storage image RID. Must be
+	// called after dispatch_material_resolve and after a barrier so the
+	// color_buffer + vis_buffer reads observe the material_resolve writes.
+	void dispatch_composite(RenderingDevice *p_rd, const RID &p_engine_color_target);
 
 	NaniteHZB *get_hzb() { return &hzb; }
 	RID get_vis_buffer() const { return vis_buffer; }

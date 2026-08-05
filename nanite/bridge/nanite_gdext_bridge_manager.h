@@ -63,11 +63,11 @@ class Viewport;
 class NaniteGDExtBridgeManager : public Object {
 	static NaniteGDExtBridgeManager *singleton;
 
-	// Two bridges: PRE_OPAQUE drives render_visibility; POST_OPAQUE drives
-	// render_material_resolve. `pre_opaque_bridge` is the one handed to
-	// NaniteServer as the active INaniteBridge handle.
+	// Two bridges: PRE_OPAQUE drives render_visibility; POST_SKY drives
+	// render_material_resolve + composite (after sky pass to avoid being
+	// overwritten by sky depth test).
 	Ref<NaniteGDExtBridge> pre_opaque_bridge;
-	Ref<NaniteGDExtBridge> post_opaque_bridge;
+	Ref<NaniteGDExtBridge> post_sky_bridge;
 
 	// Pre-built Compositor Resource that bundles both bridges in its
 	// effects list. Attached to Viewports via World3D::set_compositor().
@@ -79,6 +79,9 @@ class NaniteGDExtBridgeManager : public Object {
 	// SceneTree signal handlers.
 	void _on_node_added(Node *p_node);
 	void _on_process_frame();
+	// 在 SCENE 层级 init 时 SceneTree 可能尚未创建,用延迟重试机制
+	// 连接 SceneTree 信号(node_added / process_frame)。
+	void _try_connect_scenetree();
 
 	// Idempotent: ensures the viewport's find_world_3d() has the nanite
 	// compositor attached (either directly or by appending effects).

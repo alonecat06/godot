@@ -43,6 +43,10 @@
 #include "core/math/transform_3d.h"
 #include "core/object/class_db.h"
 #include "core/string/string_name.h"
+#include "scene/3d/light_3d.h"
+#include "scene/main/node.h"
+#include "scene/main/scene_tree.h"
+#include "scene/main/window.h"
 #include "servers/rendering/rendering_device.h"
 #include "servers/rendering/storage/render_data.h"
 #include "servers/rendering/storage/render_scene_data.h"
@@ -54,6 +58,58 @@
 
 // Static singleton pointer; set in init(), cleared in finish().
 NaniteServer *NaniteServer::singleton = nullptr;
+
+// 递归遍历场景树,找第一个 enabled 且在 tree 内的 DirectionalLight3D。
+// 返回 nullptr 表示场景中没有可用方向光。
+static DirectionalLight3D *_find_first_directional_light(Node *p_node) {
+	if (p_node == nullptr) {
+		return nullptr;
+	}
+	DirectionalLight3D *light = Object::cast_to<DirectionalLight3D>(p_node);
+	if (light != nullptr && light->is_enabled() && light->is_inside_tree()) {
+		return light;
+	}
+	for (int i = 0; i < p_node->get_child_count(); i++) {
+		DirectionalLight3D *found = _find_first_directional_light(p_node->get_child(i));
+		if (found != nullptr) {
+			return found;
+		}
+	}
+	return nullptr;
+}
+
+void NaniteServer::_update_light_cache() {
+	// 默认 fallback:没有方向光时用一个合理的角度,模型不会全黑。
+	cached_light.direction = Vector3(0.5f, 0.8f, 0.3f).normalized();
+	cached_light.color = Color(1.0f, 1.0f, 1.0f, 1.0f);
+	cached_light.energy = 1.0f;
+	cached_light.has_light = false;
+
+	SceneTree *tree = SceneTree::get_singleton();
+	if (tree == nullptr || tree->get_root() == nullptr) {
+		return;
+	}
+
+	DirectionalLight3D *light = _find_first_directional_light(tree->get_root());
+	if (light == nullptr) {
+		// 临时调试:确认场景中没有方向光被找到。
+		static bool warned_no_light = false;
+		if (!warned_no_light) {
+			warned_no_light = true;
+			WARN_PRINT("NaniteServer: no DirectionalLight3D found in scene; using fallback light.");
+		}
+		return;
+	}
+
+	// DirectionalLight3D 默认朝 -Z 方向照射;world space 光传播方向 =
+	// transform.basis * (0,0,-1)。shader 中 NdotL 用的是"光指向表面"的
+	// 方向,即光传播方向。
+	Transform3D lt = light->get_global_transform();
+	cached_light.direction = lt.basis.xform(Vector3(0.0f, 0.0f, -1.0f)).normalized();
+	cached_light.color = light->get_color();
+	cached_light.energy = light->get_param(Light3D::PARAM_ENERGY);
+	cached_light.has_light = true;
+}
 
 NaniteServer::NaniteServer() {
 }
@@ -414,7 +470,6 @@ void NaniteServer::render_visibility(const RenderData *p_render_data) {
 }
 
 void NaniteServer::render_material_resolve(const RenderData *p_render_data) {
-	(void)p_render_data; // Stage 1 doesn't blend into the engine color target yet.
 	if (!gpu_pipeline || instance_map.size() == 0) {
 		return;
 	}
@@ -424,6 +479,22 @@ void NaniteServer::render_material_resolve(const RenderData *p_render_data) {
 	}
 	int debug_mode = debug ? (int)debug->get_mode_enum() : 0;
 
+	// 每帧从场景采集 DirectionalLight3D,驱动 Lambert 着色。
+	_update_light_cache();
+
+	// 临时调试:确认 render_material_resolve 被调用,且光参数有效。
+	{
+		static int frame_cnt = 0;
+		if ((++frame_cnt % 60) == 0) {
+			print_line(vformat("Nanite render_material_resolve: light_dir=(%.2f,%.2f,%.2f) energy=%.2f color=(%.2f,%.2f,%.2f) has_light=%d instances=%d",
+					cached_light.direction.x, cached_light.direction.y, cached_light.direction.z,
+					cached_light.energy,
+					cached_light.color.r, cached_light.color.g, cached_light.color.b,
+					(int)cached_light.has_light,
+					(int)instance_map.size()));
+		}
+	}
+
 	// Task 1.16.11 — iterate instances. Material resolve re-projects each
 	// instance's triangles via the model_matrix push constant to compute
 	// barycentric coordinates in screen space. The vis_buffer is shared
@@ -431,6 +502,7 @@ void NaniteServer::render_material_resolve(const RenderData *p_render_data) {
 	// proper multi-instance composition (per-instance vis layers) is a
 	// Stage 2 concern. Stage 1 still drives dispatch_material_resolve per
 	// instance so each instance's model_matrix is applied.
+	bool any_resolved = false;
 	for (const KeyValue<ObjectID, NaniteMeshInstance3D *> &E : instance_map) {
 		NaniteMeshInstance3D *inst = E.value;
 		if (!inst) {
@@ -459,11 +531,48 @@ void NaniteServer::render_material_resolve(const RenderData *p_render_data) {
 		model_matrix[8] = b.rows[2].x; model_matrix[9] = b.rows[2].y; model_matrix[10] = b.rows[2].z; model_matrix[11] = 0.0f;
 		model_matrix[12] = o.x; model_matrix[13] = o.y; model_matrix[14] = o.z; model_matrix[15] = 1.0f;
 
-		gpu_pipeline->dispatch_material_resolve(rd, gpu_pipeline->get_vis_buffer(), md, debug_mode, model_matrix);
+		gpu_pipeline->dispatch_material_resolve(rd, gpu_pipeline->get_vis_buffer(), md, debug_mode, model_matrix, cached_light.direction, cached_light.energy, cached_light.color);
+		any_resolved = true;
 		// Stage 1 single-pass: one dispatch per instance is enough since
 		// vis_buffer is shared. Break after the first so we don't overwrite
 		// the color_buffer with a second instance's model_matrix.
 		break;
+	}
+
+	// Task 1.18 (差距 1 修复) — composite the internal color_buffer into
+	// the engine's color target so Nanite pixels actually appear on screen.
+	// The engine color target is obtained from RenderSceneBuffersRD via its
+	// ClassDB-bound get_color_layer(0) method. We use the Variant call
+	// path (same as render_visibility uses for get_internal_size) to avoid
+	// pulling in render_scene_buffers_rd.h — this keeps nanite/core free of
+	// concrete renderer implementation headers and eases the Stage 4
+	// GDExtension migration.
+	if (any_resolved && p_render_data != nullptr) {
+		Ref<RenderSceneBuffers> buffers = p_render_data->get_render_scene_buffers();
+		if (buffers.is_valid()) {
+			const Variant color_rid_v = buffers->call(SNAME("get_color_layer"), 0);
+			if (color_rid_v.get_type() == Variant::RID) {
+				const RID engine_color_target = color_rid_v;
+				if (engine_color_target.is_valid()) {
+					gpu_pipeline->dispatch_composite(rd, engine_color_target);
+					// 临时调试:确认 composite 被调用。
+					static int comp_cnt = 0;
+					if ((++comp_cnt % 60) == 0) {
+						print_line("Nanite composite dispatched.");
+					}
+				}
+			} else {
+				static int warn_cnt = 0;
+				if ((++warn_cnt % 60) == 0) {
+					print_line("Nanite: get_color_layer did not return RID.");
+				}
+			}
+		} else {
+			static int warn_cnt2 = 0;
+			if ((++warn_cnt2 % 60) == 0) {
+				print_line("Nanite: RenderSceneBuffers is null in render_material_resolve.");
+			}
+		}
 	}
 }
 

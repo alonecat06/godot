@@ -38,12 +38,14 @@
 #include "core/variant/variant.h"
 #include "scene/main/scene_tree.h"
 #include "scene/main/viewport.h"
+#include "scene/main/window.h"
 
 // Static singleton pointer; set in init(), cleared in finish().
 NaniteGDExtBridgeManager *NaniteGDExtBridgeManager::singleton = nullptr;
 
 void NaniteGDExtBridgeManager::init(NaniteServer *p_server) {
 	singleton = this;
+	print_line("NaniteGDExtBridgeManager::init called.");
 
 	// Register the auto-attach toggle and read its current value in one
 	// call. GLOBAL_DEF is idempotent and returns the registered value
@@ -57,14 +59,14 @@ void NaniteGDExtBridgeManager::init(NaniteServer *p_server) {
 	//    The PRE_OPAQUE instance is also the "main" INaniteBridge handle
 	//    handed to NaniteServer.
 	pre_opaque_bridge = Ref<NaniteGDExtBridge>(memnew(NaniteGDExtBridge(CompositorEffect::EFFECT_CALLBACK_TYPE_PRE_OPAQUE)));
-	post_opaque_bridge = Ref<NaniteGDExtBridge>(memnew(NaniteGDExtBridge(CompositorEffect::EFFECT_CALLBACK_TYPE_POST_OPAQUE)));
+	post_sky_bridge = Ref<NaniteGDExtBridge>(memnew(NaniteGDExtBridge(CompositorEffect::EFFECT_CALLBACK_TYPE_POST_SKY)));
 
 	// 2) Build a pre-baked Compositor Resource bundling both bridges.
 	default_compositor.instantiate();
 	{
 		TypedArray<CompositorEffect> effects;
 		effects.push_back(pre_opaque_bridge);
-		effects.push_back(post_opaque_bridge);
+		effects.push_back(post_sky_bridge);
 		default_compositor->set_compositor_effects(effects);
 	}
 
@@ -79,11 +81,26 @@ void NaniteGDExtBridgeManager::init(NaniteServer *p_server) {
 	//    node_added fires for every Node inserted; process_frame fires once
 	//    per main-loop tick (used as a 60-frame poll cadence for the
 	//    `_viewports` group fallback path).
+	//
+	//    IMPORTANT: at SCENE-level module init, SceneTree::get_singleton()
+	//    may still return nullptr (OS::set_main_loop runs later in
+	//    Main::start). We therefore defer the signal hookup to a deferred
+	//    retry loop that keeps polling until SceneTree becomes available.
+	_try_connect_scenetree();
+}
+
+void NaniteGDExtBridgeManager::_try_connect_scenetree() {
 	SceneTree *st = SceneTree::get_singleton();
-	if (st != nullptr) {
-		st->connect("node_added", callable_mp(this, &NaniteGDExtBridgeManager::_on_node_added));
-		st->connect("process_frame", callable_mp(this, &NaniteGDExtBridgeManager::_on_process_frame));
+	if (st == nullptr) {
+		// SceneTree not yet created; retry on the next message-queue flush.
+		callable_mp(this, &NaniteGDExtBridgeManager::_try_connect_scenetree).call_deferred();
+		return;
 	}
+	st->connect("node_added", callable_mp(this, &NaniteGDExtBridgeManager::_on_node_added));
+	st->connect("process_frame", callable_mp(this, &NaniteGDExtBridgeManager::_on_process_frame));
+	print_line(vformat("NaniteGDExtBridgeManager: SceneTree connected. root='%s', root_children=%d",
+			st->get_root() ? String(st->get_root()->get_name()) : String("<null>"),
+			st->get_root() ? st->get_root()->get_child_count() : -1));
 }
 
 void NaniteGDExtBridgeManager::finish() {
@@ -105,7 +122,7 @@ void NaniteGDExtBridgeManager::finish() {
 	}
 
 	default_compositor.unref();
-	post_opaque_bridge.unref();
+	post_sky_bridge.unref();
 	pre_opaque_bridge.unref();
 
 	if (singleton == this) {
@@ -134,7 +151,7 @@ void NaniteGDExtBridgeManager::attach_to_compositor(const Ref<Compositor> &p_com
 	if (p_compositor.is_null()) {
 		return;
 	}
-	if (pre_opaque_bridge.is_null() || post_opaque_bridge.is_null()) {
+	if (pre_opaque_bridge.is_null() || post_sky_bridge.is_null()) {
 		return;
 	}
 
@@ -145,7 +162,7 @@ void NaniteGDExtBridgeManager::attach_to_compositor(const Ref<Compositor> &p_com
 		Ref<CompositorEffect> e = effects[i];
 		if (e == pre_opaque_bridge) {
 			has_pre = true;
-		} else if (e == post_opaque_bridge) {
+		} else if (e == post_sky_bridge) {
 			has_post = true;
 		}
 	}
@@ -153,7 +170,7 @@ void NaniteGDExtBridgeManager::attach_to_compositor(const Ref<Compositor> &p_com
 		effects.push_back(pre_opaque_bridge);
 	}
 	if (!has_post) {
-		effects.push_back(post_opaque_bridge);
+		effects.push_back(post_sky_bridge);
 	}
 	p_compositor->set_compositor_effects(effects);
 }
@@ -188,6 +205,7 @@ void NaniteGDExtBridgeManager::_attach_viewport(Viewport *p_vp) {
 
 	Ref<World3D> w = p_vp->find_world_3d();
 	if (w.is_null()) {
+		print_line(vformat("Nanite _attach_viewport: viewport '%s' has no World3D.", p_vp->get_name()));
 		return;
 	}
 
@@ -197,10 +215,12 @@ void NaniteGDExtBridgeManager::_attach_viewport(Viewport *p_vp) {
 	}
 	if (existing.is_valid()) {
 		// User already has a Compositor — append rather than replace.
+		print_line(vformat("Nanite _attach_viewport: viewport '%s' already has a Compositor; appending.", p_vp->get_name()));
 		attach_to_compositor(existing);
 		return;
 	}
 	w->set_compositor(default_compositor);
+	print_line(vformat("Nanite _attach_viewport: set default_compositor on viewport '%s'.", p_vp->get_name()));
 }
 
 void NaniteGDExtBridgeManager::_on_node_added(Node *p_node) {
@@ -211,6 +231,8 @@ void NaniteGDExtBridgeManager::_on_node_added(Node *p_node) {
 	if (vp == nullptr) {
 		return;
 	}
+	// 临时调试:确认 node_added 信号触发 viewport。
+	print_line(vformat("Nanite _on_node_added: viewport '%s' added.", vp->get_name()));
 	// Defer: when node_added fires, the viewport may not yet have its
 	// world_3d assigned (e.g. SubViewport children added via add_child
 	// before set_world_3d). Deferring lets the next message-queue flush
@@ -239,6 +261,14 @@ void NaniteGDExtBridgeManager::_on_process_frame() {
 	// to node_added (e.g. editor SubViewports constructed during engine
 	// boot, before the nanite module was initialized).
 	Vector<Node *> viewports = st->get_nodes_in_group("_viewports");
+	// 临时调试:确认轮询路径找到的 viewport 数量。
+	if (viewports.size() == 0) {
+		static int warn_no_vp = 0;
+		if (warn_no_vp < 3) {
+			warn_no_vp++;
+			print_line("Nanite _on_process_frame: no viewports in '_viewports' group.");
+		}
+	}
 	for (Node *n : viewports) {
 		Viewport *vp = Object::cast_to<Viewport>(n);
 		if (vp != nullptr) {

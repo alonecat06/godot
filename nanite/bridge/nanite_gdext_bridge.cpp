@@ -72,13 +72,27 @@ void NaniteGDExtBridge::_render_callback(int p_effect_callback_type, const Rende
 		return;
 	}
 	CompositorEffect::EffectCallbackType cb = get_effect_callback_type();
+	// 临时调试:确认 CompositorEffect 回调被触发。
+	{
+		static int pre_cnt = 0;
+		static int post_cnt = 0;
+		if (cb == CompositorEffect::EFFECT_CALLBACK_TYPE_PRE_OPAQUE) {
+			if ((++pre_cnt % 60) == 0) {
+				print_line("Nanite bridge: PRE_OPAQUE callback fired.");
+			}
+		} else if (cb == CompositorEffect::EFFECT_CALLBACK_TYPE_POST_SKY) {
+			if ((++post_cnt % 60) == 0) {
+				print_line("Nanite bridge: POST_SKY callback fired.");
+			}
+		}
+	}
 	if (cb == CompositorEffect::EFFECT_CALLBACK_TYPE_PRE_OPAQUE) {
 		ns->render_visibility(p_render_data);
-	} else if (cb == CompositorEffect::EFFECT_CALLBACK_TYPE_POST_OPAQUE) {
+	} else if (cb == CompositorEffect::EFFECT_CALLBACK_TYPE_POST_SKY) {
 		ns->render_material_resolve(p_render_data);
 	}
 	// Other callback types are ignored: Nanite only runs at PRE_OPAQUE /
-	// POST_OPAQUE.
+	// POST_SKY.
 }
 
 void NaniteGDExtBridge::install(NaniteServer *p_server) {

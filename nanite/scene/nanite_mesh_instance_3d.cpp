@@ -61,8 +61,13 @@ void NaniteMeshInstance3D::set_nanite_mesh(const Ref<NaniteMeshResource> &p_mesh
 			// Set the shadow mesh on the rendering server's mesh RID so
 			// the engine shadow pass uses the coarse LOD. The mesh RID is
 			// exposed by VisualInstance3D as the instance "base".
+			// 重要:shadow mesh 已经被 set_mesh() 设为基础 mesh,get_base()
+			// 返回的就是 shadow->get_rid(),此时再调用 mesh_set_shadow_mesh
+			// 把它设为自己的 shadow mesh 会触发 "Cannot set a mesh as its
+			// own shadow mesh" 错误。只有当基础 mesh 与 shadow mesh 不同
+			// 时才需要设置 shadow mesh。
 			RID mesh_rid = get_base();
-			if (mesh_rid.is_valid()) {
+			if (mesh_rid.is_valid() && mesh_rid != shadow->get_rid()) {
 				RenderingServer::get_singleton()->mesh_set_shadow_mesh(mesh_rid, shadow->get_rid());
 			}
 		} else {
@@ -104,7 +109,8 @@ void NaniteMeshInstance3D::set_nanite_enabled(bool p_enabled) {
 			if (shadow.is_valid()) {
 				set_mesh(shadow);
 				RID mesh_rid = get_base();
-				if (mesh_rid.is_valid()) {
+				// 同 set_nanite_mesh:避免把 mesh 设为自己的 shadow mesh。
+				if (mesh_rid.is_valid() && mesh_rid != shadow->get_rid()) {
 					RenderingServer::get_singleton()->mesh_set_shadow_mesh(mesh_rid, shadow->get_rid());
 				}
 			}

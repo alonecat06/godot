@@ -31,6 +31,7 @@ env_nanite.GLSL_HEADER("shaders/nanite_hzb_downsample.glsl")
 env_nanite.GLSL_HEADER("shaders/nanite_cull.glsl")
 env_nanite.GLSL_HEADER("shaders/nanite_rasterize.glsl")
 env_nanite.GLSL_HEADER("shaders/nanite_material_resolve.glsl")
+env_nanite.GLSL_HEADER("shaders/nanite_composite.glsl")
 env_nanite.Depends(Glob("shaders/*.glsl.gen.h"), ["#glsl_builders.py"])
 
 # register_types.cpp lives at the nanite/ top level (not under core/), so it

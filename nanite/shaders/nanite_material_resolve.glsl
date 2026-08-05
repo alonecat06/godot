@@ -60,6 +60,10 @@ layout(push_constant, std430) uniform Params {
 	ivec2 screen_size;
 	uint debug_mode;
 	uint _pad;
+	vec3 light_dir;       // world space, normalized, points from light source toward surface
+	float light_energy;   // multiplier (DirectionalLight3D.light_energy)
+	vec3 light_color;     // linear RGB, pre-multiplied by energy
+	uint _pad2;
 } params;
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
@@ -140,10 +144,18 @@ vec3 barycentric(vec2 p, vec2 a, vec2 b, vec2 c) {
 }
 
 // --- Lambert shading -------------------------------------------------
-vec3 lambert(vec3 normal, vec3 light_dir, vec3 base_color) {
-	float ndotl = max(dot(normal, light_dir), 0.0);
-	float ambient = 0.3;
-	return base_color * (ndotl + ambient);
+// Uses the per-frame light parameters from push constants (light_dir,
+// light_color, light_energy). light_color is pre-multiplied by energy on
+// the CPU side, so the shader just multiplies by NdotL.
+// ambient is a small hemisphere term so back-facing pixels are not pure black.
+vec3 lambert(vec3 normal, vec3 base_color) {
+	float ndotl = max(dot(normal, params.light_dir), 0.0);
+	vec3 diffuse = base_color * params.light_color * ndotl;
+	// Hemisphere ambient: a small amount of light from the sky direction
+	// (up) so unlit faces still read as a shape, not a black silhouette.
+	float up_dot = max(dot(normal, vec3(0.0, 1.0, 0.0)), 0.0);
+	vec3 ambient = base_color * (0.18 + 0.12 * up_dot);
+	return diffuse + ambient;
 }
 
 // Hash function for cluster id -> color (debug modes).
@@ -245,9 +257,8 @@ void main() {
 
 	vec3 out_color;
 	switch (params.debug_mode) {
-		case 0u: { // NONE: Lambert shading.
-			vec3 light_dir = normalize(vec3(0.5, 0.8, 0.3));
-			out_color = lambert(normal_world, light_dir, base_color.rgb);
+		case 0u: { // NONE: Lambert shading using scene DirectionalLight3D.
+			out_color = lambert(normal_world, base_color.rgb);
 		} break;
 		case 1u: { // CLUSTER_SOLID_COLOR.
 			out_color = hash_color(cluster_id);
